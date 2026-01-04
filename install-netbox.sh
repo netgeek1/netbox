@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 
 INSTALL_DIR="/opt/netbox-docker"
 NETBOX_PORT="${1:-8000}"
@@ -74,10 +74,13 @@ clone_netbox_docker() {
 # Function: create_plugin_requirements
 # ------------------------------------------------------------
 create_plugin_requirements() {
-    echo "[INFO] Creating plugin_requirements.txt (wiki method)..."
+    echo "[INFO] Creating plugin_requirements.txt (plugin bundle)..."
 
     cat > plugin_requirements.txt <<'EOF'
 netbox-secrets
+netbox-bgp
+netbox-dns
+netbox-topology-views
 EOF
 }
 
@@ -85,20 +88,26 @@ EOF
 # Function: create_plugin_config
 # ------------------------------------------------------------
 create_plugin_config() {
-    echo "[INFO] Creating configuration/plugins.py..."
+    echo "[INFO] Creating configuration/plugins.py (plugin bundle)..."
 
     mkdir -p configuration
 
     cat > configuration/plugins.py <<'EOF'
 PLUGINS = [
     "netbox_secrets",
+    "netbox_bgp",
+    "netbox_dns",
+    "netbox_topology_views",
 ]
 
 PLUGINS_CONFIG = {
     "netbox_secrets": {
         "public_key": "",
         "private_key": "",
-    }
+    },
+    "netbox_bgp": {},
+    "netbox_dns": {},
+    "netbox_topology_views": {},
 }
 EOF
 }
@@ -121,7 +130,7 @@ EOF
 # Function: create_compose_override
 # ------------------------------------------------------------
 create_compose_override() {
-    echo "[INFO] Creating docker-compose.override.yml (wiki method + 300s health)..."
+    echo "[INFO] Creating docker-compose.override.yml (wiki method + 900s health)..."
 
     cat > docker-compose.override.yml <<EOF
 services:
@@ -132,11 +141,11 @@ services:
     ports:
       - "${NETBOX_PORT}:8080"
     environment:
-      - "PLUGINS=['netbox_secrets']"
+      - "PLUGINS=['netbox_secrets','netbox_bgp','netbox_dns','netbox_topology_views']"
     volumes:
       - ./configuration:/etc/netbox/config
     healthcheck:
-      start_period: 300s
+      start_period: 900s
 EOF
 }
 
@@ -186,7 +195,7 @@ main() {
     echo " netbox-secrets installed EXACTLY per the wiki:"
     echo "   - plugin_requirements.txt"
     echo "   - Dockerfile-plugins using uv pip"
-    echo "   - PLUGINS=['netbox_secrets']"
+    echo "   - PLUGINS=['netbox_secrets','netbox_bgp','netbox_dns','netbox_topology_views']"
     echo "   - configuration/plugins.py"
     echo "------------------------------------------------------------"
     echo " Access NetBox at: http://<server-ip>:${NETBOX_PORT}"
