@@ -1,14 +1,30 @@
 #!/usr/bin/env bash
 #
-# Added Slurpit Plugin 
-#  - https://gitlab.com/slurpit.io/slurpit_netbox
-# Added Netbox DNS
-#  - https://github.com/peteeckel/netbox-plugin-dns
+# Netbox Plugins
+#  - https://netboxlabs.com/plugins
+#      - Need to add to plugin_requirements.txt, configuration/plugins.py and PLUGINS=
+
+# - v1.1.3
+#   Added Netbox Routing
+#    - https://github.com/DanSheps/netbox-routing
+#   Added Netbox Inventory
+#    - https://github.com/ArnesSI/netbox-inventory
+#   Added Netbox Topology Views
+#    - https://github.com/netbox-community/netbox-topology-views
+#
+#
+# - v1.1.2
+#   Added Slurpit Plugin 
+#    - https://gitlab.com/slurpit.io/slurpit_netbox
+#    - https://www.youtube.com/watch?v=Asji7fTfCy8
+#   Added Netbox DNS
+#    - https://github.com/peteeckel/netbox-plugin-dns
+
 
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.1.3"
 
 INSTALL_DIR="/opt/netbox-docker"
 NETBOX_PORT="${1:-8000}"
@@ -105,6 +121,9 @@ create_plugin_requirements() {
 netbox-secrets
 slurpit_netbox
 netbox-plugin-dns
+netbox-routing
+netbox-inventory
+netbox-topology-views
 EOF
 }
 
@@ -121,13 +140,17 @@ PLUGINS = [
     "netbox_secrets",
     "slurpit_netbox",
     "netbox_dns",
+    "netbox_routing",
+    "netbox_inventory",
+	"netbox_topology_views",
 ]
 
 PLUGINS_CONFIG = {
     "netbox_secrets": {
         "public_key": "",
         "private_key": "",
-    }
+    },
+	"netbox_inventory": {},
 }
 EOF
 }
@@ -161,7 +184,7 @@ services:
     ports:
       - "${NETBOX_PORT}:8080"
     environment:
-      - "PLUGINS=['netbox_secrets','slurpit_netbox','netbox_dns']"
+      - "PLUGINS=['netbox_secrets','slurpit_netbox','netbox_dns','netbox_routing','netbox_inventory','netbox_topology_views']"
     volumes:
       - ./configuration:/etc/netbox/config
     healthcheck:
@@ -215,7 +238,7 @@ main() {
     echo " netbox-secrets installed EXACTLY per the wiki:"
     echo "   - plugin_requirements.txt"
     echo "   - Dockerfile-plugins using uv pip"
-    echo "   - PLUGINS=['netbox_secrets']"
+    echo "   - PLUGINS=['netbox_secrets','slurpit_netbox','netbox_dns','netbox_routing','netbox_inventory','netbox_topology_views']"
     echo "   - configuration/plugins.py"
     echo "------------------------------------------------------------"
     echo " Access NetBox at: http://<server-ip>:${NETBOX_PORT}"
