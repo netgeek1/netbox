@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
+#
+# Added Slurpit Plugin 
+#  - https://gitlab.com/slurpit.io/slurpit_netbox
+# Added Netbox DNS
+#  - https://github.com/peteeckel/netbox-plugin-dns
+
+
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 
 INSTALL_DIR="/opt/netbox-docker"
 NETBOX_PORT="${1:-8000}"
@@ -71,16 +78,33 @@ clone_netbox_docker() {
 }
 
 # ------------------------------------------------------------
+# Function: clone_slurpit_docker
+# ------------------------------------------------------------
+clone_slurpit_docker() {
+    echo "[INFO] Cloning slurpit-docker repository..."
+
+    mkdir -p "$INSTALL_DIR"
+    cd "$INSTALL_DIR"
+
+    if [[ ! -d netbox-docker ]]; then
+        git clone https://gitlab.com/slurpit.io/images.git slurpit-docker
+    else
+        echo "[INFO] slurpit-docker already exists — using existing clone."
+    fi
+
+    cd slurpit-docker/images
+}
+
+# ------------------------------------------------------------
 # Function: create_plugin_requirements
 # ------------------------------------------------------------
 create_plugin_requirements() {
-    echo "[INFO] Creating plugin_requirements.txt (plugin bundle)..."
+    echo "[INFO] Creating plugin_requirements.txt (wiki method)..."
 
     cat > plugin_requirements.txt <<'EOF'
 netbox-secrets
-netbox-bgp
-netbox-dns
-netbox-topology-views
+slurpit_netbox
+netbox-plugin-dns
 EOF
 }
 
@@ -88,26 +112,22 @@ EOF
 # Function: create_plugin_config
 # ------------------------------------------------------------
 create_plugin_config() {
-    echo "[INFO] Creating configuration/plugins.py (plugin bundle)..."
+    echo "[INFO] Creating configuration/plugins.py..."
 
     mkdir -p configuration
 
     cat > configuration/plugins.py <<'EOF'
 PLUGINS = [
     "netbox_secrets",
-    "netbox_bgp",
+    "slurpit_netbox",
     "netbox_dns",
-    "netbox_topology_views",
 ]
 
 PLUGINS_CONFIG = {
     "netbox_secrets": {
         "public_key": "",
         "private_key": "",
-    },
-    "netbox_bgp": {},
-    "netbox_dns": {},
-    "netbox_topology_views": {},
+    }
 }
 EOF
 }
@@ -130,7 +150,7 @@ EOF
 # Function: create_compose_override
 # ------------------------------------------------------------
 create_compose_override() {
-    echo "[INFO] Creating docker-compose.override.yml (wiki method + 900s health)..."
+    echo "[INFO] Creating docker-compose.override.yml (wiki method + 300s health)..."
 
     cat > docker-compose.override.yml <<EOF
 services:
@@ -141,11 +161,11 @@ services:
     ports:
       - "${NETBOX_PORT}:8080"
     environment:
-      - "PLUGINS=['netbox_secrets','netbox_bgp','netbox_dns','netbox_topology_views']"
+      - "PLUGINS=['netbox_secrets','slurpit_netbox','netbox_dns']"
     volumes:
       - ./configuration:/etc/netbox/config
     healthcheck:
-      start_period: 900s
+      start_period: 300s
 EOF
 }
 
@@ -195,7 +215,7 @@ main() {
     echo " netbox-secrets installed EXACTLY per the wiki:"
     echo "   - plugin_requirements.txt"
     echo "   - Dockerfile-plugins using uv pip"
-    echo "   - PLUGINS=['netbox_secrets','netbox_bgp','netbox_dns','netbox_topology_views']"
+    echo "   - PLUGINS=['netbox_secrets']"
     echo "   - configuration/plugins.py"
     echo "------------------------------------------------------------"
     echo " Access NetBox at: http://<server-ip>:${NETBOX_PORT}"
