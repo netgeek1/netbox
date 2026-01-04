@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-INSTALL_DIR="/opt"
+SCRIPT_VERSION="1.1.0"
+
+INSTALL_DIR="/opt/netbox-docker"
 NETBOX_PORT="${1:-8000}"
 NETBOX_BRANCH="release"
 
@@ -72,7 +74,7 @@ clone_netbox_docker() {
 # Function: create_plugin_requirements
 # ------------------------------------------------------------
 create_plugin_requirements() {
-    echo "[INFO] Creating plugin_requirements.txt..."
+    echo "[INFO] Creating plugin_requirements.txt (wiki method)..."
 
     cat > plugin_requirements.txt <<'EOF'
 netbox-secrets
@@ -105,7 +107,7 @@ EOF
 # Function: create_plugin_dockerfile
 # ------------------------------------------------------------
 create_plugin_dockerfile() {
-    echo "[INFO] Creating Dockerfile-plugins..."
+    echo "[INFO] Creating Dockerfile-plugins (wiki method)..."
 
     cat > Dockerfile-plugins <<'EOF'
 FROM netboxcommunity/netbox:latest
@@ -119,13 +121,22 @@ EOF
 # Function: create_compose_override
 # ------------------------------------------------------------
 create_compose_override() {
-    echo "[INFO] Creating docker-compose.override.yml..."
+    echo "[INFO] Creating docker-compose.override.yml (wiki method + 300s health)..."
 
     cat > docker-compose.override.yml <<EOF
 services:
   netbox:
+    build:
+      context: .
+      dockerfile: Dockerfile-plugins
     ports:
-      - 8000:8080
+      - "${NETBOX_PORT}:8080"
+    environment:
+      - "PLUGINS=['netbox_secrets']"
+    volumes:
+      - ./configuration:/etc/netbox/config
+    healthcheck:
+      start_period: 300s
 EOF
 }
 
@@ -136,7 +147,7 @@ build_and_start() {
     echo "[INFO] Pulling base images..."
     docker compose pull
 
-    echo "[INFO] Building NetBox image (Dockerfile + plugin_requirements.txt)..."
+    echo "[INFO] Building NetBox image (wiki plugin method)..."
     docker compose build
 
     echo "[INFO] Starting NetBox stack..."
@@ -162,9 +173,9 @@ main() {
     require_root "$@"
     install_docker
     clone_netbox_docker
-#    create_plugin_requirements
-#    create_plugin_config
-#    create_plugin_dockerfile
+    create_plugin_requirements
+    create_plugin_config
+    create_plugin_dockerfile
     create_compose_override
     build_and_start
     create_superuser
@@ -172,10 +183,12 @@ main() {
     echo
     echo "------------------------------------------------------------"
     echo " NetBox installation complete."
-    echo " netbox-secrets installed via BOTH:"
-    echo "   - Dockerfile-plugins"
+    echo " netbox-secrets installed EXACTLY per the wiki:"
     echo "   - plugin_requirements.txt"
-    echo
+    echo "   - Dockerfile-plugins using uv pip"
+    echo "   - PLUGINS=['netbox_secrets']"
+    echo "   - configuration/plugins.py"
+    echo "------------------------------------------------------------"
     echo " Access NetBox at: http://<server-ip>:${NETBOX_PORT}"
     echo "------------------------------------------------------------"
 }
