@@ -3,7 +3,14 @@
 # Netbox Plugins
 #  - https://netboxlabs.com/plugins
 #      - Need to add to plugin_requirements.txt, configuration/plugins.py and PLUGINS=
-
+#
+#
+# - v1.1.4
+#   Added Slurpit Server
+#    - https://gitlab.com/slurpit.io/slurpit_netbox
+#    - https://www.youtube.com/watch?v=Asji7fTfCy8
+#
+#
 # - v1.1.3
 #   Added Netbox Routing
 #    - https://github.com/DanSheps/netbox-routing
@@ -16,7 +23,6 @@
 # - v1.1.2
 #   Added Slurpit Plugin 
 #    - https://gitlab.com/slurpit.io/slurpit_netbox
-#    - https://www.youtube.com/watch?v=Asji7fTfCy8
 #   Added Netbox DNS
 #    - https://github.com/peteeckel/netbox-plugin-dns
 
@@ -24,9 +30,9 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.3"
+SCRIPT_VERSION="1.1.4"
 
-INSTALL_DIR="/opt/netbox-docker"
+INSTALL_DIR="/opt"
 NETBOX_PORT="${1:-8000}"
 NETBOX_BRANCH="release"
 
@@ -102,13 +108,14 @@ clone_slurpit_docker() {
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 
-    if [[ ! -d netbox-docker ]]; then
+    if [[ ! -d slurpit-docker ]]; then
         git clone https://gitlab.com/slurpit.io/images.git slurpit-docker
     else
         echo "[INFO] slurpit-docker already exists — using existing clone."
     fi
 
-    cd slurpit-docker/images
+    cd slurpit-docker
+    cp docker-compose.override-EXAMPLE.yml docker-compose.override.yml
 }
 
 # ------------------------------------------------------------
@@ -173,7 +180,7 @@ EOF
 # Function: create_compose_override
 # ------------------------------------------------------------
 create_compose_override() {
-    echo "[INFO] Creating docker-compose.override.yml (wiki method + 300s health)..."
+    echo "[INFO] Creating docker-compose.override.yml (wiki method + 900s health)..."
 
     cat > docker-compose.override.yml <<EOF
 services:
@@ -188,7 +195,7 @@ services:
     volumes:
       - ./configuration:/etc/netbox/config
     healthcheck:
-      start_period: 300s
+      start_period: 900s
 EOF
 }
 
@@ -229,6 +236,10 @@ main() {
     create_plugin_config
     create_plugin_dockerfile
     create_compose_override
+    cd "$INSTALL_DIR/netbox-docker"
+    build_and_start
+    clone_slurpit_docker
+    cd "$INSTALL_DIR/slurpit-docker"
     build_and_start
     create_superuser
 
