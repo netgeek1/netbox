@@ -4,12 +4,8 @@
 #  - https://netboxlabs.com/plugins
 #      - Need to add to plugin_requirements.txt, configuration/plugins.py and PLUGINS=
 #
-#
-# - v1.1.4
-#   Added Slurpit Server
-#    - https://gitlab.com/slurpit.io/slurpit_netbox
-#    - https://www.youtube.com/watch?v=Asji7fTfCy8
-#
+# - 2.0.1
+#   Version pinning to NetBox 4.4.9 and plugins versions that work
 #
 # - v1.1.3
 #   Added Netbox Routing
@@ -23,45 +19,60 @@
 # - v1.1.2
 #   Added Slurpit Plugin 
 #    - https://gitlab.com/slurpit.io/slurpit_netbox
+#    - https://www.youtube.com/watch?v=Asji7fTfCy8
 #   Added Netbox DNS
 #    - https://github.com/peteeckel/netbox-plugin-dns
-
-
+#
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.4"
+SCRIPT_VERSION="2.0.1"
 
 INSTALL_DIR="/opt"
-NETBOX_PORT="${1:-8000}"
+NETBOX_COMPOSE_DIR="${INSTALL_DIR}/netbox-docker"
+NETBOX_PORT="${NETBOX_PORT:-8000}"
 NETBOX_BRANCH="release"
+NETBOX_VERSION="v4.4.9"
+
+REAL_USER="${SUDO_USER:-${LOGNAME:-$(whoami)}}"
+
+log()   { printf '[INFO] %s\n' "$*"; }
+warn()  { printf '[WARN] %s\n' "$*" >&2; }
+error() { printf '[ERROR] %s\n' "$*" >&2; }
 
 # ------------------------------------------------------------
-# Function: require_root
+# Root handling
 # ------------------------------------------------------------
 require_root() {
     if [[ $EUID -ne 0 ]]; then
         echo "[INFO] Elevation required — re-running with sudo..."
-        sudo bash "$0" "$@"
+        sudo -E bash "$0" "$@"
         exit $?
     fi
 }
 
 # ------------------------------------------------------------
-# Function: install_docker
+# Docker install
 # ------------------------------------------------------------
 install_docker() {
-  command -v docker >/dev/null 2>&1 && return
-  log "Docker not found; installing prerequisites + Docker Engine..."
+  if command -v docker >/dev/null 2>&1; then
+    log "Docker already installed."
+    return
+  fi
+
+  log "Installing Docker Engine..."
 
   apt-get update
-  apt-get install -y ca-certificates curl gnupg lsb-release openssl
+  apt-get install -y ca-certificates curl gnupg lsb-release openssl git
 
   mkdir -p /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
 
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+    > /etc/apt/sources.list.d/docker.list
 
   apt-get update
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
@@ -77,15 +88,15 @@ ensure_docker_group() {
   if ! id "$REAL_USER" | grep -q docker; then
     log "Adding user '$REAL_USER' to docker group"
     usermod -aG docker "$REAL_USER"
-    warn "You may need to log out/in for group changes to apply in existing sessions."
+    warn "You may need to log out/in for group changes to apply."
   fi
 }
 
 # ------------------------------------------------------------
-# Function: clone_netbox_docker
+# Clone netbox-docker
 # ------------------------------------------------------------
 clone_netbox_docker() {
-    echo "[INFO] Cloning netbox-docker repository..."
+    log "Ensuring netbox-docker repository exists..."
 
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
@@ -93,52 +104,36 @@ clone_netbox_docker() {
     if [[ ! -d netbox-docker ]]; then
         git clone -b "$NETBOX_BRANCH" https://github.com/netbox-community/netbox-docker.git
     else
-        echo "[INFO] netbox-docker already exists — using existing clone."
+        log "netbox-docker already exists."
     fi
+}
 
-    cd netbox-docker
+update_netbox_repo() {
+    cd "$NETBOX_COMPOSE_DIR"
+    log "Updating netbox-docker repo..."
+    git pull --ff-only || warn "Git pull failed; check local changes."
 }
 
 # ------------------------------------------------------------
-# Function: clone_slurpit_docker
-# ------------------------------------------------------------
-clone_slurpit_docker() {
-    echo "[INFO] Cloning slurpit-docker repository..."
-
-    mkdir -p "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
-
-    if [[ ! -d slurpit-docker ]]; then
-        git clone https://gitlab.com/slurpit.io/images.git slurpit-docker
-    else
-        echo "[INFO] slurpit-docker already exists — using existing clone."
-    fi
-
-    cd slurpit-docker
-    cp docker-compose.override-EXAMPLE.yml docker-compose.override.yml
-}
-
-# ------------------------------------------------------------
-# Function: create_plugin_requirements
+# Plugin bundle (your exact working list)
 # ------------------------------------------------------------
 create_plugin_requirements() {
-    echo "[INFO] Creating plugin_requirements.txt (wiki method)..."
+    cd "$NETBOX_COMPOSE_DIR"
+    log "Writing plugin_requirements.txt..."
 
     cat > plugin_requirements.txt <<'EOF'
-netbox-secrets
-slurpit_netbox
-netbox-plugin-dns
-netbox-routing
-netbox-inventory
-netbox-topology-views
+netbox-secrets==2.4.1
+slurpit_netbox==1.2.7
+netbox-plugin-dns==1.4.7
+netbox-inventory==2.4.1
+netbox-routing==0.3.1
+netbox-topology-views==4.4.0
 EOF
 }
 
-# ------------------------------------------------------------
-# Function: create_plugin_config
-# ------------------------------------------------------------
 create_plugin_config() {
-    echo "[INFO] Creating configuration/plugins.py..."
+    cd "$NETBOX_COMPOSE_DIR"
+    log "Writing configuration/plugins.py..."
 
     mkdir -p configuration
 
@@ -149,7 +144,7 @@ PLUGINS = [
     "netbox_dns",
     "netbox_routing",
     "netbox_inventory",
-	"netbox_topology_views",
+    "netbox_topology_views",
 ]
 
 PLUGINS_CONFIG = {
@@ -157,30 +152,26 @@ PLUGINS_CONFIG = {
         "public_key": "",
         "private_key": "",
     },
-	"netbox_inventory": {},
+    "netbox_inventory": {},
 }
 EOF
 }
 
-# ------------------------------------------------------------
-# Function: create_plugin_dockerfile
-# ------------------------------------------------------------
 create_plugin_dockerfile() {
-    echo "[INFO] Creating Dockerfile-plugins (wiki method)..."
+    cd "$NETBOX_COMPOSE_DIR"
+    log "Writing Dockerfile-plugins with pinned NetBox version ${NETBOX_VERSION}..."
 
-    cat > Dockerfile-plugins <<'EOF'
-FROM netboxcommunity/netbox:latest
+    cat > Dockerfile-plugins <<EOF
+FROM netboxcommunity/netbox:${NETBOX_VERSION}
 
 COPY ./plugin_requirements.txt /opt/netbox/
 RUN /usr/local/bin/uv pip install -r /opt/netbox/plugin_requirements.txt
 EOF
 }
 
-# ------------------------------------------------------------
-# Function: create_compose_override
-# ------------------------------------------------------------
 create_compose_override() {
-    echo "[INFO] Creating docker-compose.override.yml (wiki method + 900s health)..."
+    cd "$NETBOX_COMPOSE_DIR"
+    log "Writing docker-compose.override.yml..."
 
     cat > docker-compose.override.yml <<EOF
 services:
@@ -195,40 +186,116 @@ services:
     volumes:
       - ./configuration:/etc/netbox/config
     healthcheck:
-      start_period: 900s
+      start_period: 300s
 EOF
 }
 
 # ------------------------------------------------------------
-# Function: build_and_start
+# Build & lifecycle
 # ------------------------------------------------------------
-build_and_start() {
-    echo "[INFO] Pulling base images..."
+build_netbox() {
+    cd "$NETBOX_COMPOSE_DIR"
+    log "Pulling base images..."
     docker compose pull
 
-    echo "[INFO] Building NetBox image (wiki plugin method)..."
+    log "Building NetBox image..."
     docker compose build
+}
 
-    echo "[INFO] Starting NetBox stack..."
+start_netbox() {
+    cd "$NETBOX_COMPOSE_DIR"
+    log "Starting NetBox..."
     docker compose up -d
 }
 
-# ------------------------------------------------------------
-# Function: create_superuser
-# ------------------------------------------------------------
-create_superuser() {
-    echo "[INFO] Attempting to create NetBox superuser..."
-    docker compose exec netbox /opt/netbox/netbox/manage.py createsuperuser || {
-        echo "[WARN] NetBox not healthy yet — rerun manually:"
-        echo "       cd ${INSTALL_DIR}/netbox-docker"
-        echo "       docker compose exec netbox /opt/netbox/netbox/manage.py createsuperuser"
-    }
+stop_netbox() {
+    cd "$NETBOX_COMPOSE_DIR"
+    log "Stopping NetBox..."
+    docker compose down
+}
+
+restart_netbox() {
+    stop_netbox
+    start_netbox
+}
+
+status_netbox() {
+    cd "$NETBOX_COMPOSE_DIR"
+    docker compose ps
+}
+
+logs_netbox() {
+    cd "$NETBOX_COMPOSE_DIR"
+    docker compose logs -f "${1:-netbox}"
+}
+
+shell_netbox() {
+    cd "$NETBOX_COMPOSE_DIR"
+    docker compose exec netbox /bin/bash
 }
 
 # ------------------------------------------------------------
-# Main
+# Superuser
 # ------------------------------------------------------------
-main() {
+create_superuser() {
+    cd "$NETBOX_COMPOSE_DIR"
+    docker compose exec netbox /opt/netbox/netbox/manage.py createsuperuser || {
+        warn "NetBox not healthy yet. Run manually:"
+        echo "  docker compose exec netbox /opt/netbox/netbox/manage.py createsuperuser"
+    }
+}
+
+reset_superuser_password() {
+    local user="${1:-}"
+    [[ -z "$user" ]] && { error "Usage: netbox-manager superuser reset <username>"; exit 1; }
+
+    cd "$NETBOX_COMPOSE_DIR"
+    docker compose exec netbox /opt/netbox/netbox/manage.py changepassword "$user"
+}
+
+# ------------------------------------------------------------
+# Health & diagnostics
+# ------------------------------------------------------------
+health_check() {
+    cd "$NETBOX_COMPOSE_DIR"
+    docker compose ps
+}
+
+version_info() {
+    echo "netbox-manager version: $SCRIPT_VERSION"
+}
+
+# ------------------------------------------------------------
+# High-level install/update/rebuild
+# ------------------------------------------------------------
+do_install() {
+    require_root "$@"
+    install_docker
+    ensure_docker_group
+    clone_netbox_docker
+    create_plugin_requirements
+    create_plugin_config
+    create_plugin_dockerfile
+    create_compose_override
+    build_netbox
+    start_netbox
+    create_superuser
+}
+
+do_update() {
+    require_root "$@"
+    install_docker
+    clone_netbox_docker
+    update_netbox_repo
+    create_plugin_requirements
+    create_plugin_config
+    create_plugin_dockerfile
+    create_compose_override
+    build_netbox
+    restart_netbox
+}
+
+do_rebuild() {
     require_root "$@"
     install_docker
     clone_netbox_docker
@@ -236,24 +303,90 @@ main() {
     create_plugin_config
     create_plugin_dockerfile
     create_compose_override
-    cd "$INSTALL_DIR/netbox-docker"
-    build_and_start
-    clone_slurpit_docker
-    cd "$INSTALL_DIR/slurpit-docker"
-    build_and_start
-    create_superuser
-
-    echo
-    echo "------------------------------------------------------------"
-    echo " NetBox installation complete."
-    echo " netbox-secrets installed EXACTLY per the wiki:"
-    echo "   - plugin_requirements.txt"
-    echo "   - Dockerfile-plugins using uv pip"
-    echo "   - PLUGINS=['netbox_secrets','slurpit_netbox','netbox_dns','netbox_routing','netbox_inventory','netbox_topology_views']"
-    echo "   - configuration/plugins.py"
-    echo "------------------------------------------------------------"
-    echo " Access NetBox at: http://<server-ip>:${NETBOX_PORT}"
-    echo "------------------------------------------------------------"
+    build_netbox
+    restart_netbox
 }
 
-main "$@"
+# ------------------------------------------------------------
+# Menu UI
+# ------------------------------------------------------------
+show_menu() {
+cat <<EOF
+netbox-manager ${SCRIPT_VERSION}
+
+1) Install
+2) Update
+3) Rebuild
+4) Start
+5) Stop
+6) Restart
+7) Status
+8) Logs
+9) Shell
+10) Superuser: Create
+11) Superuser: Reset Password
+12) Health Check
+13) Version Info
+0) Exit
+EOF
+}
+
+menu_loop() {
+  while true; do
+    show_menu
+    read -rp "Select: " choice
+    echo
+    case "$choice" in
+      1) do_install ;;
+      2) do_update ;;
+      3) do_rebuild ;;
+      4) start_netbox ;;
+      5) stop_netbox ;;
+      6) restart_netbox ;;
+      7) status_netbox ;;
+      8) read -rp "Service [netbox]: " svc; logs_netbox "${svc:-netbox}" ;;
+      9) shell_netbox ;;
+      10) create_superuser ;;
+      11) read -rp "Username: " u; reset_superuser_password "$u" ;;
+      12) health_check ;;
+      13) version_info ;;
+      0) exit 0 ;;
+      *) echo "Invalid option." ;;
+    esac
+    echo
+  done
+}
+
+# ------------------------------------------------------------
+# CLI dispatcher
+# ------------------------------------------------------------
+dispatch() {
+  require_root
+  local cmd="${1:-}"
+  shift || true
+
+  case "$cmd" in
+    install) do_install "$@" ;;
+    update) do_update "$@" ;;
+    rebuild) do_rebuild "$@" ;;
+    start) start_netbox ;;
+    stop) stop_netbox ;;
+    restart) restart_netbox ;;
+    status) status_netbox ;;
+    logs) logs_netbox "${1:-netbox}" ;;
+    shell) shell_netbox ;;
+    superuser)
+      case "${1:-}" in
+        create) create_superuser ;;
+        reset) shift; reset_superuser_password "${1:-}" ;;
+        *) error "Usage: netbox-manager superuser [create|reset <user>]" ;;
+      esac
+      ;;
+    health) health_check ;;
+    version) version_info ;;
+    "") menu_loop ;;
+    *) error "Unknown command: $cmd" ;;
+  esac
+}
+
+dispatch "$@"
