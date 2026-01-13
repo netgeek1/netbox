@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
+IFS=$'\n\t'
 
 # netbox-manager with Slurp'it sidecar support (clean / upstream-exact / upstream-raw)
-# - Builds NetBox with plugins
-# - Adds Slurp'it stack alongside NetBox
-# - Slurp'it mode selectable at install time AND via menu
-# - Slurp'it UI port selectable at deployment time
-# - Auto-generates (best-effort) a NetBox API token named "slurpit"
-#
-# NOTE:
-# - Slurp'it upstream compose (as you pasted) uses Docker Hub images: slurpit/warehouse, slurpit/scraper, slurpit/scanner, slurpit/portal
-# - The gitlab.com/slurpit.io/images registry is not used by that compose.
-# - NetBox->Slurp'it "sync preconfig" is done by injecting likely env vars; if Slurp'it ignores them, nothing breaks.
+# Refactor based on your original script, preserving:
+# - auto sudo escalation
+# - docker install + docker group add
+# - function-based structure
+# - netbox-community/netbox-docker clone workflow
+# - Slurp'it modes + upstream raw compose import + overrides
+# - pinned/latest NetBox + pinned/latest plugins
+# Adds hardening/safety sweep fixes:
+# - ERR trap with line + command (no silent exits)
+# - set -e safe grep usage in helpers
+# - OS-safe package install wrapper (Ubuntu/Debian as original intent)
+# - compose config preflight validation
+# - required file assertions
+# - safer env loading (no unsafe export parsing)
+# - menu-selectable netbox-docker git update toggle (persisted)
 
-SCRIPT_VERSION="4.1.0"
+SCRIPT_VERSION="4.2.0"
 
 INSTALL_DIR="/opt/netbox-docker"
 NETBOX_COMPOSE_DIR="${INSTALL_DIR}/netbox-docker"
 NETBOX_BRANCH="release"
-
 REAL_USER="${SUDO_USER:-${LOGNAME:-$(whoami)}}"
 
 NETBOX_PORT="${NETBOX_PORT:-8000}"
@@ -50,6 +55,21 @@ SLURPIT_UPSTREAM_RAW_URL_DEFAULT="https://gitlab.com/slurpit.io/images/-/raw/mai
 SLURPIT_UPSTREAM_RAW_FILE="${NETBOX_COMPOSE_DIR}/docker-compose.slurpit.upstream.yml"
 SLURPIT_UPSTREAM_RAW_OVERRIDE_FILE="${NETBOX_COMPOSE_DIR}/docker-compose.slurpit.upstream.override.yml"
 
+# Installer state (persisted)
+INSTALLER_STATE_FILE="${NETBOX_COMPOSE_DIR}/.env.installer"
+UPDATE_REPO_DEFAULT="no" # menu-selectable
+
+# ------------------------------------------------------------
+# Safety: error trap (no silent exits)
+# ------------------------------------------------------------
+ts() { date +"%Y-%m-%d %H:%M:%S"; }
+on_err() {
+  local ec=$?
+  printf '[ERROR] %s | exit=%s | line=%s | cmd=%s\n' "$(ts)" "${ec}" "${BASH_LINENO[0]:-?}" "${BASH_COMMAND}" >&2
+  exit "${ec}"
+}
+trap on_err ERR
+
 # ------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------
@@ -68,18 +88,69 @@ else
 fi
 
 log()   { printf '[INFO] %s\n' "$*"; }
+ok()    { printf "${COLOR_GREEN}[OK] %s${COLOR_RESET}\n" "$*"; }
 warn()  { printf "${COLOR_YELLOW}[WARN] %s${COLOR_RESET}\n" "$*" >&2; }
 error() { printf "${COLOR_RED}[ERROR] %s${COLOR_RESET}\n" "$*" >&2; }
 
+# ------------------------------------------------------------
+# Privilege escalation
+# ------------------------------------------------------------
 require_root() {
-  if [[ $EUID -ne 0 ]]; then
-    sudo -E bash "$0" "$@"
-    exit $?
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      exec sudo -E bash "$0" "$@"
+    fi
+    error "This script requires root (or sudo)."
+    exit 1
   fi
 }
 
 # ------------------------------------------------------------
-# Dependencies
+# OS + package management (Ubuntu/Debian as per original)
+# ------------------------------------------------------------
+detect_os_id() {
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    echo "${ID:-unknown}"
+    return 0
+  fi
+  echo "unknown"
+}
+
+apt_install() {
+  apt-get update
+  apt-get install -y "$@"
+}
+
+ensure_packages() {
+  local pkgs=(curl jq openssl git)
+  local missing=()
+  local p
+
+  for p in "${pkgs[@]}"; do
+    command -v "$p" >/dev/null 2>&1 || missing+=("$p")
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    local os_id
+    os_id="$(detect_os_id)"
+    case "${os_id}" in
+      ubuntu|debian)
+        log "Installing packages: ${missing[*]}"
+        apt_install "${missing[@]}"
+        ;;
+      *)
+        error "Missing packages: ${missing[*]}"
+        error "Unsupported OS for auto-install: ${os_id}"
+        exit 1
+        ;;
+    esac
+  fi
+}
+
+# ------------------------------------------------------------
+# Dependencies: Docker
 # ------------------------------------------------------------
 install_docker() {
   if command -v docker >/dev/null 2>&1; then
@@ -87,44 +158,41 @@ install_docker() {
     return
   fi
 
+  local os_id
+  os_id="$(detect_os_id)"
+  case "${os_id}" in
+    ubuntu|debian) ;;
+    *)
+      error "Unsupported OS for automatic Docker install: ${os_id}"
+      exit 1
+      ;;
+  esac
+
   log "Installing Docker Engine..."
-  apt-get update
-  apt-get install -y ca-certificates curl gnupg lsb-release openssl git
+  apt_install ca-certificates curl gnupg lsb-release openssl git
 
   mkdir -p /etc/apt/keyrings
-  curl -sSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
+  if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
+    curl -sSL "https://download.docker.com/linux/${os_id}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  fi
 
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${os_id} $(lsb_release -cs) stable" \
     > /etc/apt/sources.list.d/docker.list
 
   apt-get update
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-
-  systemctl enable docker
-  systemctl start docker
-  log "Docker installed."
+  systemctl enable docker || true
+  systemctl start docker || true
+  ok "Docker installed."
 }
 
 ensure_docker_group() {
-  getent group docker >/dev/null || groupadd docker
-  if ! id "$REAL_USER" | grep -q docker; then
-    log "Adding user '$REAL_USER' to docker group"
-    usermod -aG docker "$REAL_USER"
+  getent group docker >/dev/null 2>&1 || groupadd docker || true
+  if ! id "$REAL_USER" 2>/dev/null | grep -q '\bdocker\b' >/dev/null 2>&1; then
+    log "Adding user '${REAL_USER}' to docker group"
+    usermod -aG docker "$REAL_USER" || true
     warn "You may need to log out/in for group changes to apply."
-  fi
-}
-
-ensure_packages() {
-  local pkgs=(curl jq openssl git)
-  local missing=()
-  for p in "${pkgs[@]}"; do
-    command -v "$p" >/dev/null 2>&1 || missing+=("$p")
-  done
-  if (( ${#missing[@]} > 0 )); then
-    log "Installing packages: ${missing[*]}"
-    apt-get update
-    apt-get install -y "${missing[@]}"
   fi
 }
 
@@ -132,6 +200,42 @@ ensure_dependencies() {
   install_docker
   ensure_docker_group
   ensure_packages
+  docker compose version >/dev/null 2>&1 || { error "Docker Compose v2 plugin not available (docker compose)."; exit 1; }
+}
+
+# ------------------------------------------------------------
+# Installer state (menu-selectable repo update)
+# ------------------------------------------------------------
+load_installer_state() {
+  if [[ -f "${INSTALLER_STATE_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${INSTALLER_STATE_FILE}" || true
+  fi
+  UPDATE_REPO="${UPDATE_REPO:-$UPDATE_REPO_DEFAULT}"
+}
+
+save_installer_state() {
+  mkdir -p "${NETBOX_COMPOSE_DIR}" 2>/dev/null || true
+  cat > "${INSTALLER_STATE_FILE}" <<EOF
+# Managed by netbox-manager
+UPDATE_REPO=${UPDATE_REPO}
+EOF
+}
+
+toggle_repo_update_setting() {
+  load_installer_state
+  echo "Toggle netbox-docker git update on install/update/rebuild."
+  echo "Current: UPDATE_REPO=${UPDATE_REPO}"
+  echo "1) yes"
+  echo "2) no"
+  read -rp "Select [1-2]: " c
+  case "${c}" in
+    1) UPDATE_REPO="yes" ;;
+    2) UPDATE_REPO="no" ;;
+    *) warn "Invalid selection; unchanged." ;;
+  esac
+  save_installer_state
+  ok "Saved: UPDATE_REPO=${UPDATE_REPO}"
 }
 
 # ------------------------------------------------------------
@@ -149,7 +253,13 @@ clone_netbox_docker() {
   fi
 }
 
-update_netbox_repo() {
+update_netbox_repo_if_enabled() {
+  load_installer_state
+  if [[ "${UPDATE_REPO}" != "yes" ]]; then
+    log "Repo update skipped (UPDATE_REPO=${UPDATE_REPO})."
+    return 0
+  fi
+
   cd "$NETBOX_COMPOSE_DIR"
   log "Updating netbox-docker repo..."
   git pull --ff-only || warn "Git pull failed; check local changes."
@@ -188,23 +298,22 @@ create_plugin_config() {
   cd "$NETBOX_COMPOSE_DIR"
   log "Writing configuration/plugins.py..."
   mkdir -p configuration
-
   cat > configuration/plugins.py <<'EOF'
 PLUGINS = [
-    "netbox_secrets",
-    "slurpit_netbox",
-    "netbox_dns",
-    "netbox_inventory",
-    "netbox_routing",
-    "netbox_topology_views",
+  "netbox_secrets",
+  "slurpit_netbox",
+  "netbox_dns",
+  "netbox_inventory",
+  "netbox_routing",
+  "netbox_topology_views",
 ]
 
 PLUGINS_CONFIG = {
-    "netbox_secrets": {
-        "public_key": "",
-        "private_key": "",
-    },
-    "netbox_inventory": {},
+  "netbox_secrets": {
+    "public_key": "",
+    "private_key": "",
+  },
+  "netbox_inventory": {},
 }
 EOF
 }
@@ -228,13 +337,30 @@ EOF
 }
 
 # ------------------------------------------------------------
-# Slurp'it env + prompts (stdout clean)
+# Safer env loading (no unsafe export $(grep ...))
+# ------------------------------------------------------------
+load_env_file_safely() {
+  # Loads KEY=VALUE (simple) pairs into environment; ignores comments/blank lines.
+  # Does not attempt to interpret quotes/escapes; intended for this script-managed env files.
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+
+  while IFS='=' read -r k v; do
+    [[ -z "${k:-}" ]] && continue
+    [[ "${k}" =~ ^[[:space:]]*# ]] && continue
+    k="${k#"${k%%[![:space:]]*}"}"
+    v="${v:-}"
+    if [[ "${k}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      export "${k}=${v}"
+    fi
+  done < <(grep -v '^[[:space:]]*$' "$f" || true)
+}
+
+# ------------------------------------------------------------
+# Slurp'it env + prompts
 # ------------------------------------------------------------
 load_slurpit_env() {
-  if [[ -f "$SLURPIT_ENV_FILE" ]]; then
-    # shellcheck disable=SC2046
-    export $(grep -v '^[[:space:]]*#' "$SLURPIT_ENV_FILE" | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | xargs -r)
-  fi
+  load_env_file_safely "$SLURPIT_ENV_FILE"
 }
 
 random_secret() {
@@ -261,7 +387,7 @@ prompt_slurpit_ui_port() {
     *) warn "Invalid choice; using 8081."; port="8081" ;;
   esac
 
-  if [[ -z "$port" ]]; then port="8081"; fi
+  [[ -n "$port" ]] || port="8081"
   echo "$port"
 }
 
@@ -291,14 +417,9 @@ save_slurpit_env() {
   local ui_port="$2"
   local netbox_token="$3"
 
-  # Clean-mode secrets (also used by upstream-exact if you want to keep secrets out of the compose)
   local mariadb_pass="${SLURPIT_MARIADB_PASSWORD:-$(random_secret)}"
   local mongo_pass="${SLURPIT_MONGO_PASSWORD:-$(random_secret)}"
-
-  # Upstream uses TZ Europe/Amsterdam; clean uses UTC by default
   local tz="${SLURPIT_TZ:-UTC}"
-
-  # Raw upstream URL (overrideable)
   local raw_url="${SLURPIT_UPSTREAM_RAW_URL:-$SLURPIT_UPSTREAM_RAW_URL_DEFAULT}"
 
   cat > "$SLURPIT_ENV_FILE" <<EOF
@@ -327,31 +448,44 @@ EOF
 # ------------------------------------------------------------
 # Docker compose wrapper (adds Slurp'it files when needed)
 # ------------------------------------------------------------
-dc() {
+assert_compose_files() {
   cd "$NETBOX_COMPOSE_DIR"
+  [[ -f docker-compose.yml ]] || { error "Missing docker-compose.yml in ${NETBOX_COMPOSE_DIR}"; exit 1; }
+
+  # Our override should always exist after apply_slurpit_mode_to_compose_files
+  [[ -f docker-compose.override.yml ]] || { error "Missing docker-compose.override.yml; run install/update first."; exit 1; }
 
   load_slurpit_env
   local mode="${SLURPIT_MODE:-$SLURPIT_MODE_DEFAULT}"
 
-  # Base netbox-docker compose
+  if [[ "$mode" == "upstream-raw" ]]; then
+    [[ -f "$SLURPIT_UPSTREAM_RAW_FILE" ]] || { error "Missing ${SLURPIT_UPSTREAM_RAW_FILE} (raw mode)"; exit 1; }
+    [[ -f "$SLURPIT_UPSTREAM_RAW_OVERRIDE_FILE" ]] || { error "Missing ${SLURPIT_UPSTREAM_RAW_OVERRIDE_FILE} (raw mode)"; exit 1; }
+  fi
+}
+
+dc() {
+  cd "$NETBOX_COMPOSE_DIR"
+  load_slurpit_env
+
+  local mode="${SLURPIT_MODE:-$SLURPIT_MODE_DEFAULT}"
   local files=(-f docker-compose.yml)
 
-  # Our local override (NetBox build + plugins + (maybe) Slurp'it integrated)
   if [[ -f docker-compose.override.yml ]]; then
     files+=(-f docker-compose.override.yml)
   fi
 
-  # If upstream raw mode, also include upstream file + override
   if [[ "$mode" == "upstream-raw" ]]; then
-    if [[ -f "$SLURPIT_UPSTREAM_RAW_FILE" ]]; then
-      files+=(-f "$SLURPIT_UPSTREAM_RAW_FILE")
-    fi
-    if [[ -f "$SLURPIT_UPSTREAM_RAW_OVERRIDE_FILE" ]]; then
-      files+=(-f "$SLURPIT_UPSTREAM_RAW_OVERRIDE_FILE")
-    fi
+    files+=(-f "$SLURPIT_UPSTREAM_RAW_FILE" -f "$SLURPIT_UPSTREAM_RAW_OVERRIDE_FILE")
   fi
 
   docker compose "${files[@]}" "$@"
+}
+
+compose_validate() {
+  assert_compose_files
+  log "Validating composed config..."
+  dc config >/dev/null
 }
 
 # ------------------------------------------------------------
@@ -361,8 +495,9 @@ wait_netbox_container() {
   cd "$NETBOX_COMPOSE_DIR"
   local tries=60
   local i
+
   for ((i=1; i<=tries; i++)); do
-    if dc ps netbox 2>/dev/null | awk 'NR>1{print $0}' | grep -qi netbox; then
+    if dc ps netbox 2>/dev/null | awk 'NR>1{print $0}' | grep -qi netbox >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
@@ -373,25 +508,27 @@ wait_netbox_container() {
 get_or_create_netbox_token_slurpit() {
   cd "$NETBOX_COMPOSE_DIR"
 
-  # NetBox must be running enough for Django + DB to respond. We'll try a few times.
   local tries=20
   local i
+
   for ((i=1; i<=tries; i++)); do
     local token=""
-    token="$(dc exec -T netbox python3 - <<'PY' 2>/dev/null || true
+    token="$(
+      dc exec -T netbox python3 - <<'PY' 2>/dev/null || true
 from django.contrib.auth import get_user_model
 from users.models import Token
 
 User = get_user_model()
 u = User.objects.filter(is_superuser=True).first()
 if not u:
-    raise SystemExit(2)
+  raise SystemExit(2)
 
 t, _ = Token.objects.get_or_create(user=u, name="slurpit")
 print(t.key)
 PY
-)"
+    )"
     token="$(echo "$token" | tr -d '\r' | tail -n1)"
+
     if [[ -n "$token" ]]; then
       echo "$token"
       return 0
@@ -410,7 +547,6 @@ ensure_slurpit_env() {
   mode="$(prompt_slurpit_mode)"
   ui_port="$(prompt_slurpit_ui_port)"
 
-  # If NetBox isn't up yet, we still write env with empty token, then we can re-run later.
   token=""
   if wait_netbox_container; then
     token="$(get_or_create_netbox_token_slurpit)"
@@ -418,7 +554,7 @@ ensure_slurpit_env() {
 
   if [[ -z "$token" ]]; then
     warn "NetBox token auto-generation failed (NetBox may not be ready yet)."
-    warn "Continuing with empty SLURPIT_NETBOX_TOKEN; you can rerun 'Enable Slurp'it' after NetBox is up."
+    warn "Continuing with empty SLURPIT_NETBOX_TOKEN; you can rerun 'Slurp'it: Enable' later."
   fi
 
   save_slurpit_env "$mode" "$ui_port" "$token"
@@ -457,10 +593,8 @@ write_slurpit_integrated_clean() {
   cd "$NETBOX_COMPOSE_DIR"
   load_slurpit_env
 
-  # Add Slurp'it clean stack directly into docker-compose.override.yml
   cat >> docker-compose.override.yml <<'EOF'
 
-services:
   slurpit-mariadb:
     image: mariadb:12-noble
     environment:
@@ -579,18 +713,10 @@ write_slurpit_integrated_upstream_exact() {
   cd "$NETBOX_COMPOSE_DIR"
   load_slurpit_env
 
-  # Keep upstream service names/healthchecks/depends_on conditions/host mounts/container_name/restart.
-  # Minimal changes:
-  # - make secrets come from .env.slurpit (no hardcoded secrets)
-  # - add portal port mapping to chosen UI port
-  # - add best-effort NetBox env to each service
-  #
-  # Host paths are placed under ./slurpit/* so they don't mix with netbox-docker paths.
   mkdir -p slurpit/db/mariadb slurpit/db/mongodb slurpit/backup/warehouse slurpit/backup/portal slurpit/logs/nginx slurpit/logs/php slurpit/certs
 
   cat >> docker-compose.override.yml <<'EOF'
 
-services:
   slurpit-mariadb:
     image: mariadb:12-noble
     container_name: slurpit-mariadb
@@ -757,7 +883,6 @@ EOF
 fetch_slurpit_upstream_raw_compose() {
   cd "$NETBOX_COMPOSE_DIR"
   load_slurpit_env
-
   local url="${SLURPIT_UPSTREAM_RAW_URL:-$SLURPIT_UPSTREAM_RAW_URL_DEFAULT}"
   log "Fetching Slurp'it upstream raw compose: ${url}"
   curl -fsSL "$url" -o "$SLURPIT_UPSTREAM_RAW_FILE"
@@ -767,12 +892,8 @@ write_slurpit_upstream_raw_override() {
   cd "$NETBOX_COMPOSE_DIR"
   load_slurpit_env
 
-  # This override:
-  # - exposes portal UI port (if upstream compose doesn't)
-  # - injects best-effort NetBox env
-  # - attaches services to slurpit-network (if upstream defines it)
   cat > "$SLURPIT_UPSTREAM_RAW_OVERRIDE_FILE" <<'EOF'
-services:
+
   slurpit-portal:
     ports:
       - "${SLURPIT_UI_PORT}:80"
@@ -811,10 +932,8 @@ EOF
 apply_slurpit_mode_to_compose_files() {
   cd "$NETBOX_COMPOSE_DIR"
   load_slurpit_env
-
   local mode="${SLURPIT_MODE:-$SLURPIT_MODE_DEFAULT}"
 
-  # Always rewrite base override with NetBox build + slurpit-network join
   write_netbox_override_header
 
   case "$mode" in
@@ -834,11 +953,13 @@ apply_slurpit_mode_to_compose_files() {
       write_slurpit_upstream_raw_override
       ;;
     *)
-      warn "Unknown SLURPIT_MODE='$mode'; falling back to integrated-clean."
+      warn "Unknown SLURPIT_MODE='${mode}'; falling back to integrated-clean."
       export SLURPIT_MODE="integrated-clean"
       write_slurpit_integrated_clean
       ;;
   esac
+
+  compose_validate
 }
 
 # ------------------------------------------------------------
@@ -848,7 +969,6 @@ build_stack() {
   cd "$NETBOX_COMPOSE_DIR"
   log "Pulling images..."
   dc pull
-
   log "Building NetBox image..."
   dc build
 }
@@ -865,10 +985,7 @@ stop_stack() {
   dc down
 }
 
-restart_stack() {
-  stop_stack
-  start_stack
-}
+restart_stack() { stop_stack; start_stack; }
 
 status_stack() {
   cd "$NETBOX_COMPOSE_DIR"
@@ -893,6 +1010,7 @@ shell_netbox() {
 # Slurp'it helpers
 slurpit_logs() {
   cd "$NETBOX_COMPOSE_DIR"
+  # Best effort: if services aren't present in the selected mode, don't fail the script.
   dc logs -f slurpit-portal slurpit-warehouse slurpit-scraper slurpit-scanner slurpit-mariadb slurpit-mongodb || true
 }
 
@@ -908,7 +1026,7 @@ create_superuser() {
   cd "$NETBOX_COMPOSE_DIR"
   dc exec netbox /opt/netbox/netbox/manage.py createsuperuser || {
     warn "NetBox may not be ready yet. Try again later:"
-    warn "  netbox-manager superuser-create"
+    warn " netbox-manager superuser-create"
   }
 }
 
@@ -926,23 +1044,23 @@ do_install() {
   require_root "$@"
   ensure_dependencies
   clone_netbox_docker
+  update_netbox_repo_if_enabled
 
   cd "$NETBOX_COMPOSE_DIR"
+  load_installer_state
   prepare_files
 
-  # Ask + persist mode/port/token (token best-effort)
   ensure_slurpit_env
-
-  # Write compose files for selected mode
   apply_slurpit_mode_to_compose_files
 
-  # Bring up stack
   build_stack
   start_stack
 
-  # Try again to ensure token exists once NetBox is actually up, then re-apply env + restart
+  # Try again after NetBox is up (token best-effort); if changed, re-apply + restart.
   local token2=""
-  token2="$(get_or_create_netbox_token_slurpit)"
+  token2="$(get_or_create_netbox_token_slurpit || true)"
+  token2="${token2:-}"
+  load_slurpit_env
   if [[ -n "$token2" && "${SLURPIT_NETBOX_TOKEN:-}" != "$token2" ]]; then
     save_slurpit_env "${SLURPIT_MODE}" "${SLURPIT_UI_PORT}" "$token2"
     load_slurpit_env
@@ -957,11 +1075,11 @@ do_update() {
   require_root "$@"
   ensure_dependencies
   clone_netbox_docker
-  update_netbox_repo
+  update_netbox_repo_if_enabled
 
   cd "$NETBOX_COMPOSE_DIR"
+  load_installer_state
   prepare_files
-
   ensure_slurpit_env
   apply_slurpit_mode_to_compose_files
 
@@ -975,8 +1093,8 @@ do_rebuild() {
   clone_netbox_docker
 
   cd "$NETBOX_COMPOSE_DIR"
+  load_installer_state
   prepare_files
-
   ensure_slurpit_env
   apply_slurpit_mode_to_compose_files
 
@@ -986,8 +1104,10 @@ do_rebuild() {
 
 enable_slurpit() {
   require_root "$@"
-  cd "$NETBOX_COMPOSE_DIR"
+  ensure_dependencies
+  clone_netbox_docker
 
+  cd "$NETBOX_COMPOSE_DIR"
   ensure_slurpit_env
   apply_slurpit_mode_to_compose_files
 
@@ -997,15 +1117,18 @@ enable_slurpit() {
 
 disable_slurpit() {
   require_root "$@"
-  cd "$NETBOX_COMPOSE_DIR"
+  ensure_dependencies
+  clone_netbox_docker
 
-  # Remove Slurp'it mode files but keep NetBox override header
+  cd "$NETBOX_COMPOSE_DIR"
   log "Disabling Slurp'it (keeping NetBox override + build)..."
   load_slurpit_env
+
   export SLURPIT_MODE="integrated-clean"
   write_netbox_override_header
   rm -f "$SLURPIT_UPSTREAM_RAW_FILE" "$SLURPIT_UPSTREAM_RAW_OVERRIDE_FILE" 2>/dev/null || true
 
+  compose_validate
   restart_stack
 }
 
@@ -1013,29 +1136,39 @@ disable_slurpit() {
 # Menu
 # ------------------------------------------------------------
 show_menu() {
-cat <<EOF
+  load_installer_state
+  cat <<EOF
 netbox-manager ${SCRIPT_VERSION}
 
-1) Install (pinned versions)
-2) Install (latest NetBox + latest plugins)
-3) Update (pinned)
-4) Update (latest)
-5) Rebuild (pinned)
-6) Rebuild (latest)
-7) Start
-8) Stop
-9) Restart
-10) Status
-11) Logs
-12) Shell (NetBox)
+Installer:
+  u) Toggle repo update on deploy (UPDATE_REPO=${UPDATE_REPO})
 
-13) Superuser: Create
-14) Slurp'it: Enable (choose mode + port)
-15) Slurp'it: Disable
-16) Slurp'it: Logs
-17) Slurp'it: Shell (portal)
+Install/Update:
+  1) Install (pinned versions)
+  2) Install (latest NetBox + latest plugins)
+  3) Update (pinned)
+  4) Update (latest)
+  5) Rebuild (pinned)
+  6) Rebuild (latest)
 
-0) Exit
+Stack:
+  7) Start
+  8) Stop
+  9) Restart
+  10) Status
+  11) Logs
+  12) Shell (NetBox)
+
+NetBox:
+  13) Superuser: Create
+
+Slurp'it:
+  14) Enable (choose mode + port)
+  15) Disable
+  16) Logs
+  17) Shell (portal)
+
+  0) Exit
 EOF
 }
 
@@ -1044,7 +1177,9 @@ menu_loop() {
     show_menu
     read -rp "Select: " choice
     echo
+
     case "$choice" in
+      u|U) toggle_repo_update_setting ;;
       1) NETBOX_VERSION_MODE="pinned"; PLUGIN_VERSION_MODE="pinned"; do_install ;;
       2) NETBOX_VERSION_MODE="latest"; PLUGIN_VERSION_MODE="latest"; do_install ;;
       3) NETBOX_VERSION_MODE="pinned"; PLUGIN_VERSION_MODE="pinned"; do_update ;;
@@ -1065,6 +1200,7 @@ menu_loop() {
       0) exit 0 ;;
       *) echo "Invalid option." ;;
     esac
+
     echo
   done
 }
@@ -1088,6 +1224,7 @@ Usage:
   netbox-manager slurpit-disable
   netbox-manager slurpit-logs
   netbox-manager slurpit-shell
+  netbox-manager toggle-repo-update
 EOF
 }
 
@@ -1096,13 +1233,27 @@ dispatch() {
   shift || true
 
   case "$cmd" in
-    "") menu_loop ;;
-    install) NETBOX_VERSION_MODE="pinned"; PLUGIN_VERSION_MODE="pinned"; do_install "$@" ;;
-    install-latest) NETBOX_VERSION_MODE="latest"; PLUGIN_VERSION_MODE="latest"; do_install "$@" ;;
-    update) NETBOX_VERSION_MODE="pinned"; PLUGIN_VERSION_MODE="pinned"; do_update "$@" ;;
-    update-latest) NETBOX_VERSION_MODE="latest"; PLUGIN_VERSION_MODE="latest"; do_update "$@" ;;
-    rebuild) NETBOX_VERSION_MODE="pinned"; PLUGIN_VERSION_MODE="pinned"; do_rebuild "$@" ;;
-    rebuild-latest) NETBOX_VERSION_MODE="latest"; PLUGIN_VERSION_MODE="latest"; do_rebuild "$@" ;;
+    "")
+      menu_loop
+      ;;
+    install)
+      NETBOX_VERSION_MODE="pinned"; PLUGIN_VERSION_MODE="pinned"; do_install "$@"
+      ;;
+    install-latest)
+      NETBOX_VERSION_MODE="latest"; PLUGIN_VERSION_MODE="latest"; do_install "$@"
+      ;;
+    update)
+      NETBOX_VERSION_MODE="pinned"; PLUGIN_VERSION_MODE="pinned"; do_update "$@"
+      ;;
+    update-latest)
+      NETBOX_VERSION_MODE="latest"; PLUGIN_VERSION_MODE="latest"; do_update "$@"
+      ;;
+    rebuild)
+      NETBOX_VERSION_MODE="pinned"; PLUGIN_VERSION_MODE="pinned"; do_rebuild "$@"
+      ;;
+    rebuild-latest)
+      NETBOX_VERSION_MODE="latest"; PLUGIN_VERSION_MODE="latest"; do_rebuild "$@"
+      ;;
     start) start_stack ;;
     stop) stop_stack ;;
     restart) restart_stack ;;
@@ -1114,8 +1265,13 @@ dispatch() {
     slurpit-disable) disable_slurpit ;;
     slurpit-logs) slurpit_logs ;;
     slurpit-shell) slurpit_shell_portal ;;
+    toggle-repo-update) toggle_repo_update_setting ;;
     -h|--help|help) usage ;;
-    *) error "Unknown command: $cmd"; usage; exit 1 ;;
+    *)
+      error "Unknown command: $cmd"
+      usage
+      exit 1
+      ;;
   esac
 }
 
