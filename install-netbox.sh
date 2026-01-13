@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 #
+# This is a 100% working Netbox v4.4.9 install with the following plugins:
+#
+#     netbox-secrets==2.4.1
+#     slurpit_netbox==1.2.7
+#     netbox-plugin-dns==1.4.7
+#     netbox-inventory==2.4.1
+#     netbox-routing==0.3.1
+#     netbox-topology-views==4.4.0
+#
 # Netbox Plugins
 #  - https://netboxlabs.com/plugins
 #      - Need to add to plugin_requirements.txt, configuration/plugins.py and PLUGINS=
