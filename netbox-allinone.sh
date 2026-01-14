@@ -9,8 +9,11 @@
 #     netbox-routing==0.3.1
 #     netbox-topology-views==4.4.0
 #
+# - 4.2.11
+#   Menu and URL fixes
+#
 # - 4.2.10
-#   Docker-compose.override fix
+#   Docker-compose.override fix & URL fixes
 #
 # - 4.2.9
 #   Menu status
@@ -58,7 +61,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="4.2.10"
+SCRIPT_VERSION="4.2.11"
 
 INSTALL_DIR="/opt"
 NETBOX_COMPOSE_DIR="${INSTALL_DIR}/netbox-docker"
@@ -74,6 +77,11 @@ log()   { printf '[INFO] %s\n' "$*"; }
 warn()  { printf '[WARN] %s\n' "$*" >&2; }
 error() { printf '[ERROR] %s\n' "$*" >&2; }
 die()   { echo "[ERROR] $*" >&2; exit 1; }
+
+green() { printf "\033[0;32m%s\033[0m" "$1"; }
+red()   { printf "\033[0;31m%s\033[0m" "$1"; }
+yellow(){ printf "\033[0;33m%s\033[0m" "$1"; }
+
 
 # ------------------------------------------------------------
 # Root handling
@@ -291,6 +299,42 @@ shell_netbox() {
     docker compose exec netbox /bin/bash
 }
 
+get_host_ip() {
+    ip route get 1 | awk '{print $7; exit}'
+}
+
+check_url_reachable() {
+    local url="$1"
+    if curl -s --max-time 2 "$url" >/dev/null; then
+        echo "OK"
+    else
+        echo "FAIL"
+    fi
+}
+
+print_url_status() {
+    local label="$1"
+    local url="$2"
+    local status
+
+    status="$(check_url_reachable "$url")"
+
+    if [[ "$status" == "OK" ]]; then
+        printf "%-22s %s [%s]\n" "$label:" "$url" "$(green OK)"
+    else
+        printf "%-22s %s [%s]\n" "$label:" "$url" "$(red FAIL)"
+    fi
+}
+
+open_in_browser() {
+    local url="$1"
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$url" >/dev/null 2>&1 &
+    elif command -v open >/dev/null 2>&1; then
+        open "$url" >/dev/null 2>&1 &
+    fi
+}
+
 ###############################################################################
 # URL Auto‑Detection Helpers
 ###############################################################################
@@ -301,28 +345,42 @@ detect_published_port() {
     local internal_port="$2"
 
     docker inspect "$container" \
-      --format '{{range $p, $conf := .NetworkSettings.Ports}}{{println $p $conf}}{{end}}' 2>/dev/null \
-    | awk -v port="${internal_port}/tcp" '$1 == port {print $2}' \
-    | sed -E 's/.*HostPort":"?([0-9]+)"?.*/\1/' \
+      --format "{{range \$p, \$conf := .NetworkSettings.Ports}}{{if eq \$p \"${internal_port}/tcp\"}}{{range \$conf}}{{println .HostPort}}{{end}}{{end}}{{end}}" \
+      2>/dev/null \
+    | grep -E '^[0-9]+$' \
     | head -n1
 }
 
+
 # NetBox URL (always published)
 get_netbox_url() {
-    echo "http://localhost:${NETBOX_PORT}"
+    local host_port host_ip
+    host_port="$(detect_published_port netbox-docker-netbox-1 8080)"
+    host_ip="$(get_host_ip)"
+
+    if [[ -n "$host_port" ]]; then
+        echo "http://${host_ip}:${host_port}"
+    else
+        echo "http://netbox-docker-netbox-1:8080  (internal only)"
+    fi
 }
 
 get_netbox_api_status_url() {
-    echo "http://localhost:${NETBOX_PORT}/api/status/"
+    local base
+    base="$(get_netbox_url)"
+    echo "${base}/api/status/"
 }
+
+
 
 # Slurp’it Portal URL (auto‑detect host → fallback to internal)
 get_slurpit_portal_url() {
-    local host_port
+    local host_port host_ip
     host_port="$(detect_published_port slurpit-portal 80)"
+    host_ip="$(get_host_ip)"
 
     if [[ -n "$host_port" ]]; then
-        echo "http://localhost:${host_port}"
+        echo "http://${host_ip}:${host_port}"
     else
         echo "http://slurpit-portal:80  (internal only)"
     fi
@@ -330,11 +388,12 @@ get_slurpit_portal_url() {
 
 # Slurp’it Warehouse URL (auto‑detect host → fallback to internal)
 get_slurpit_warehouse_url() {
-    local host_port
+    local host_port host_ip
     host_port="$(detect_published_port slurpit-warehouse 3000)"
+    host_ip="$(get_host_ip)"
 
     if [[ -n "$host_port" ]]; then
-        echo "http://localhost:${host_port}"
+        echo "http://${host_ip}:${host_port}"
     else
         echo "http://slurpit-warehouse:3000  (internal only)"
     fi
@@ -431,13 +490,192 @@ slurpit_docker_compose_up() {
     docker compose up -d --force-recreate
 }
 
+get_netbox_plugins() {
+    docker exec netbox-docker-netbox-1 sh -c \
+      "python3 - <<'EOF'
+import ast, pathlib
+cfg = pathlib.Path('/etc/netbox/config/plugins.py').read_text()
+tree = ast.parse(cfg)
+for node in tree.body:
+    if isinstance(node, ast.Assign) and node.targets[0].id == 'PLUGINS':
+        print([elt.value for elt in node.value.elts])
+EOF" 2>/dev/null
+}
+
 # ------------------------------------------------------------
 # Health & diagnostics
 # ------------------------------------------------------------
-health_check() {
-    cd "$NETBOX_COMPOSE_DIR"
-    docker compose ps
+system_health_dashboard() {
+    clear
+    echo "============================================================"
+    echo "                 SYSTEM HEALTH DASHBOARD"
+    echo "============================================================"
+    echo
+
+    local host_ip
+    host_ip="$(get_host_ip)"
+
+    echo "Host IP: $host_ip"
+    echo
+
+    # -------------------------
+    # NetBox
+    # -------------------------
+    local nb_url nb_api nb_status
+    nb_url="$(get_netbox_url)"
+    nb_api="$(get_netbox_api_status_url)"
+    nb_status="$(check_url_reachable "$nb_api")"
+
+    if [[ "$nb_status" == "OK" ]]; then
+        nb_status="$(green OK)"
+    else
+        nb_status="$(red FAIL)"
+    fi
+
+    echo "NETBOX"
+    echo "  UI:          $nb_url"
+    echo "  API Status:  $nb_api  [$nb_status]"
+    echo
+
+    # -------------------------
+    # Slurp’it Portal
+    # -------------------------
+    local portal_url portal_status
+    portal_url="$(get_slurpit_portal_url)"
+    portal_status="$(check_url_reachable "$portal_url")"
+
+    if [[ "$portal_status" == "OK" ]]; then
+        portal_status="$(green OK)"
+    else
+        portal_status="$(red FAIL)"
+    fi
+
+    echo "SLURP’IT PORTAL"
+    echo "  URL:         $portal_url  [$portal_status]"
+    echo
+
+    # -------------------------
+    # Slurp’it Warehouse
+    # -------------------------
+    local wh_url wh_status
+    wh_url="$(get_slurpit_warehouse_url)"
+    wh_status="$(check_url_reachable "$wh_url")"
+
+    if [[ "$wh_status" == "OK" ]]; then
+        wh_status="$(green OK)"
+    else
+        wh_status="$(red FAIL)"
+    fi
+
+    echo "SLURP’IT WAREHOUSE"
+    echo "  URL:         $wh_url  [$wh_status]"
+    echo
+
+    # -------------------------
+    # Plugin Status
+    # -------------------------
+    echo "NETBOX PLUGINS"
+    get_netbox_plugins
+    echo
+
+    # -------------------------
+    # Network Membership
+    # -------------------------
+    echo "NETWORKS"
+    echo "  NetBox network: netbox-docker_default"
+    echo "  Slurp’it containers:"
+    docker ps --format '{{.Names}}' | grep slurpit | sed 's/^/    - /'
+    echo
+
+    echo "============================================================"
+    echo "Press ENTER to return to menu"
+    read -rsn1
 }
+
+tui_dashboard() {
+    while true; do
+        clear
+        echo "============================================================"
+        echo "                    LIVE SYSTEM DASHBOARD"
+        echo "============================================================"
+        echo "(Press Q to quit)"
+        echo
+
+        local host_ip
+        host_ip="$(get_host_ip)"
+
+        echo "Host IP: $host_ip"
+        echo
+
+        # NetBox
+        local nb_url nb_api nb_status
+        nb_url="$(get_netbox_url)"
+        nb_api="$(get_netbox_api_status_url)"
+        nb_status="$(check_url_reachable "$nb_api")"
+
+        if [[ "$nb_status" == "OK" ]]; then
+            nb_status="$(green OK)"
+        else
+            nb_status="$(red FAIL)"
+        fi
+
+        echo "NETBOX"
+        echo "  UI:          $nb_url"
+        echo "  API Status:  $nb_api  [$nb_status]"
+        echo
+
+        # Portal
+        local portal_url portal_status
+        portal_url="$(get_slurpit_portal_url)"
+        portal_status="$(check_url_reachable "$portal_url")"
+
+        if [[ "$portal_status" == "OK" ]]; then
+            portal_status="$(green OK)"
+        else
+            portal_status="$(red FAIL)"
+        fi
+
+        echo "SLURP’IT PORTAL"
+        echo "  URL:         $portal_url  [$portal_status]"
+        echo
+
+        # Warehouse
+        local wh_url wh_status
+        wh_url="$(get_slurpit_warehouse_url)"
+        wh_status="$(check_url_reachable "$wh_url")"
+
+        if [[ "$wh_status" == "OK" ]]; then
+            wh_status="$(green OK)"
+        else
+            wh_status="$(red FAIL)"
+        fi
+
+        echo "SLURP’IT WAREHOUSE"
+        echo "  URL:         $wh_url  [$wh_status]"
+        echo
+
+        # Containers
+        echo "CONTAINERS"
+        docker ps --format '  - {{.Names}} ({{.Status}})'
+        echo
+
+        # Networks
+        echo "NETWORKS"
+        if docker network inspect netbox-docker_default >/dev/null 2>&1; then
+            echo "  netbox-docker_default: $(green OK)"
+        else
+            echo "  netbox-docker_default: $(red MISSING)"
+        fi
+        echo
+
+        # Non-blocking read, ignore timeout errors
+        read -rsn1 -t 30 key || true
+        case "$key" in
+            q|Q) break ;;
+        esac
+    done
+}
+
 
 version_info() {
     echo "netbox-manager version: $SCRIPT_VERSION"
@@ -835,10 +1073,12 @@ netbox-manager ${SCRIPT_VERSION}
 9) Shell
 10) Superuser: Create
 11) Superuser: Reset Password
-12) Health Check
+12) System Health Dashboard
 13) Version Info
 14) Slurp'it Netbox Status
 15) URLs & Dashboard
+16) Open in Browser
+17) Live TUI Dashboard
 0) Exit
 EOF
 }
@@ -860,16 +1100,16 @@ menu_loop() {
       9) shell_netbox ;;
       10) create_superuser ;;
       11) read -rp "Username: " u; reset_superuser_password "$u" ;;
-      12) health_check ;;
+      12) system_health_dashboard ;;
       13) version_info ;;
       14) slurpit_netbox_status ;;
       15)
         echo
-        echo "NetBox UI:            $(get_netbox_url)"
-        echo "NetBox API Status:    $(get_netbox_api_status_url)"
+        print_url_status "NetBox UI"            "$(get_netbox_url)"
+        print_url_status "NetBox API Status"    "$(get_netbox_api_status_url)"
         echo
-        echo "Slurp’it Portal:       $(get_slurpit_portal_url)"
-        echo "Slurp’it Warehouse:    $(get_slurpit_warehouse_url)"
+        print_url_status "Slurp’it Portal"       "$(get_slurpit_portal_url)"
+        print_url_status "Slurp’it Warehouse"    "$(get_slurpit_warehouse_url)"
         echo
         echo "Plugin Docs:"
         echo "  - Secrets:           https://github.com/netbox-community/netbox-secrets"
@@ -880,6 +1120,22 @@ menu_loop() {
         echo "  - Topology Views:    https://github.com/netbox-community/netbox-topology-views"
         echo
         ;;
+      
+      16)
+        echo "Which service?"
+        echo "1) NetBox UI"
+        echo "2) Slurp’it Portal"
+        echo "3) Slurp’it Warehouse"
+        read -rp "> " svc
+      
+        case "$svc" in
+          1) open_in_browser "$(get_netbox_url)" ;;
+          2) open_in_browser "$(get_slurpit_portal_url)" ;;
+          3) open_in_browser "$(get_slurpit_warehouse_url)" ;;
+          *) echo "Invalid selection." ;;
+        esac
+        ;;
+      17) tui_dashboard ;;
       0) exit 0 ;;
       *) echo "Invalid option." ;;
     esac
@@ -912,7 +1168,7 @@ dispatch() {
         *) error "Usage: netbox-manager superuser [create|reset <user>]" ;;
       esac
       ;;
-    health) health_check ;;
+    health) system_health_dashboard ;;
     version) version_info ;;
     "") menu_loop ;;
     *) error "Unknown command: $cmd" ;;
