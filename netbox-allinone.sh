@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+f#!/usr/bin/env bash
 #
 # This is a 100% working Netbox v4.4.9 install with the following plugins:
 #
@@ -8,6 +8,9 @@
 #     netbox-inventory==2.4.1
 #     netbox-routing==0.3.1
 #     netbox-topology-views==4.4.0
+#
+# - 4.2.7
+#   Slurp'it re-write
 #
 # - 4.2.6
 #   Slurp'it network fix
@@ -46,7 +49,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="4.2.6"
+SCRIPT_VERSION="4.2.7"
 
 INSTALL_DIR="/opt"
 NETBOX_COMPOSE_DIR="${INSTALL_DIR}/netbox-docker"
@@ -349,55 +352,107 @@ slurpit_docker_compose_up() {
     docker compose up -d --force-recreate
 }
 
+# ------------------------------------------------------------
+# Health & diagnostics
+# ------------------------------------------------------------
+health_check() {
+    cd "$NETBOX_COMPOSE_DIR"
+    docker compose ps
+}
+
+version_info() {
+    echo "netbox-manager version: $SCRIPT_VERSION"
+}
+
 ###############################################################################
-# Slurp’it ↔ NetBox Integration Functions
+# Slurp’it ↔ NetBox integration module with network auto-repair
 ###############################################################################
-slurpit_netbox_integration() {
+
+# Logging helpers (assumes die/log not already defined)
+log() { echo "[INFO] $*"; }
+die() { echo "[ERROR] $*" >&2; exit 1; }
+
+###############################################################################
+# Detection helpers
+###############################################################################
 
 detect_netbox_api_container() {
   docker ps --format '{{.Names}} {{.Image}}' \
     | awk '$2 ~ /netboxcommunity\/netbox/ && $1 ~ /netbox-[0-9]+$/ {print $1; exit}'
 }
 
-NETBOX_CONTAINER="$(detect_netbox_api_container)"
+detect_netbox_network() {
+  local netbox_container
+  netbox_container="$(detect_netbox_api_container)"
+  [[ -n "$netbox_container" ]] || return 1
 
-if [[ -z "$NETBOX_CONTAINER" ]]; then
-  die "Unable to locate NetBox API container"
-fi
-
-NETBOX_URL="http://${NETBOX_CONTAINER}:8000"
+  docker inspect "$netbox_container" \
+    --format '{{range $k, $_ := .NetworkSettings.Networks}}{{println $k}}{{end}}' \
+    | head -n1
+}
 
 detect_slurpit_containers() {
   docker ps --format '{{.Names}} {{.Image}}' \
     | awk '$2 ~ /^slurpit\// {print $1}'
 }
 
-SLURPIT_CONTAINERS=($(detect_slurpit_containers))
+###############################################################################
+# Network auto-repair
+###############################################################################
 
-if [[ ${#SLURPIT_CONTAINERS[@]} -eq 0 ]]; then
-  die "No Slurp’it containers detected"
-fi
+ensure_netbox_network_exists() {
+  local netbox_network
+  netbox_network="$(detect_netbox_network || true)"
+
+  if [[ -z "$netbox_network" ]]; then
+    die "Unable to detect NetBox network (is NetBox running?)"
+  fi
+
+  if ! docker network inspect "$netbox_network" >/dev/null 2>&1; then
+    log "Creating NetBox network '$netbox_network'..."
+    docker network create "$netbox_network" >/dev/null
+  fi
+
+  echo "$netbox_network"
+}
+
+attach_slurpit_to_netbox_network() {
+  local netbox_network="$1"
+  local slurpit_containers=("$@")
+  slurpit_containers=("${slurpit_containers[@]:1}")
+
+  for c in "${slurpit_containers[@]}"; do
+    if ! docker inspect "$c" \
+      --format '{{range $k, $_ := .NetworkSettings.Networks}}{{println $k}}{{end}}' \
+      | grep -qx "$netbox_network"; then
+      log "Attaching $c to network '$netbox_network'..."
+      docker network connect "$netbox_network" "$c" >/dev/null || \
+        die "Failed to attach $c to network '$netbox_network'"
+    fi
+  done
 }
 
 ###############################################################################
-# Check NetBox API reachability
+# NetBox API reachability
 ###############################################################################
+
 check_netbox_reachable() {
-  slurpit_netbox_integration
-  log "Checking NetBox API reachability..."
-  curl -s "${NETBOX_URL}/api/status/" >/dev/null \
-    || die "NetBox API not reachable"
+  local netbox_url="$1"
+  log "Checking NetBox API reachability at $netbox_url..."
+  curl -s "${netbox_url}/api/status/" >/dev/null \
+    || die "NetBox API not reachable at ${netbox_url}"
 }
 
+###############################################################################
+# NetBox token management (NetBox 4.4+)
+###############################################################################
 
-###############################################################################
-# Ensure NetBox API token exists (NetBox 4.4+ correct)
-###############################################################################
 ensure_netbox_token() {
+  local netbox_container="$1"
   log "Ensuring NetBox API token exists..."
 
   NETBOX_TOKEN="$(
-  docker exec -i "${NETBOX_CONTAINER}" \
+  docker exec -i "${netbox_container}" \
     /opt/netbox/netbox/manage.py shell <<'PY'
 from django.contrib.auth import get_user_model
 from users.models import Token
@@ -424,23 +479,23 @@ PY
   log "NetBox API token ready"
 }
 
+###############################################################################
+# Slurp’it lifecycle + verification
+###############################################################################
 
-###############################################################################
-# Restart Slurp’it services only
-###############################################################################
 restart_slurpit_services() {
+  local slurpit_containers=("$@")
+  [[ ${#slurpit_containers[@]} -gt 0 ]] || die "No Slurp’it containers detected"
+
   log "Restarting Slurp’it services..."
-  docker restart "${SLURPIT_CONTAINERS[@]}" >/dev/null
+  docker restart "${slurpit_containers[@]}" >/dev/null
 }
 
-
-###############################################################################
-# Verify Slurp’it plugin is registered in NetBox
-###############################################################################
 verify_plugin_registered() {
+  local netbox_container="$1"
   log "Verifying Slurp’it plugin registration..."
 
-  docker exec -i "${NETBOX_CONTAINER}" \
+  docker exec -i "${netbox_container}" \
     /opt/netbox/netbox/manage.py shell <<'PY'
 from django.conf import settings
 assert "slurpit_netbox" in settings.PLUGINS
@@ -448,43 +503,75 @@ print("Slurp’it plugin registered")
 PY
 }
 
-
-###############################################################################
-# Verify Slurp’it can reach NetBox (container-to-container)
-###############################################################################
 verify_slurpit_reachability() {
+  local slurpit_warehouse="$1"
+  local netbox_url="$2"
+
   log "Verifying Slurp’it can reach NetBox..."
 
-  docker exec slurpit-warehouse sh -c "
-    curl -s "${NETBOX_URL}/api/status/" >/dev/null
-  " || die "Slurp’it cannot reach NetBox API"
+  docker exec "$slurpit_warehouse" sh -c "
+    curl -s ${netbox_url}/api/status/ >/dev/null
+  " || die "Slurp’it cannot reach NetBox API at ${netbox_url}"
 
   log "SUCCESS: Slurp’it ↔ NetBox integration verified"
 }
 
+###############################################################################
+# Main entrypoint
+###############################################################################
 
-###############################################################################
-# Main function: wire Slurp’it to NetBox
-###############################################################################
 wire_slurpit_netbox() {
-  check_netbox_reachable
-  ensure_netbox_token
-  restart_slurpit_services
-  verify_plugin_registered
-  verify_slurpit_reachability
+  # Detect NetBox API container
+  local netbox_container
+  netbox_container="$(detect_netbox_api_container)"
+  [[ -n "$netbox_container" ]] || die "Unable to locate NetBox API container"
+
+  # Detect NetBox network and ensure it exists
+  local netbox_network
+  netbox_network="$(ensure_netbox_network_exists)"
+
+  # Detect Slurp’it containers
+  local slurpit_containers
+  mapfile -t slurpit_containers < <(detect_slurpit_containers)
+  [[ ${#slurpit_containers[@]} -gt 0 ]] || die "No Slurp’it containers detected"
+
+  # Auto-repair: attach Slurp’it containers to NetBox network
+  attach_slurpit_to_netbox_network "$netbox_network" "${slurpit_containers[@]}"
+
+  # Derive NetBox URL as seen by Slurp’it (container-to-container)
+  local netbox_url="http://${netbox_container}:8080"
+
+  # Check NetBox reachability from host
+  check_netbox_reachable "http://localhost:8000"
+
+  # Ensure token
+  ensure_netbox_token "$netbox_container"
+
+  # Restart Slurp’it
+  restart_slurpit_services "${slurpit_containers[@]}"
+
+  # Verify plugin
+  verify_plugin_registered "$netbox_container"
+
+  # Pick warehouse container for smoke test
+  local slurpit_warehouse=""
+  for c in "${slurpit_containers[@]}"; do
+    if [[ "$c" == *"warehouse"* ]]; then
+      slurpit_warehouse="$c"
+      break
+    fi
+  done
+  [[ -n "$slurpit_warehouse" ]] || die "Unable to locate Slurp’it warehouse container"
+
+  # Verify Slurp’it → NetBox connectivity over shared network
+  verify_slurpit_reachability "$slurpit_warehouse" "$netbox_url"
 }
 
-# ------------------------------------------------------------
-# Health & diagnostics
-# ------------------------------------------------------------
-health_check() {
-    cd "$NETBOX_COMPOSE_DIR"
-    docker compose ps
-}
 
-version_info() {
-    echo "netbox-manager version: $SCRIPT_VERSION"
-}
+
+
+
+
 
 # ------------------------------------------------------------
 # High-level install/update/rebuild
