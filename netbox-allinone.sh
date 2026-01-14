@@ -9,6 +9,9 @@ f#!/usr/bin/env bash
 #     netbox-routing==0.3.1
 #     netbox-topology-views==4.4.0
 #
+# - 4.2.6
+#   Slurp'it network fix
+#   
 # - 4.2.3
 #   Slurp'it full build
 #   
@@ -43,7 +46,7 @@ f#!/usr/bin/env bash
 
 set -euo pipefail
 
-SCRIPT_VERSION="4.2.5"
+SCRIPT_VERSION="4.2.6"
 
 INSTALL_DIR="/opt"
 NETBOX_COMPOSE_DIR="${INSTALL_DIR}/netbox-docker"
@@ -340,7 +343,10 @@ slurpit_docker_compose_up() {
     fi
     
     echo "Starting containers..."
-    docker compose up -d
+    docker compose down
+	docker network inspect netbox-docker_default >/dev/null 2>&1 \
+  || docker network create netbox-docker_default
+    docker compose up -d --force-recreate
 }
 
 ###############################################################################
