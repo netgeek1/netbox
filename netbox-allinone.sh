@@ -1,4 +1,4 @@
-f#!/usr/bin/env bash
+#!/usr/bin/env bash
 #
 # This is a 100% working Netbox v4.4.9 install with the following plugins:
 #
