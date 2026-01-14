@@ -1,4 +1,4 @@
-f#!/usr/bin/env bash
+#!/usr/bin/env bash
 #
 # This is a 100% working Netbox v4.4.9 install with the following plugins:
 #
@@ -9,8 +9,11 @@ f#!/usr/bin/env bash
 #     netbox-routing==0.3.1
 #     netbox-topology-views==4.4.0
 #
-# - 4.2.7
+# - 4.2.8
 #   Slurp'it re-write
+#
+# - 4.2.7
+#   Slutp'it re-write
 #
 # - 4.2.6
 #   Slurp'it network fix
@@ -49,7 +52,7 @@ f#!/usr/bin/env bash
 
 set -euo pipefail
 
-SCRIPT_VERSION="4.2.7"
+SCRIPT_VERSION="4.2.8"
 
 INSTALL_DIR="/opt"
 NETBOX_COMPOSE_DIR="${INSTALL_DIR}/netbox-docker"
@@ -567,10 +570,121 @@ wire_slurpit_netbox() {
   verify_slurpit_reachability "$slurpit_warehouse" "$netbox_url"
 }
 
+slurpit_netbox_status() {
+  echo "------------------------------------------------------------"
+  echo " Slurp’it ↔ NetBox Status Report (Read‑Only)"
+  echo "------------------------------------------------------------"
 
+  #
+  # Detect NetBox API container
+  #
+  local netbox_container
+  netbox_container="$(detect_netbox_api_container)"
+  if [[ -z "$netbox_container" ]]; then
+    echo "NetBox API container: NOT FOUND"
+    return 1
+  fi
+  echo "NetBox API container: $netbox_container"
 
+  #
+  # Detect NetBox network
+  #
+  local netbox_network
+  netbox_network="$(detect_netbox_network || true)"
+  if [[ -z "$netbox_network" ]]; then
+    echo "NetBox network: NOT FOUND"
+  else
+    echo "NetBox network: $netbox_network"
+  fi
 
+  #
+  # Detect Slurp’it containers
+  #
+  local slurpit_containers
+  mapfile -t slurpit_containers < <(detect_slurpit_containers)
+  if [[ ${#slurpit_containers[@]} -eq 0 ]]; then
+    echo "Slurp’it containers: NONE FOUND"
+    return 1
+  fi
 
+  echo "Slurp’it containers:"
+  for c in "${slurpit_containers[@]}"; do
+    echo "  - $c"
+  done
+
+  #
+  # Check network membership
+  #
+  echo
+  echo "Network membership:"
+  if [[ -z "$netbox_network" ]]; then
+    echo "  Cannot check — NetBox network unknown"
+  else
+    for c in "${slurpit_containers[@]}"; do
+      if docker inspect "$c" \
+        --format '{{range $k, $_ := .NetworkSettings.Networks}}{{println $k}}{{end}}' \
+        | grep -qx "$netbox_network"; then
+        echo "  $c: JOINED"
+      else
+        echo "  $c: NOT JOINED"
+      fi
+    done
+  fi
+
+  #
+  # Check NetBox API reachability (host → NetBox)
+  #
+  echo
+  echo "NetBox API reachability (host → NetBox):"
+  if curl -s "http://localhost:8000/api/status/" >/dev/null; then
+    echo "  OK"
+  else
+    echo "  FAILED"
+  fi
+
+  #
+  # Check plugin registration
+  #
+  echo
+  echo "Slurp’it plugin registration:"
+  if docker exec -i "$netbox_container" \
+    /opt/netbox/netbox/manage.py shell <<'PY' 2>/dev/null | grep -q "Slurp’it plugin registered"
+from django.conf import settings
+assert "slurpit_netbox" in settings.PLUGINS
+print("Slurp’it plugin registered")
+PY
+  then
+    echo "  REGISTERED"
+  else
+    echo "  NOT REGISTERED"
+  fi
+
+  #
+  # Check Slurp’it → NetBox reachability
+  #
+  echo
+  echo "Slurp’it → NetBox API reachability:"
+  local warehouse=""
+  for c in "${slurpit_containers[@]}"; do
+    [[ "$c" == *"warehouse"* ]] && warehouse="$c"
+  done
+
+  if [[ -z "$warehouse" ]]; then
+    echo "  Warehouse container not found — cannot test"
+  else
+    local netbox_url="http://${netbox_container}:8080"
+    if docker exec "$warehouse" sh -c "curl -s ${netbox_url}/api/status/ >/dev/null"; then
+      echo "  OK"
+    else
+      echo "  FAILED"
+    fi
+  fi
+
+  echo
+  echo "------------------------------------------------------------"
+  echo " Status report complete."
+  echo "------------------------------------------------------------"
+}
 
 
 # ------------------------------------------------------------
@@ -647,6 +761,7 @@ netbox-manager ${SCRIPT_VERSION}
 11) Superuser: Reset Password
 12) Health Check
 13) Version Info
+14) Slurp'it Netbox Status
 0) Exit
 EOF
 }
@@ -670,6 +785,7 @@ menu_loop() {
       11) read -rp "Username: " u; reset_superuser_password "$u" ;;
       12) health_check ;;
       13) version_info ;;
+	  14) slurpit_netbox_status ;;
       0) exit 0 ;;
       *) echo "Invalid option." ;;
     esac
