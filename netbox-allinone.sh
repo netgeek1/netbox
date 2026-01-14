@@ -9,6 +9,9 @@
 #     netbox-routing==0.3.1
 #     netbox-topology-views==4.4.0
 #
+# - 4.2.13
+#   Plugin versions
+#
 # - 4.2.12
 #   Menu updates
 #
@@ -64,7 +67,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="4.2.12"
+SCRIPT_VERSION="4.2.13"
 
 INSTALL_DIR="/opt"
 NETBOX_COMPOSE_DIR="${INSTALL_DIR}/netbox-docker"
@@ -337,6 +340,58 @@ open_in_browser() {
         open "$url" >/dev/null 2>&1 &
     fi
 }
+
+get_netbox_plugin_versions() {
+    docker exec netbox-docker-netbox-1 sh -c \
+      "python3 - <<'EOF'
+import ast, pathlib, importlib, os
+
+# Load plugins.py
+cfg = pathlib.Path('/etc/netbox/config/plugins.py').read_text()
+tree = ast.parse(cfg)
+
+plugins = []
+for node in tree.body:
+    if isinstance(node, ast.Assign) and getattr(node.targets[0], 'id', None) == 'PLUGINS':
+        plugins = [elt.value for elt in node.value.elts]
+        break
+
+def get_version_from_distinfo(name):
+    base = '/opt/netbox/venv/lib/python3.12/site-packages'
+    for entry in os.listdir(base):
+        # Match both underscores and hyphens
+        if entry.replace('_','-').startswith(name.replace('_','-')) and entry.endswith('.dist-info'):
+            meta = os.path.join(base, entry, 'METADATA')
+            if os.path.exists(meta):
+                with open(meta) as f:
+                    for line in f:
+                        if line.startswith('Version:'):
+                            return line.split(':',1)[1].strip()
+            # Fallback: parse version from directory name
+            parts = entry.split('-')
+            if len(parts) > 1:
+                return parts[1].replace('.dist.info','')
+    return None
+
+# Pretty print
+for name in plugins:
+    version = None
+
+    # Try __version__
+    try:
+        mod = importlib.import_module(name)
+        version = getattr(mod, '__version__', None)
+    except Exception:
+        pass
+
+    # Try dist-info metadata
+    if not version:
+        version = get_version_from_distinfo(name)
+
+    print(f\"{name}: {version or 'UNKNOWN'}\")
+EOF"
+}
+
 
 ###############################################################################
 # URL Auto‑Detection Helpers
@@ -614,6 +669,12 @@ system_health_dashboard() {
     check_netbox_plugin_imports | sed 's/^/  /'
     echo
 
+    echo "NETBOX PLUGIN VERSIONS"
+    get_netbox_plugin_versions | sed 's/^/ /'
+#	versions="$(get_netbox_plugin_versions)"
+#    echo "  $versions"
+    echo
+    
     # Containers
     echo "CONTAINERS (health)"
     get_container_health | sed 's/^/  /'
@@ -668,6 +729,10 @@ tui_dashboard() {
         echo "NETBOX"
         echo "  UI:          $nb_url"
         echo "  API Status:  $nb_api  [$nb_status]"
+        echo
+
+        echo "PLUGIN VERSIONS"
+        get_netbox_plugin_versions | sed 's/^/  /'
         echo
 
         # Slurp’it Portal
