@@ -9,11 +9,17 @@
 #     netbox-routing==0.3.1
 #     netbox-topology-views==4.4.0
 #
+# - 4.2.10
+#   Docker-compose.override fix
+#
+# - 4.2.9
+#   Menu status
+#
 # - 4.2.8
 #   Slurp'it re-write
 #
 # - 4.2.7
-#   Slutp'it re-write
+#   Slurp'it re-write
 #
 # - 4.2.6
 #   Slurp'it network fix
@@ -52,7 +58,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="4.2.8"
+SCRIPT_VERSION="4.2.10"
 
 INSTALL_DIR="/opt"
 NETBOX_COMPOSE_DIR="${INSTALL_DIR}/netbox-docker"
@@ -285,6 +291,55 @@ shell_netbox() {
     docker compose exec netbox /bin/bash
 }
 
+###############################################################################
+# URL Auto‑Detection Helpers
+###############################################################################
+
+# Detect host‑published port for a given container + internal port
+detect_published_port() {
+    local container="$1"
+    local internal_port="$2"
+
+    docker inspect "$container" \
+      --format '{{range $p, $conf := .NetworkSettings.Ports}}{{println $p $conf}}{{end}}' 2>/dev/null \
+    | awk -v port="${internal_port}/tcp" '$1 == port {print $2}' \
+    | sed -E 's/.*HostPort":"?([0-9]+)"?.*/\1/' \
+    | head -n1
+}
+
+# NetBox URL (always published)
+get_netbox_url() {
+    echo "http://localhost:${NETBOX_PORT}"
+}
+
+get_netbox_api_status_url() {
+    echo "http://localhost:${NETBOX_PORT}/api/status/"
+}
+
+# Slurp’it Portal URL (auto‑detect host → fallback to internal)
+get_slurpit_portal_url() {
+    local host_port
+    host_port="$(detect_published_port slurpit-portal 80)"
+
+    if [[ -n "$host_port" ]]; then
+        echo "http://localhost:${host_port}"
+    else
+        echo "http://slurpit-portal:80  (internal only)"
+    fi
+}
+
+# Slurp’it Warehouse URL (auto‑detect host → fallback to internal)
+get_slurpit_warehouse_url() {
+    local host_port
+    host_port="$(detect_published_port slurpit-warehouse 3000)"
+
+    if [[ -n "$host_port" ]]; then
+        echo "http://localhost:${host_port}"
+    else
+        echo "http://slurpit-warehouse:3000  (internal only)"
+    fi
+}
+
 # ------------------------------------------------------------
 # Superuser
 # ------------------------------------------------------------
@@ -314,6 +369,27 @@ create_slurpit_compose_override() {
     log "Writing docker-compose.override.yml..."
 
     cat > docker-compose.override.yml <<EOF
+services:
+  slurpit-portal:
+    networks:
+      - netbox
+    ports:
+      - "8080:80"
+
+  slurpit-warehouse:
+    networks:
+      - netbox
+    ports:
+      - "3000:3000"
+
+  slurpit-scraper:
+    networks:
+      - netbox
+
+  slurpit-scanner:
+    networks:
+      - netbox
+
 networks:
   netbox:
     external: true
@@ -762,6 +838,7 @@ netbox-manager ${SCRIPT_VERSION}
 12) Health Check
 13) Version Info
 14) Slurp'it Netbox Status
+15) URLs & Dashboard
 0) Exit
 EOF
 }
@@ -785,7 +862,24 @@ menu_loop() {
       11) read -rp "Username: " u; reset_superuser_password "$u" ;;
       12) health_check ;;
       13) version_info ;;
-	  14) slurpit_netbox_status ;;
+      14) slurpit_netbox_status ;;
+      15)
+        echo
+        echo "NetBox UI:            $(get_netbox_url)"
+        echo "NetBox API Status:    $(get_netbox_api_status_url)"
+        echo
+        echo "Slurp’it Portal:       $(get_slurpit_portal_url)"
+        echo "Slurp’it Warehouse:    $(get_slurpit_warehouse_url)"
+        echo
+        echo "Plugin Docs:"
+        echo "  - Secrets:           https://github.com/netbox-community/netbox-secrets"
+        echo "  - Slurp’it Plugin:   https://gitlab.com/slurpit.io/slurpit_netbox"
+        echo "  - DNS:               https://github.com/peteeckel/netbox-plugin-dns"
+        echo "  - Inventory:         https://github.com/ArnesSI/netbox-inventory"
+        echo "  - Routing:           https://github.com/DanSheps/netbox-routing"
+        echo "  - Topology Views:    https://github.com/netbox-community/netbox-topology-views"
+        echo
+        ;;
       0) exit 0 ;;
       *) echo "Invalid option." ;;
     esac
