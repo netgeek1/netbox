@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+f#!/usr/bin/env bash
 #
 # This is a 100% working Netbox v4.4.9 install with the following plugins:
 #
@@ -43,7 +43,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="4.2.4"
+SCRIPT_VERSION="4.2.5"
 
 INSTALL_DIR="/opt"
 NETBOX_COMPOSE_DIR="${INSTALL_DIR}/netbox-docker"
@@ -359,7 +359,7 @@ if [[ -z "$NETBOX_CONTAINER" ]]; then
   die "Unable to locate NetBox API container"
 fi
 
-NETBOX_URL="http://${NETBOX_CONTAINER}:8080"
+NETBOX_URL="http://${NETBOX_CONTAINER}:8000"
 
 detect_slurpit_containers() {
   docker ps --format '{{.Names}} {{.Image}}' \
@@ -496,6 +496,7 @@ do_install() {
     start_netbox
     create_superuser
     clone_slurpit_docker
+    create_slurpit_compose_override
 	slurpit_docker_compose_up
 	wire_slurpit_netbox
 }
@@ -528,6 +529,7 @@ do_rebuild() {
     build_netbox
     restart_netbox
     clone_slurpit_docker
+    create_slurpit_compose_override
 	slurpit_docker_compose_up
 	wire_slurpit_netbox
 }
