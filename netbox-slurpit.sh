@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# This is a 100% working Netbox v4.4.9 install with the following plugins:
+# This is a 100% working Netbox v4.4.9 & Slurp'it install with the following plugins:
 #
 #     netbox-secrets==2.4.1
 #     slurpit_netbox==1.2.7
