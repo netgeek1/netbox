@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================
 # NetBox Docker All-in-One Installer & Manager (+ Discovery + Plugins)
-# Version: 1.9.20
-# Baseline: v1.2.8 (LOCKED)
-#
 # This installs the latest NetBox (4.5.1) as of creation.
 #
+# Netbox Plugins
+#  - https://netboxlabs.com/plugins
+#      - Need to add to plugin_requirements.txt, configuration/plugins.py and PLUGINS=
+#
+#   Added Netbox Routing
+#    - https://github.com/DanSheps/netbox-routing
+#   Added Netbox Inventory
+#    - https://github.com/ArnesSI/netbox-inventory
+#   Added Netbox Topology Views
+#    - https://github.com/netbox-community/netbox-topology-views
 # ============================================================
+#
+# Version: 1.9.21
+#
 # v1.3.x features (kept intact):
 # - NetBox + Postgres + Redis + Redis-cache
 # - Netdisco backend + web using shared Postgres
@@ -33,7 +43,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.20"
+SCRIPT_VERSION="1.9.21"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -757,8 +767,10 @@ DEPLOY_ADMIN_USER_DEFAULT=1
 # NetBox plugins
 NB_PLUGIN_TOPOLOGY_PIP="netbox-topology-views"
 NB_PLUGIN_TOPOLOGY_MOD="netbox_topology_views"
-NB_PLUGIN_BGP_PIP="netbox-bgp"
-NB_PLUGIN_BGP_MOD="netbox_bgp"
+NB_PLUGIN_ROUTING_PIP="netbox-routing"
+NB_PLUGIN_ROUTING_MOD="netbox_routing"
+NB_PLUGIN_INVENTORY_PIP="netbox-inventory"
+NB_PLUGIN_INVENTORY_MOD="netbox_inventory"
 
 # ------------------------------------------------------------
 # Discovery (Model 2 multi-source) - CONFIG ONLY (no importers yet)
@@ -1143,7 +1155,7 @@ add_netdisco_snmpv3_profile() {
 # ------------------------------------------------------------
 plugins_enabled() {
   cd_install_dir
-  [[ -f netbox-custom/config/plugins.py ]] && grep -q "netbox_topology_views\|netbox_bgp" netbox-custom/config/plugins.py
+  [[ -f netbox-custom/config/plugins.py ]] && grep -q "netbox_topology_views\|netbox_routing\|netbox_inventory" netbox-custom/config/plugins.py
 }
 
 write_plugins_py_enabled() {
@@ -1152,7 +1164,8 @@ write_plugins_py_enabled() {
 # Managed by ${SCRIPT_NAME} v${SCRIPT_VERSION}
 PLUGINS = [
   '${NB_PLUGIN_TOPOLOGY_MOD}',
-  '${NB_PLUGIN_BGP_MOD}',
+  '${NB_PLUGIN_ROUTING_MOD}',
+  '${NB_PLUGIN_INVENTORY_MOD}',
 ]
 
 PLUGINS_CONFIG = {
@@ -1202,7 +1215,8 @@ PY
 RUN /opt/netbox/venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
     /opt/netbox/venv/bin/python -m pip install --no-cache-dir \
       netbox-topology-views \
-      netbox-bgp
+      netbox-routing \
+      netbox-inventory
 
 RUN mkdir -p /opt/netbox/netbox/static/netbox_topology_views/img
 EOF
