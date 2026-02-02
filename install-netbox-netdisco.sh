@@ -15,7 +15,18 @@
 #    - https://github.com/netbox-community/netbox-topology-views
 # ============================================================
 #
-# Version: 1.9.21
+# Version: 3.0
+#
+# v3.0: 
+# - Version moved to 3.0 to fix inconsistencies
+# - Fixed issue with API_TOKEN_PEPPERS`
+#
+# v1.9.23: 
+# - Enable Plugins on initial build
+# - Fixing $3 unbound variable with "${3:-}"
+#
+# v1.9.22: 
+# - Added Netbox superuser creation on install and via menu
 #
 # v1.3.x features (kept intact):
 # - NetBox + Postgres + Redis + Redis-cache
@@ -43,7 +54,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.9.21"
+SCRIPT_VERSION="3.0"
 
 # Script identity (helps detect running the wrong file/version)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -237,6 +248,64 @@ fi
 ########################################
 # TOKEN GENERATION
 ########################################
+
+ensure_netbox_extra_py() {
+  local cfg_dir="/opt/netbox/config"
+  local extra_py="${cfg_dir}/extra.py"
+
+  mkdir -p "$cfg_dir"
+
+  if [[ ! -f "$extra_py" ]]; then
+    log "Creating persistent NetBox extra.py"
+    cat > "$extra_py" <<'EOF'
+# NetBox local overrides
+# This file is persistent and safe to edit
+EOF
+    chown "$REAL_USER":"$REAL_USER" "$extra_py"
+    chmod 0644 "$extra_py"
+  fi
+}
+
+ensure_api_token_pepper() {
+  local extra_py="/opt/netbox/config/extra.py"
+
+  if grep -q '^API_TOKEN_PEPPERS' "$extra_py"; then
+    log "API_TOKEN_PEPPERS already defined"
+    return 0
+  fi
+
+  log "Generating NetBox API token pepper (one-time)"
+
+  local pepper
+  pepper="$(openssl rand -base64 64 | tr -d '\n')"
+
+  cat >> "$extra_py" <<EOF
+
+# ------------------------------------------------------------------
+# API token peppers (required for v2 API tokens)
+# ------------------------------------------------------------------
+API_TOKEN_PEPPERS = {
+    1: "$pepper",
+}
+EOF
+
+  log "API_TOKEN_PEPPERS written to extra.py"
+}
+
+ensure_extra_py_bind_mount() {
+  local compose="docker-compose.yml"
+
+  grep -q '/opt/netbox/config/extra.py' "$compose" && return 0
+
+  log "Injecting extra.py bind mount into docker-compose.yml"
+
+  sed -i '/netbox:/,/volumes:/{
+    /volumes:/a\
+      - /opt/netbox/config/extra.py:/etc/netbox/config/extra.py:ro
+  }' "$compose"
+}
+
+
 
 generate_netbox_tokens() {
     local secrets_file="/opt/netbox/secrets/secrets.env"
@@ -440,8 +509,8 @@ mkdir -p "$DISCOVERY_DIR"
 
 ### --- NetBox API wrapper ---
 netbox_api() {
-  local method="$1" endpoint="$2" data="$3"
-  curl -sS -X "$method" \
+  local method="$1" endpoint="$2" data="${3:-}"
+  curl -fsS -X "$method" \
     -H "Authorization: Token $NETBOX_TOKEN" \
     -H "Content-Type: application/json" \
     ${data:+-d "$data"} \
@@ -450,23 +519,65 @@ netbox_api() {
 
 ### --- CIDR Discovery (Nmap) ---
 discovery_scan_cidr() {
-  : > "$AUDIT_LOG"
-  nmap -sn "$1" -oX - | python3 - <<'PY' > "$SCAN_JSON"
-import xml.etree.ElementTree as ET, json, sys
-root = ET.fromstring(sys.stdin.read())
-hosts=[]
-for h in root.findall("host"):
-    a=h.find("address[@addrtype='ipv4']")
-    if a is None: continue
-    hn=h.find("hostnames/hostname")
-    hosts.append({
-        "ip":a.get("addr"),
-        "name":hn.get("name") if hn is not None else None
-    })
-print(json.dumps(hosts,indent=2))
-PY
-}
+  local cidr="${1:-}"
+  [[ -z "$cidr" ]] && { err "CIDR is required"; return 1; }
 
+  log "Running Nmap scan in ephemeral container for CIDR: $cidr"
+
+  # Pre-pull so the scan stream is clean
+  as_user docker pull instrumentisto/nmap >/dev/null
+
+  local out errf
+  out="$(mktemp)"
+  errf="$(mktemp)"
+
+  # NOTE: keep --network host; add NET_RAW for ICMP
+  if ! as_user docker run --rm --network host --cap-add NET_RAW \
+      instrumentisto/nmap -sn "$cidr" -oX - \
+      1>"$out" 2>"$errf"; then
+    err "Nmap container exited non-zero"
+    sed -n '1,80p' "$errf" >&2
+    rm -f "$out" "$errf"
+    return 1
+  fi
+
+  if ! grep -q "<nmaprun" "$out"; then
+    err "Nmap produced no XML output"
+    echo "---- stderr (first 80 lines) ----" >&2
+    sed -n '1,80p' "$errf" >&2
+    echo "---- stdout (first 20 lines) ----" >&2
+    sed -n '1,20p' "$out" >&2
+    rm -f "$out" "$errf"
+    return 1
+  fi
+
+  python3 - "$out" >"$SCAN_JSON" <<'PY'
+import xml.etree.ElementTree as ET
+import json, sys
+
+with open(sys.argv[1], "r") as f:
+    data = f.read().strip()
+
+root = ET.fromstring(data)
+hosts = []
+
+for h in root.findall("host"):
+    addr = h.find("address[@addrtype='ipv4']")
+    if addr is None:
+        continue
+    hostname = h.find("hostnames/hostname")
+    hosts.append({
+        "ip": addr.get("addr"),
+        "name": hostname.get("name") if hostname is not None else None
+    })
+
+print(json.dumps(hosts, indent=2))
+PY
+
+
+  rm -f "$out" "$errf"
+  log "Scan complete: $(jq length "$SCAN_JSON") hosts discovered"
+}
 ### --- Normalize ---
 discovery_normalize() {
   jq '
@@ -588,6 +699,10 @@ discovery_neighbors() {
 
 ### --- Import neighbors ---
 discovery_import_neighbors() {
+  [[ -f "$NEIGHBOR_JSON" ]] || {
+  err "Neighbor data missing. Run discovery_neighbors first."
+  return 1
+}
   jq -c '.[]' "$NEIGHBOR_JSON" | while read -r n; do
     src=$(jq -r .src_ip <<<"$n")
     lport=$(jq -r .local_port <<<"$n")
@@ -644,23 +759,50 @@ discovery_reconcile_delete() {
 ### NETDISCO → NETBOX ENRICHMENT
 ### ==================================================
 discovery_enrich_from_netdisco() {
-  netdisco_api "search/device?field=ip&op=~&value=." | \
-  jq -c '.devices[]' | while read -r d; do
+  log "Enriching NetBox devices from NetDisco (vendor/model)"
+
+  local raw
+  raw="$(netdisco_api "search/device?field=ip&op=~&value=.")"
+
+  # Validate JSON before jq
+  if ! echo "$raw" | jq -e . >/dev/null 2>&1; then
+    err "NetDisco API did not return valid JSON"
+    echo "Raw response:"
+    echo "$raw" | sed -n '1,20p'
+    return 1
+  fi
+
+  echo "$raw" | jq -c '.devices[]' | while read -r d; do
     ip=$(jq -r .ip <<<"$d")
+    vendor=$(jq -r .vendor <<<"$d")
     model=$(jq -r .model <<<"$d")
     os=$(jq -r .os <<<"$d")
-    vendor=$(jq -r .vendor <<<"$d")
+    sysobj=$(jq -r .sysobjectid <<<"$d")
 
-    id=$(netbox_api GET "dcim/devices/?q=$ip" | jq -r '.results[0].id//empty')
-    [[ -z "$id" ]] && continue
+    dev_id=$(netbox_api GET "dcim/devices/?q=$ip" | jq -r '.results[0].id//empty')
+    [[ -z "$dev_id" ]] && continue
 
-    netbox_api PATCH "dcim/devices/$id/" "{
+    norm="$(normalize_vendor_model "$vendor" "$model")"
+    nb_vendor="${norm%%|*}"
+    nb_model="${norm##*|}"
+
+    netbox_ensure_manufacturer "$nb_vendor"
+    mfg_id=$(netbox_api GET "dcim/manufacturers/?name=$nb_vendor" | jq -r '.results[0].id')
+
+    netbox_ensure_device_type "$nb_model" "$mfg_id"
+    dtype_id=$(netbox_api GET "dcim/device-types/?model=$nb_model" | jq -r '.results[0].id')
+
+    netbox_api PATCH "dcim/devices/$dev_id/" "{
+      \"manufacturer\":$mfg_id,
+      \"device_type\":$dtype_id,
       \"custom_fields\":{
-        \"model\":\"$model\",
+							 
         \"os\":\"$os\",
-        \"vendor\":\"$vendor\"
+        \"sysobjectid\":\"$sysobj\"
       }
     }" >/dev/null
+
+    echo "[ENRICH] $ip → $nb_vendor $nb_model" >> "$AUDIT_LOG"
   done
 }
 
@@ -685,6 +827,42 @@ discovery_apply_full() {
 # ------------------------------------------------------------
 # End 1.9.20 additions
 # ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# NetBox runtime audit (WARNING ONLY)
+# ------------------------------------------------------------
+netbox_runtime_audit_warn() {
+  # Warning-only guardrail (per user request)
+  # Checks the running container's reported NetBox version.
+  cd_install_dir
+
+  if ! as_user docker compose ps netbox >/dev/null 2>&1; then
+    warn "Runtime audit skipped: docker compose ps netbox failed"
+    return 0
+  fi
+
+  local ver=""
+  ver="$(
+    as_user docker compose exec -T netbox python - <<'PY' 2>/dev/null || true
+import netbox
+print(netbox.__version__)
+PY
+  )"
+
+  if [[ -z "$ver" ]]; then
+    warn "Runtime audit: unable to determine NetBox version (container not ready yet?)"
+    return 0
+  fi
+
+  if [[ "$ver" != "$REQUIRED_NETBOX_VERSION" ]]; then
+    warn "Runtime audit: NetBox version mismatch (expected ${REQUIRED_NETBOX_VERSION}, running ${ver})"
+    warn "Pinning is configured for ${NETBOX_VERSION_TAG}. If this persists, rebuild the netbox image."
+    return 0
+  fi
+
+  log "Runtime audit: NetBox version OK (${ver})"
+  return 0
+}
 
 # ------------------------------------------------------------
 # SNMP Debug Logging (host-side)
@@ -1173,7 +1351,8 @@ PLUGINS_CONFIG = {
     'static_image_directory': '${NB_PLUGIN_TOPOLOGY_MOD}/img',
     'allow_coordinates_saving': True,
     'always_save_coordinates': True,
-  }
+  },
+  '${NB_PLUGIN_TOPOLOGY_MOD}': {},
 }
 EOF
   chmod 0644 netbox-custom/config/plugins.py || true
@@ -1347,21 +1526,25 @@ enable_netbox_plugins() {
   write_plugins_py_enabled
   write_netbox_plugin_dockerfile
   generate_compose_yml
+  ensure_extra_py_bind_mount
 
   log "Building NetBox image with plugins..."
   as_user docker compose build netbox
 
   log "Restarting NetBox to load plugins..."
   as_user docker compose up -d netbox
+  wait_for_http "NetBox" "http://localhost:${NETBOX_PORT}" 600
 }
 
 disable_netbox_plugins() {
   cd_install_dir
   write_plugins_py_disabled
   generate_compose_yml
-
-  log "Restarting NetBox without plugins (stock image)..."
+  ensure_extra_py_bind_mount
+  
+  log "Restarting NetBox without plugins (stock pinned image)..."
   as_user docker compose up -d netbox
+  wait_for_http "NetBox" "http://localhost:${NETBOX_PORT}" 600 || true
 }
 
 plugin_status() {
@@ -1385,6 +1568,62 @@ plugin_status() {
   echo
 }
 
+
+###############################################################################
+# URL Auto‑Detection Helpers
+###############################################################################
+
+# Detect host‑published port for a given container + internal port
+detect_published_port() {
+    local container="$1"
+    local internal_port="$2"
+
+    docker inspect "$container" \
+      --format "{{range \$p, \$conf := .NetworkSettings.Ports}}{{if eq \$p \"${internal_port}/tcp\"}}{{range \$conf}}{{println .HostPort}}{{end}}{{end}}{{end}}" \
+      2>/dev/null \
+    | grep -E '^[0-9]+$' \
+    | head -n1
+}
+
+
+# NetBox URL (always published)
+get_netbox_url() {
+    local host_port host_ip
+    host_port="$(detect_published_port netbox-docker-netbox-1 8080)"
+    host_ip="$(get_host_ip)"
+
+    if [[ -n "$host_port" ]]; then
+        echo "http://${host_ip}:${host_port}"
+    else
+        echo "http://netbox-docker-netbox-1:8080  (internal only)"
+    fi
+}
+
+get_netbox_api_status_url() {
+    local base
+    base="$(get_netbox_url)"
+    echo "${base}/api/status/"
+}
+
+# ------------------------------------------------------------
+# Superuser
+# ------------------------------------------------------------
+create_netbox_superuser() {
+    cd "$DEFAULT_INSTALL_DIR"
+    docker compose exec netbox /opt/netbox/netbox/manage.py createsuperuser || {
+        warn "NetBox not healthy yet. Run manually:"
+        echo "  docker compose exec netbox /opt/netbox/netbox/manage.py createsuperuser"
+    }
+}
+
+reset_netbox_superuser_password() {
+    local user="${1:-}"
+    [[ -z "$user" ]] && { error "Usage: netbox-manager superuser reset <username>"; exit 1; }
+
+    cd "$DEFAULT_INSTALL_DIR"
+    docker compose exec netbox /opt/netbox/netbox/manage.py changepassword "$user"
+}
+
 # ------------------------------------------------------------
 # Core stack actions
 # ------------------------------------------------------------
@@ -1396,7 +1635,7 @@ install_or_update_stack() {
   generate_netbox_env
   generate_netdisco_env
   ensure_netdisco_deployment_yml
-  
+
   if [[ ! -f netbox-custom/config/plugins.py ]]; then
     write_plugins_py_disabled
   fi
@@ -1404,6 +1643,16 @@ install_or_update_stack() {
   write_netbox_plugin_dockerfile
   generate_compose_yml
 
+  # ------------------------------------------------------------
+  # NetBox persistent configuration bootstrap
+  # ------------------------------------------------------------
+  ensure_netbox_extra_py
+  ensure_api_token_pepper
+  ensure_extra_py_bind_mount
+
+  # ------------------------------------------------------------
+  # Start core services
+  # ------------------------------------------------------------
   log "Starting core services"
   as_user docker compose up -d postgres redis redis-cache netbox
   wait_for_postgres
@@ -1417,10 +1666,16 @@ install_or_update_stack() {
 
   wait_for_http "NetBox" "http://localhost:${NETBOX_PORT}" 600
   wait_for_http "Netdisco" "http://localhost:${NETDISCO_PORT}" 600
+
   generate_netbox_tokens
   with_netbox_rw netbox_ensure_tokens
+  create_netbox_superuser
+  enable_netbox_plugins
+
   log "All services operational"
 }
+
+
 
 start_stack()   { cd_install_dir; as_user docker compose up -d; }
 stop_stack()    { cd_install_dir; as_user docker compose down; }
@@ -2369,6 +2624,151 @@ view_snmp_proof_markers() {
   echo
 }
 
+install_librenms_mibs() {
+  cd_install_dir
+
+  local mib_dir="${INSTALL_DIR}/netdisco/nd-site-local/mibs"
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+
+  log "Installing LibreNMS MIBs into NetDisco"
+
+  mkdir -p "$mib_dir"
+
+  log "Cloning LibreNMS MIB repository"
+  git clone --depth 1 https://github.com/librenms/librenms.git "$tmp_dir/librenms"
+
+  log "Copying MIBs"
+  rsync -a --delete "$tmp_dir/librenms/mibs/" "$mib_dir/"
+
+  rm -rf "$tmp_dir"
+
+  chown -R 901:901 "${INSTALL_DIR}/netdisco/nd-site-local"
+  chmod -R 0755 "$mib_dir"
+
+  log "LibreNMS MIBs installed successfully"
+}
+
+reload_netdisco_mibs() {
+  cd_install_dir
+  log "Restarting NetDisco to reload MIBs"
+  as_user docker compose restart netdisco-backend netdisco-web
+}
+
+verify_netdisco_mibs() {
+  cd_install_dir
+
+  log "Verifying MIB visibility inside NetDisco"
+
+  as_user docker compose exec -T netdisco-backend bash -lc '
+    echo "Checking LibreNMS MIB directory..."
+    test -d /home/netdisco/nd-site-local/mibs || exit 1
+    count=$(find /home/netdisco/nd-site-local/mibs -type f | wc -l)
+    echo "MIB files found: $count"
+    [ "$count" -gt 100 ] && echo "OK: LibreNMS MIBs present"
+  '
+}
+
+
+update_librenms_mibs() {
+  install_librenms_mibs
+  reload_netdisco_mibs
+  verify_netdisco_mibs
+}
+
+normalize_vendor_model() {
+  local vendor="$1"
+  local model="$2"
+
+  vendor="$(echo "$vendor" | tr '[:upper:]' '[:lower:]')"
+  model="$(echo "$model" | sed 's/[[:space:]]\+/ /g')"
+
+  case "$vendor" in
+    cisco*) vendor="Cisco" ;;
+    juniper*) vendor="Juniper" ;;
+    arista*) vendor="Arista" ;;
+    ubiquiti*) vendor="Ubiquiti" ;;
+    hp*|hewlett*) vendor="HPE" ;;
+    dell*) vendor="Dell" ;;
+    *) vendor="$(echo "$vendor" | sed 's/.*/\u&/')" ;;
+  esac
+
+  echo "$vendor|$model"
+}
+
+netbox_ensure_manufacturer() {
+  local name="$1"
+  netbox_api GET "dcim/manufacturers/?name=$name" | jq -e '.count>0' >/dev/null || \
+    netbox_api POST "dcim/manufacturers/" "{\"name\":\"$name\",\"slug\":\"$(echo "$name" | tr '[:upper:]' '[:lower:]')\"}" >/dev/null
+}
+
+netbox_ensure_device_type() {
+  local model="$1"
+  local manufacturer_id="$2"
+
+  netbox_api GET "dcim/device-types/?model=$model" | jq -e '.count>0' >/dev/null || \
+    netbox_api POST "dcim/device-types/" "{
+      \"model\":\"$model\",
+      \"slug\":\"$(echo "$model" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')\",
+      \"manufacturer\":$manufacturer_id
+    }" >/dev/null
+}
+
+discovery_enrich_from_netdisco() {
+  log "Enriching NetBox devices from NetDisco (vendor/model)"
+
+  netdisco_api "search/device?field=ip&op=~&value=." | \
+  jq -c '.devices[]' | while read -r d; do
+    ip=$(jq -r .ip <<<"$d")
+    vendor=$(jq -r .vendor <<<"$d")
+    model=$(jq -r .model <<<"$d")
+    os=$(jq -r .os <<<"$d")
+
+    dev_id=$(netbox_api GET "dcim/devices/?q=$ip" | jq -r '.results[0].id//empty')
+    [[ -z "$dev_id" ]] && continue
+
+    norm="$(normalize_vendor_model "$vendor" "$model")"
+    nb_vendor="${norm%%|*}"
+    nb_model="${norm##*|}"
+
+    netbox_ensure_manufacturer "$nb_vendor"
+    mfg_id=$(netbox_api GET "dcim/manufacturers/?name=$nb_vendor" | jq -r '.results[0].id')
+
+    netbox_ensure_device_type "$nb_model" "$mfg_id"
+    dtype_id=$(netbox_api GET "dcim/device-types/?model=$nb_model" | jq -r '.results[0].id')
+
+    netbox_api PATCH "dcim/devices/$dev_id/" "{
+      \"manufacturer\":$mfg_id,
+      \"device_type\":$dtype_id,
+      \"custom_fields\":{
+        \"os\":\"$os\",
+        \"sysobjectid\":\"$(jq -r .sysobjectid <<<"$d")\"
+      }
+    }" >/dev/null
+
+    echo "[ENRICH] $ip → $nb_vendor $nb_model" >> "$AUDIT_LOG"
+  done
+}
+
+discovery_apply_full() {
+  discovery_diff
+  discovery_apply
+  discovery_neighbors
+  discovery_import_neighbors
+  discovery_reconcile_delete
+  discovery_enrich_from_netdisco
+  echo "[DONE] Full discovery + reconciliation applied" >> "$AUDIT_LOG"
+}
+
+discovery_scan_cidr_menu() {
+  read -rp "Enter CIDR to scan (e.g. 10.0.0.0/24): " cidr
+  [[ -z "$cidr" ]] && { warn "No CIDR provided"; return 1; }
+
+  with_netbox_rw discovery_scan_cidr "$cidr"
+  with_netbox_rw discovery_apply
+}
+
+
 # ------------------------------------------------------------
 # Menu
 # ------------------------------------------------------------
@@ -2478,9 +2878,6 @@ EOF
   pause
 }
 
-
-
-
 menu_main() {
   clear
   echo "======================================"
@@ -2497,8 +2894,8 @@ menu_main() {
   echo "04) Restart stack"
   echo "05) Status"
   echo "06) View ALL logs"
-echo "07) Change NetBox admin password"
-echo "08) Netdisco: Change admin password (UI guidance)"
+  echo "07) Change NetBox admin password"
+  echo "08) Netdisco: Change admin password (UI guidance)"
   echo "09) Netdisco: EMERGENCY admin password reset (UNSUPPORTED)"
   echo "--------------------------------------"
   echo "10) Netdisco: SNMP & credential guidance (UI hint)"
@@ -2513,16 +2910,23 @@ echo "08) Netdisco: Change admin password (UI guidance)"
   echo "30) NetBox plugins: Status"
   echo "31) NetBox plugins: Enable (Topology Views + BGP)"
   echo "32) NetBox plugins: Disable (revert to stock)"
+  echo "33) Create Netbox Superuser"
+  echo "34) Reset Netbox Superuser password"
   echo "--------------------------------------"
+  echo "39) Discovery: Scan CIDR and create devices"
   echo "40) Discovery: Status / Enabled sources"
   echo "41) Discovery: Toggle sources"
   echo "42) Discovery: Dry-run (validation only)"
   echo "43) Discovery: Apply approved changes"
   echo "44) Discovery: View last discovery report"
   echo "45) Discovery: Topology enrichment (LLDP / CDP)"
+  echo "46) Discovery: Enrich NetBox from NetDisco (vendor/model)"
   echo "--------------------------------------"
   echo "50) Debug: View SNMP debug log"
   echo "51) Debug: View SNMP proof markers"
+  echo "--------------------------------------"
+  echo "60) NetDisco: Install / Update LibreNMS MIBs"
+  echo "61) NetDisco: Verify MIB loading"
   echo "--------------------------------------"
   echo "99) Exit (Q/q)"
   echo "======================================"
@@ -2553,16 +2957,27 @@ echo "08) Netdisco: Change admin password (UI guidance)"
     30) plugin_status ; pause ;;
     31) enable_netbox_plugins ; pause ;;
     32) disable_netbox_plugins ; pause ;;
+    33) create_netbox_superuser ; pause ;;
+    34) reset_netbox_superuser_password ; pause ;;
 
+    39) discovery_scan_cidr_menu ; pause ;;
     40) with_netbox_ro discovery_status ; pause ;;
     41) discovery_toggle_menu ; pause ;;
     42) with_netbox_ro discovery_diff ; pause ;;
     43) with_netbox_rw discovery_apply_full ; pause ;;
     44) discovery_view_last_report ; pause ;;
-    45) with_netbox_rw discovery_import_neighbors ; pause ;;
+    45)
+      with_netbox_ro discovery_neighbors
+      with_netbox_rw discovery_import_neighbors
+      pause
+      ;;
+	46) with_netbox_rw discovery_enrich_from_netdisco ; pause ;;
 
     50) view_snmp_debug_log ; pause ;;
     51) view_snmp_proof_markers ; pause ;;
+
+    60) update_librenms_mibs ; pause ;;
+    61) verify_netdisco_mibs ; pause ;;
 
     99|Q|q) echo "Bye."; exit 0 ;;
     *) echo "Invalid option"; pause ;;
