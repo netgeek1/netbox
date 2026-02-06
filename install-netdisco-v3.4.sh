@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="3.4.1"
+SCRIPT_VERSION="3.4.6"
 
 # -----------------------------
 # Constants
@@ -277,7 +277,7 @@ upgrade_netdisco() {
 
 refresh_mac_vendors() {
   log "Refreshing MAC vendors..."
-  docker exec netdisco /bin/sh -c "netdisco-do macsuck"
+  docker exec netdisco-backend /bin/sh -c "netdisco-do macsuck"
 }
 
 status() {
@@ -296,231 +296,183 @@ start_netdisco() {
   docker_compose up -d
 }
 
-# -----------------------------
-# SNMP config handling
-# -----------------------------
-# ------------------------------------------------------------
-# SNMP DB helpers (DB-backed, not YAML)
-# ------------------------------------------------------------
+# ============================================================================
+# SNMP MANAGEMENT - ADDED FUNCTIONS ONLY
+# ============================================================================
 
-ensure_snmp_db() {
-  docker exec netdisco-backend netdisco-do dbicdeploy >/dev/null 2>&1 || true
-}
+SNMP_DB_FILE="$INSTALL_DIR/netdisco/config/snmp_credentials.db"
 
-list_snmp_profiles() {
-  ensure_snmp_db
-
-  echo
-  echo "Configured SNMP profiles:"
-  echo "-------------------------"
-
-  docker exec netdisco-backend netdisco-do snmp_auth list 2>/dev/null \
-    | awk '
-        /^tag:/ {
-            tag=$2
-        }
-        /community:/ {
-            printf "[v2c] %s\n", tag
-        }
-        /user:/ {
-            user=$2
-        }
-        /auth:/ {
-            auth=$2
-        }
-        /priv:/ {
-            priv=$2
-            printf "[v3 ] %s | Auth: %s | Priv: %s\n", user, auth, priv
-        }
-      '
-
-  echo
-}
-
-add_snmp_v2_profile() {
-  read -rp "Profile name (tag): " TAG
-  read -rsp "Community: " COMMUNITY
-  echo
-
-  ensure_snmp_db
-
-  docker exec netdisco-backend netdisco-do snmp_auth create \
-      --tag "$TAG" \
-      --community "$COMMUNITY"
-
-  echo "[OK] Added v2c profile: $TAG"
-}
-
-add_snmp_v3_profile() {
-  read -rp "Profile name (tag): " TAG
-  read -rp "User: " USER
-  read -rp "Auth protocol (MD5/SHA): " AUTHPROTO
-  read -rsp "Auth password: " AUTHPASS
-  echo
-  read -rp "Priv protocol (DES/AES): " PRIVPROTO
-  read -rsp "Priv password: " PRIVPASS
-  echo
-
-  ensure_snmp_db
-
-  docker exec netdisco-backend netdisco-do snmp_auth create \
-      --tag "$TAG" \
-      --user "$USER" \
-      --auth "$AUTHPROTO" \
-      --authpass "$AUTHPASS" \
-      --priv "$PRIVPROTO" \
-      --privpass "$PRIVPASS"
-
-  echo "[OK] Added v3 profile: $TAG"
-}
-
-delete_snmp_profile() {
-  list_snmp_profiles
-  read -rp "Profile tag to delete: " TAG
-
-  docker exec netdisco-backend netdisco-do snmp_auth delete --tag "$TAG"
-  echo "[OK] Deleted profile: $TAG"
-}
-
-# ------------------------
-# Regenerate Deployment from DB
-# ------------------------
-snmp_regen_deployment() {
-  mkdir -p "$(dirname "$DEPLOYMENT_YML")"
-  echo "snmp_auth:" > "$DEPLOYMENT_YML"
-  while IFS='|' read -r version tag rest; do
-    if [[ "$version" == "v2c" ]]; then
-      community="$rest"
-      echo "  - tag: $tag" >> "$DEPLOYMENT_YML"
-      echo "    community: $community" >> "$DEPLOYMENT_YML"
-    else
-      user=$(echo "$rest" | cut -d'|' -f1)
-      authproto=$(echo "$rest" | cut -d'|' -f2)
-      authpass=$(echo "$rest" | cut -d'|' -f3)
-      privproto=$(echo "$rest" | cut -d'|' -f4)
-      privpass=$(echo "$rest" | cut -d'|' -f5)
-      echo "  - tag: $tag" >> "$DEPLOYMENT_YML"
-      echo "    user: $user" >> "$DEPLOYMENT_YML"
-      echo "    authproto: $authproto" >> "$DEPLOYMENT_YML"
-      echo "    authpass: $authpass" >> "$DEPLOYMENT_YML"
-      echo "    privproto: $privproto" >> "$DEPLOYMENT_YML"
-      echo "    privpass: $privpass" >> "$DEPLOYMENT_YML"
-    fi
-  done < "$SNMP_DB"
-}
-
-# ------------------------
-# SNMP Test
-# ------------------------
-snmp_test() {
-  ensure_snmp_db
-  if [[ ! $(docker ps -q -f name=netdisco-backend) ]]; then
-    echo "NetDisco backend container is not running!"
-    read -rp "Press Enter to continue..."
-    return
+snmp_db_ensure() {
+  mkdir -p "$INSTALL_DIR/netdisco/config"
+  if [[ ! -f "$SNMP_DB_FILE" ]]; then
+    sudo touch "$SNMP_DB_FILE"
+    sudo chmod 0640 "$SNMP_DB_FILE"
+    sudo chgrp 901 "$SNMP_DB_FILE" 2>/dev/null || true
   fi
-
-  echo
-  echo "SNMP Test Menu"
-  echo "=============="
-  echo "1) List profiles"
-  echo "2) Test all profiles (default)"
-  echo "3) Test single profile"
-  echo "4) Manual test"
-  echo "0) Back"
-  echo
-
-  read -rp "Select option [2]: " choice
-  choice=${choice:-2}
-
-  case "$choice" in
-    1) list_snmp_profiles ;;
-    2)
-      read -rp "Target IP/CIDR for testing all profiles: " target
-      while IFS='|' read -r version tag rest; do
-        echo "Testing $tag on $target..."
-        if [[ "$version" == "v2c" ]]; then
-          community="$rest"
-          docker exec -it netdisco-backend netdisco-do discover -d "$target" -c "$community"
-        else
-          user=$(echo "$rest" | cut -d'|' -f1)
-          authproto=$(echo "$rest" | cut -d'|' -f2)
-          authpass=$(echo "$rest" | cut -d'|' -f3)
-          privproto=$(echo "$rest" | cut -d'|' -f4)
-          privpass=$(echo "$rest" | cut -d'|' -f5)
-          docker exec -it netdisco-backend netdisco-do discover -d "$target" -u "$user" \
-            --authproto "$authproto" --authpass "$authpass" --privproto "$privproto" --privpass "$privpass"
-        fi
-      done < "$SNMP_DB"
-      ;;
-    3)
-      list_snmp_profiles
-      read -rp "Profile to test: " tag
-      line=$(grep "|$tag|" "$SNMP_DB")
-      [[ -z "$line" ]] && { echo "Profile not found."; read -rp "Press Enter..."; return; }
-
-      read -rp "Target IP/CIDR for testing $tag: " target
-      version=$(echo "$line" | cut -d'|' -f1)
-      if [[ "$version" == "v2c" ]]; then
-        community=$(echo "$line" | cut -d'|' -f3)
-        docker exec -it netdisco-backend netdisco-do discover -d "$target" -c "$community"
-      else
-        user=$(echo "$line" | cut -d'|' -f2)
-        authproto=$(echo "$line" | cut -d'|' -f3)
-        authpass=$(echo "$line" | cut -d'|' -f4)
-        privproto=$(echo "$line" | cut -d'|' -f5)
-        privpass=$(echo "$line" | cut -d'|' -f6)
-        docker exec -it netdisco-backend netdisco-do discover -d "$target" -u "$user" \
-          --authproto "$authproto" --authpass "$authpass" --privproto "$privproto" --privpass "$privpass"
-      fi
-      ;;
-    4)
-      read -rp "Target IP/CIDR: " target
-      read -rp "SNMP version (2c/3): " version
-      if [[ "$version" == "2c" ]]; then
-        read -rp "Community: " community
-        docker exec -it netdisco-backend netdisco-do discover -d "$target" -c "$community"
-      else
-        read -rp "User: " user
-        read -s -rp "Auth password: " authpass; echo
-        read -s -rp "Priv password: " privpass; echo
-        docker exec -it netdisco-backend netdisco-do discover -d "$target" -u "$user" \
-          --authpass "$authpass" --privpass "$privpass"
-      fi
-      ;;
-    0) return ;;
-    *) echo "Invalid option" ;;
-  esac
-  read -rp "Press Enter to continue..."
 }
 
-# ------------------------
-# SNMP Menu Loop
-# ------------------------
+snmp_db_list() {
+  snmp_db_ensure
+  sudo cat "$SNMP_DB_FILE" 2>/dev/null | grep -v '^#' | grep -v '^$' || true
+}
+
+snmp_db_add() {
+  local line="$1"
+  snmp_db_ensure
+  echo "$line" | sudo tee -a "$SNMP_DB_FILE" >/dev/null
+}
+
+snmp_db_delete() {
+  local tag="$1"
+  snmp_db_ensure
+  local tmp=$(mktemp)
+  sudo cat "$SNMP_DB_FILE" | grep -v "|${tag}|" > "$tmp"
+  sudo cp "$tmp" "$SNMP_DB_FILE"
+  rm -f "$tmp"
+  sudo chmod 0640 "$SNMP_DB_FILE"
+  sudo chgrp 901 "$SNMP_DB_FILE" 2>/dev/null || true
+}
+
+snmp_regen_deployment() {
+  snmp_db_ensure
+  local yml="$INSTALL_DIR/netdisco/config/deployment.yml"
+  local v3_count=$(snmp_db_list | grep -c '^v3|' || true)
+  
+  if [[ "$v3_count" -gt 0 ]]; then
+    {
+      echo "no_auth: false"
+      echo "discover_snmpver: 3"
+      echo "device_auth:"
+      snmp_db_list | grep '^v3|' | while IFS='|' read -r typ tag user aproto apass mode pproto ppass; do
+        echo "  - tag: $tag"
+        echo "    user: $user"
+        echo "    ro: true"
+        echo "    auth:"
+        echo "      proto: $aproto"
+        echo "      pass: $apass"
+        if [[ "$mode" == "authPriv" ]]; then
+          echo "    priv:"
+          echo "      proto: $pproto"
+          echo "      pass: $ppass"
+        fi
+      done
+    } > "$yml"
+  else
+    {
+      echo "no_auth: true"
+      echo "discover_snmpver: 2"
+      echo "device_auth: []"
+    } > "$yml"
+  fi
+  
+  chmod 0640 "$yml"
+  chown 901:901 "$yml" 2>/dev/null || true
+}
+
+snmp_list() {
+  echo
+  echo "=== SNMP Credentials ==="
+  local i=0
+  snmp_db_list | while IFS='|' read -r typ tag rest; do
+    i=$((i+1))
+    if [[ "$typ" == "v3" ]]; then
+      echo "[$i] $tag (SNMPv3)"
+    elif [[ "$typ" == "v2c" ]]; then
+      echo "[$i] $tag (SNMPv2c)"
+    fi
+  done
+  if [[ $(snmp_db_list | wc -l) -eq 0 ]]; then
+    echo "(none)"
+  fi
+  echo
+}
+
+snmp_add() {
+  echo
+  echo "1) SNMPv3"
+  echo "2) SNMPv2c"
+  read -rp "Select [1]: " kind
+  kind="${kind:-1}"
+  
+  read -rp "Tag: " tag
+  [[ -z "$tag" ]] && echo "Cancelled" && return
+  
+  if [[ "$kind" == "2" ]]; then
+    read -rsp "Community: " comm
+    echo
+    snmp_db_add "v2c|$tag|$comm"
+  else
+    read -rp "Username: " user
+    read -rp "Auth (SHA/MD5) [SHA]: " aproto
+    aproto="${aproto:-SHA}"
+    read -rsp "Auth pass: " apass
+    echo
+    echo "1) authPriv"
+    echo "2) authNoPriv"
+    read -rp "Select [1]: " pm
+    pm="${pm:-1}"
+    if [[ "$pm" == "1" ]]; then
+      read -rp "Priv (AES/DES) [AES]: " pproto
+      pproto="${pproto:-AES}"
+      read -rsp "Priv pass: " ppass
+      echo
+      snmp_db_add "v3|$tag|$user|$aproto|$apass|authPriv|$pproto|$ppass"
+    else
+      snmp_db_add "v3|$tag|$user|$aproto|$apass|authNoPriv||"
+    fi
+  fi
+  
+  snmp_regen_deployment
+  docker_compose restart netdisco-backend netdisco-web >/dev/null 2>&1 || true
+  echo "Added $tag"
+}
+
+snmp_delete() {
+  snmp_list
+  read -rp "Tag to delete: " tag
+  [[ -z "$tag" ]] && echo "Cancelled" && return
+  
+  echo "Type DELETE to confirm:"
+  read -r confirm
+  [[ "$confirm" != "DELETE" ]] && echo "Cancelled" && return
+  
+  snmp_db_delete "$tag"
+  snmp_regen_deployment
+  docker_compose restart netdisco-backend netdisco-web >/dev/null 2>&1 || true
+  echo "Deleted $tag"
+}
+
+snmp_test() {
+  snmp_list
+  read -rp "Tag to test: " tag
+  [[ -z "$tag" ]] && echo "Cancelled" && return
+  
+  read -rp "Target IP: " ip
+  [[ -z "$ip" ]] && echo "Cancelled" && return
+  
+  echo "Testing $tag against $ip..."
+  docker exec -it netdisco-backend netdisco-do discover -d "$ip" || true
+}
+
 snmp_menu() {
   while true; do
     echo
     echo "SNMP Management"
     echo "==============="
-    echo "1) List profiles"
-    echo "2) Add SNMP v2c profile"
-    echo "3) Add SNMP v3 profile"
-    echo "4) Edit v3 profile"
-    echo "5) Delete profile"
-    echo "6) Test SNMP"
+    echo "1) List"
+    echo "2) Add"
+    echo "3) Delete"
+    echo "4) Test"
     echo "0) Back"
     echo
-    read -rp "Select option: " choice
-
-    case "$choice" in
-      1) list_snmp_profiles ;;
-      2) add_snmp_v2 ;;
-      3) add_snmp_v3 ;;
-      4) edit_snmp_v3 ;;
-      5) delete_snmp_profile ;;
-      6) snmp_test ;;
+    read -rp "Select: " opt
+    
+    case "$opt" in
+      1) snmp_list; read -p "Press enter..." ;;
+      2) snmp_add; read -p "Press enter..." ;;
+      3) snmp_delete; read -p "Press enter..." ;;
+      4) snmp_test; read -p "Press enter..." ;;
       0) break ;;
-      *) echo "Invalid selection" ;;
     esac
   done
 }
