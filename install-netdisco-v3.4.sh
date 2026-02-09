@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="3.4.6"
+SCRIPT_VERSION="3.4.7"
 
 # -----------------------------
 # Constants
@@ -393,10 +393,10 @@ snmp_add() {
   echo "2) SNMPv2c"
   read -rp "Select [1]: " kind
   kind="${kind:-1}"
-  
+
   read -rp "Tag: " tag
   [[ -z "$tag" ]] && echo "Cancelled" && return
-  
+
   if [[ "$kind" == "2" ]]; then
     read -rsp "Community: " comm
     echo
@@ -421,9 +421,11 @@ snmp_add() {
       snmp_db_add "v3|$tag|$user|$aproto|$apass|authNoPriv||"
     fi
   fi
-  
+
   snmp_regen_deployment
-  docker_compose restart netdisco-backend netdisco-web >/dev/null 2>&1 || true
+
+  # Reload containers with updated deployment.yml and env
+  docker compose restart netdisco-backend netdisco-web >/dev/null 2>&1 || true
   echo "Added $tag"
 }
 
@@ -431,28 +433,104 @@ snmp_delete() {
   snmp_list
   read -rp "Tag to delete: " tag
   [[ -z "$tag" ]] && echo "Cancelled" && return
-  
+
   echo "Type DELETE to confirm:"
   read -r confirm
   [[ "$confirm" != "DELETE" ]] && echo "Cancelled" && return
-  
-  snmp_db_delete "$tag"
+
+  # Ensure DB exists
+  snmp_db_ensure
+
+  # Remove the line(s) for this tag
+  local tmp
+  tmp=$(mktemp)
+  sudo awk -F'|' -v t="$tag" '$2 != t' "$SNMP_DB_FILE" > "$tmp"
+  sudo mv "$tmp" "$SNMP_DB_FILE"
+  sudo chmod 0640 "$SNMP_DB_FILE"
+  sudo chown $ND_UID:$ND_GID "$SNMP_DB_FILE" 2>/dev/null || true
+
+  # Regenerate deployment.yml with remaining credentials
   snmp_regen_deployment
-  docker_compose restart netdisco-backend netdisco-web >/dev/null 2>&1 || true
-  echo "Deleted $tag"
+
+  # Restart backend so Netdisco picks up the change
+  docker compose restart netdisco-backend netdisco-web >/dev/null 2>&1 || true
+
+  echo "Deleted SNMP credential '$tag'."
 }
+
 
 snmp_test() {
   snmp_list
   read -rp "Tag to test: " tag
   [[ -z "$tag" ]] && echo "Cancelled" && return
-  
+
   read -rp "Target IP: " ip
   [[ -z "$ip" ]] && echo "Cancelled" && return
-  
-  echo "Testing $tag against $ip..."
+
+  # Load the credential from DB
+  local dbline
+  dbline=$(snmp_db_list | grep "|${tag}|")
+  if [[ -z "$dbline" ]]; then
+    echo "Tag not found!"
+    return
+  fi
+
+  # Parse credential fields
+  IFS='|' read -r typ _tag user aproto apass mode pproto ppass <<<"$dbline"
+
+  # Backup current deployment.yml
+  local yml="$INSTALL_DIR/netdisco/config/deployment.yml"
+  local yml_bak
+  yml_bak=$(mktemp)
+  [[ -f "$yml" ]] && cp -f "$yml" "$yml_bak"
+
+  # Regenerate a temp deployment.yml with only this credential
+  if [[ "$typ" == "v3" ]]; then
+    {
+      echo "no_auth: false"
+      echo "discover_snmpver: 3"
+      echo "device_auth:"
+      echo "  - tag: $tag"
+      echo "    user: $user"
+      echo "    ro: true"
+      echo "    auth:"
+      echo "      proto: $aproto"
+      echo "      pass: $apass"
+      if [[ "$mode" == "authPriv" ]]; then
+        echo "    priv:"
+        echo "      proto: $pproto"
+        echo "      pass: $ppass"
+      fi
+    } > "$yml"
+  else
+    # v2c
+    local comm
+    comm=$(echo "$dbline" | awk -F'|' '{print $3}')
+    {
+      echo "no_auth: true"
+      echo "discover_snmpver: 2"
+      echo "device_auth: []"
+    } > "$yml"
+    export NETDISCO_RO_COMMUNITY="$comm"
+  fi
+
+  # Restart backend to pick up new deployment.yml
+  docker compose restart netdisco-backend >/dev/null 2>&1 || true
+
+  echo "Testing SNMP credential '$tag' against $ip..."
   docker exec -it netdisco-backend netdisco-do discover -d "$ip" || true
+
+  # Restore original deployment.yml
+  [[ -f "$yml_bak" ]] && cp -f "$yml_bak" "$yml"
+  rm -f "$yml_bak"
+
+  # Restart backend to restore full configuration
+  docker compose restart netdisco-backend >/dev/null 2>&1 || true
+
+  echo "Test complete."
 }
+
+
 
 snmp_menu() {
   while true; do
