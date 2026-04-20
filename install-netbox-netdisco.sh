@@ -15,8 +15,10 @@
 #    - https://github.com/netbox-community/netbox-topology-views
 # ============================================================
 #
-# Version: 3.0
+# Version: 3.1
 #
+# v3.1: 
+# - Added missing jq to pre-reqs
 # v3.0: 
 # - Version moved to 3.0 to fix inconsistencies
 # - Fixed issue with API_TOKEN_PEPPERS`
@@ -978,7 +980,7 @@ install_docker() {
   log "Docker not found; installing prerequisites + Docker Engine..."
 
   apt-get update
-  apt-get install -y ca-certificates curl gnupg lsb-release openssl
+  apt-get install -y ca-certificates curl gnupg lsb-release openssl jq
 
   mkdir -p /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
