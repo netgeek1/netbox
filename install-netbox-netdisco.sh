@@ -15,8 +15,10 @@
 #    - https://github.com/netbox-community/netbox-topology-views
 # ============================================================
 #
-# Version: 3.1
+# Version: 3.1.1
 #
+# v3.1.1
+# - Added missing rsync to pre-reqs
 # v3.1: 
 # - Added missing jq to pre-reqs
 # v3.0: 
@@ -980,7 +982,7 @@ install_docker() {
   log "Docker not found; installing prerequisites + Docker Engine..."
 
   apt-get update
-  apt-get install -y ca-certificates curl gnupg lsb-release openssl jq
+  apt-get install -y ca-certificates curl gnupg lsb-release openssl jq rsync
 
   mkdir -p /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -2708,7 +2710,7 @@ netbox_ensure_device_type() {
   local model="$1"
   local manufacturer_id="$2"
 
-  netbox_api GET "dcim/device-types/?model=$model" | jq -e '.count>0' >/dev/null || \
+  netbox_api GET "dcim/device-types/?model=$model" | 0 -e '.count>0' >/dev/null || \
     netbox_api POST "dcim/device-types/" "{
       \"model\":\"$model\",
       \"slug\":\"$(echo "$model" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')\",
