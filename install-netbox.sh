@@ -4,6 +4,9 @@
 #  - https://netboxlabs.com/plugins
 #      - Need to add to plugin_requirements.txt, configuration/plugins.py and PLUGINS=
 #
+# - v1.1.0 - 20260423-1509
+#   Corrected pinning issues
+#
 # - v1.0.0
 #   Version pinning to NetBox 4.4.9 and plugins versions that work
 #   Added Netbox Routing
@@ -18,7 +21,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
 INSTALL_DIR="/opt"
 NETBOX_COMPOSE_DIR="${INSTALL_DIR}/netbox-docker"
@@ -154,8 +157,12 @@ create_plugin_dockerfile() {
     cat > Dockerfile-plugins <<EOF
 FROM netboxcommunity/netbox:${NETBOX_VERSION}
 
+RUN adduser --system --group netbox
+
 COPY ./plugin_requirements.txt /opt/netbox/
 RUN /usr/local/bin/uv pip install -r /opt/netbox/plugin_requirements.txt
+
+USER netbox
 EOF
 }
 
@@ -178,6 +185,11 @@ services:
     healthcheck:
       start_period: 900s
 EOF
+
+    cat > .env <<EOF
+VERSION=${NETBOX_VERSION}
+EOF
+
 }
 
 # ------------------------------------------------------------
