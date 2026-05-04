@@ -2,7 +2,7 @@
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite
 #  For Ubuntu 24.04
-#  Version: 2.0.0
+#  Version: 2.0.1
 #
 #  Features:
 #   - Deploys NetBox via Docker Compose
@@ -20,7 +20,7 @@ set -uo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 # GLOBAL CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
