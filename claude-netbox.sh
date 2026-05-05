@@ -2,7 +2,17 @@
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite
 #  For Ubuntu 24.04
-#  Version: 2.0.3
+#  Version: 2.0.4
+#
+#  Changelog v2.0.4 
+#   — Auto-sudo added
+#   — Wrapped in cmd_exists download-mibs
+#   — Changed from a single pip3 install … all-packages to a per-package
+#   — Added Docker's official apt repo (GPG key + docker.list) 
+#   — Added SKIP_SUPERUSER: "false" to the override yml
+#   — Pre-generate a 40-char hex token with openssl rand -hex 20
+#   — Changed while read < "$LIVE_HOSTS_FILE" to while read <&3 … done 3< "$LIVE_HOSTS_FILE" 
+#   — Added integer regex validation (^[0-9]+$) for dtype_id, role_id, and site_id
 #
 #  Changelog v2.0.3 
 #   — Removed version: '3.4'
@@ -27,7 +37,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.0.3"
+SCRIPT_VERSION="2.0.4"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 
 BASE_DIR="/opt/netbox-discovery"
@@ -37,6 +47,7 @@ CREDS_FILE="$BASE_DIR/.credentials.enc"
 CREDS_KEY_FILE="$BASE_DIR/.creds.key"
 DISCOVERY_DIR="$BASE_DIR/discovery"
 NETBOX_DIR="/opt/netbox-docker"
+DOCKER_COMPOSE="$DOCKER_COMPOSE"   # overridden by detect_docker_compose()
 
 # -- Colours (pure ANSI escape codes, no Unicode) --
 R='\033[0;31m'
@@ -85,7 +96,10 @@ log_step() {
 # UTILITIES
 # -----------------------------------------------------------------------------
 check_root() {
-    [[ $EUID -eq 0 ]] || { log_error "Run as root: sudo $0"; exit 1; }
+    if [[ $EUID -ne 0 ]]; then
+        log_info "Not running as root -- re-launching with sudo..."
+        exec sudo "$0" "$@"
+    fi
 }
 
 pause() { echo; read -rp "  Press [Enter] to continue..."; }
@@ -139,6 +153,22 @@ banner() {
     echo -e "  ${D}Log   : $LOG_FILE${NC}"
     echo -e "  ${D}Config: $CONFIG_FILE${NC}"
     echo ""
+}
+
+# -----------------------------------------------------------------------------
+# DOCKER COMPOSE DETECTION
+# -----------------------------------------------------------------------------
+detect_docker_compose() {
+    if docker compose version &>/dev/null 2>&1; then
+        DOCKER_COMPOSE="docker compose"
+        log_debug "Detected: docker compose (plugin)"
+    elif command -v docker-compose &>/dev/null 2>&1; then
+        DOCKER_COMPOSE="docker-compose"
+        log_warn "docker compose plugin not found -- falling back to docker-compose (legacy)"
+    else
+        DOCKER_COMPOSE="docker compose"
+        log_warn "Cannot detect docker compose -- will attempt docker compose after install"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -236,8 +266,26 @@ install_deps() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >> "$LOG_FILE" 2>&1
 
+    # Install Docker from the official Docker repo for reliable compose v2 support
+    echo -ne "  Setting up Docker official repo ... "
+    if ! cmd_exists docker || ! docker compose version &>/dev/null 2>&1; then
+        apt-get install -y ca-certificates curl gnupg >> "$LOG_FILE" 2>&1 || true
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg             | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null || true
+        chmod a+r /etc/apt/keyrings/docker.gpg 2>/dev/null || true
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable"             > /etc/apt/sources.list.d/docker.list 2>/dev/null || true
+        apt-get update -qq >> "$LOG_FILE" 2>&1 || true
+        apt-get install -y docker-ce docker-ce-cli containerd.io             docker-buildx-plugin docker-compose-plugin >> "$LOG_FILE" 2>&1             || log_warn "Docker official install failed -- falling back to docker.io"
+        # Fallback: ubuntu repo docker if official fails
+        if ! cmd_exists docker; then
+            apt-get install -y docker.io >> "$LOG_FILE" 2>&1 || true
+        fi
+        echo -e "${G}OK${NC}"
+    else
+        echo -e "${G}already installed${NC}"
+    fi
+
     local pkgs=(
-        docker.io docker-compose-v2
         git curl wget ipcalc bc
         nmap masscan arp-scan fping
         snmp snmpd snmp-mibs-downloader
@@ -265,15 +313,21 @@ install_deps() {
     done
 
     echo -ne "  Downloading SNMP MIBs ... "
-    download-mibs >> "$LOG_FILE" 2>&1 || true
-    sed -i '/^mibs/d' /etc/snmp/snmp.conf 2>/dev/null || true
+    if cmd_exists download-mibs; then
+        download-mibs >> "$LOG_FILE" 2>&1 || true
+    else
+        # Manually unlock MIBs if download-mibs is unavailable
+        sed -i 's/^mibs :$/#mibs :/' /etc/snmp/snmp.conf 2>/dev/null || true
+    fi
+    sed -i '/^mibs +ALL/d' /etc/snmp/snmp.conf 2>/dev/null || true
     echo "mibs +ALL" >> /etc/snmp/snmp.conf 2>/dev/null || true
     echo -e "${G}OK${NC}"
 
     log_info "Installing Python network libraries..."
-    pip3 install --break-system-packages --quiet \
-        netmiko napalm pysnmp paramiko requests pynetbox scapy \
-        >> "$LOG_FILE" 2>&1 || log_warn "Some Python packages failed"
+    local pylib
+    for pylib in netmiko napalm pysnmp paramiko requests pynetbox scapy; do
+        pip3 install --break-system-packages --quiet             --ignore-installed "$pylib" >> "$LOG_FILE" 2>&1             || pip3 install --break-system-packages --quiet                "$pylib" >> "$LOG_FILE" 2>&1 || true
+    done
 
     local svc
     for svc in docker lldpd avahi-daemon; do
@@ -300,10 +354,13 @@ deploy_netbox() {
         pause; return 1
     fi
 
-    local admin_pass
+    local admin_pass api_token secret_key
     admin_pass="NetBox@$(openssl rand -hex 5)"
-    local secret_key
+    api_token=$(openssl rand -hex 20)
     secret_key=$(openssl rand -base64 60 | tr -d '\n/+=' | head -c 50)
+    # Store token immediately so deploy failures still leave it in config
+    NETBOX_API_TOKEN="$api_token"
+    save_config
 
     if [[ -d "$NETBOX_DIR/.git" ]]; then
         log_info "Updating existing netbox-docker repo..."
@@ -326,9 +383,11 @@ services:
     ports:
       - "${NETBOX_PORT}:8080"
     environment:
+      SKIP_SUPERUSER: "false"
       SUPERUSER_NAME: admin
       SUPERUSER_PASSWORD: ${admin_pass}
       SUPERUSER_EMAIL: admin@netbox.local
+      SUPERUSER_API_TOKEN: ${api_token}
       SECRET_KEY: ${secret_key}
   netbox-worker:
     environment:
@@ -336,12 +395,13 @@ services:
 DCEOF
 
     log_info "Pulling Docker images (may take several minutes)..."
-    docker compose pull >> "$LOG_FILE" 2>&1 &
+    detect_docker_compose
+    $DOCKER_COMPOSE pull >> "$LOG_FILE" 2>&1 &
     spinner $!
-    wait $! || { log_error "docker compose pull failed"; pause; return 1; }
+    wait $! || { log_error "$DOCKER_COMPOSE pull failed"; pause; return 1; }
 
     log_info "Starting NetBox containers..."
-    docker compose up -d >> "$LOG_FILE" 2>&1 &
+    $DOCKER_COMPOSE up -d >> "$LOG_FILE" 2>&1 &
     spinner $!
     wait $!
 
@@ -356,12 +416,9 @@ DCEOF
     done
     echo -e " ${G}Ready!${NC}"
 
-    log_info "Creating API token..."
-    NETBOX_API_TOKEN=$(docker compose exec -T netbox \
-        python manage.py shell -c \
-        "from users.models import Token; from django.contrib.auth.models import User; \
-u=User.objects.get(username='admin'); t,_=Token.objects.get_or_create(user=u); print(t.key)" \
-        2>/dev/null | tail -1)
+    # API token was pre-generated and set as SUPERUSER_API_TOKEN in the override.
+    # netbox-docker creates the superuser and assigns this token on first start.
+    log_info "API token pre-configured: ${NETBOX_API_TOKEN:0:8}..."
     save_config
 
     local creds_out="$BASE_DIR/netbox-credentials.txt"
@@ -371,7 +428,7 @@ NetBox Access Credentials
 URL:       http://localhost:${NETBOX_PORT}
 Username:  admin
 Password:  ${admin_pass}
-API Token: ${NETBOX_API_TOKEN}
+API Token: ${api_token}
 
 KEEP THIS FILE SECURE -- DELETE AFTER NOTING CREDENTIALS
 CREDEOF
@@ -524,6 +581,17 @@ nb_upsert_device() {
     mfr_id=$(nb_get_or_create_manufacturer "$mfr")
     dtype_id=$(nb_get_or_create_device_type "$mfr_id" "$model")
     role_id=$(nb_get_or_create_role "$role")
+
+    # Validate that all IDs are non-empty integers before using --argjson
+    if [[ -z "$dtype_id"  || ! "$dtype_id"  =~ ^[0-9]+$ ]]; then
+        log_error "Invalid device_type ID ($dtype_id) for $name -- skipping"; return 1
+    fi
+    if [[ -z "$role_id"   || ! "$role_id"   =~ ^[0-9]+$ ]]; then
+        log_error "Invalid role ID ($role_id) for $name -- skipping"; return 1
+    fi
+    if [[ -z "$site_id"   || ! "$site_id"   =~ ^[0-9]+$ ]]; then
+        log_error "Invalid site ID ($site_id) -- skipping"; return 1
+    fi
 
     local enc; enc=$(nb_urlencode "$name")
     local existing; existing=$(nb_get "dcim/devices/?name=${enc}")
@@ -702,11 +770,13 @@ scan_all_hosts() {
     log_step "Phase 2 -- Deep Scanning $total Hosts"
     local idx=0
     local ip
-    while IFS= read -r ip; do
-        (( idx++ ))
+    # Use fd3 for the host file so background probe subprocesses
+    # inheriting fd0 (stdin) cannot accidentally consume loop lines.
+    while IFS= read -r ip <&3; do
+        (( idx++ )) || true
         printf "\n  ${C}[%d/%d]${NC} ${W}%s${NC}\n" "$idx" "$total" "$ip"
         scan_single_host "$ip"
-    done < "$LIVE_HOSTS_FILE"
+    done 3< "$LIVE_HOSTS_FILE"
     log_ok "Phase 2 complete"
 }
 
@@ -714,14 +784,16 @@ scan_single_host() {
     local ip="$1"
     local tmp; tmp=$(mktemp -d)
 
-    probe_nmap    "$ip" "$tmp" &
-    probe_snmp    "$ip" "$tmp" &
-    probe_ssh     "$ip" "$tmp" &
-    probe_http    "$ip" "$tmp" &
-    probe_netbios "$ip" "$tmp" &
-    probe_dns     "$ip" "$tmp" &
-    probe_banners "$ip" "$tmp" &
-    probe_mdns    "$ip" "$tmp" &
+    # Redirect stdin to /dev/null for every probe so they cannot
+    # accidentally read from an inherited file descriptor.
+    probe_nmap    "$ip" "$tmp" </dev/null &
+    probe_snmp    "$ip" "$tmp" </dev/null &
+    probe_ssh     "$ip" "$tmp" </dev/null &
+    probe_http    "$ip" "$tmp" </dev/null &
+    probe_netbios "$ip" "$tmp" </dev/null &
+    probe_dns     "$ip" "$tmp" </dev/null &
+    probe_banners "$ip" "$tmp" </dev/null &
+    probe_mdns    "$ip" "$tmp" </dev/null &
     wait
 
     local host_json
@@ -1528,7 +1600,7 @@ sync_to_netbox() {
 
     local host
     while IFS= read -r host; do
-        (( idx++ ))
+        (( idx++ )) || true
         local ip hostname role mfr model os serial
         local loc contact uptime cpu mem comments dmethods
         ip=$(echo "$host"       | jq -r '.ip')
@@ -1794,18 +1866,18 @@ menu_netbox_mgmt() {
 
         read -rp $'\nChoice: ' c
         case "$c" in
-        1)  cd "$NETBOX_DIR" && docker compose up -d >> "$LOG_FILE" 2>&1
+        1)  cd "$NETBOX_DIR" && $DOCKER_COMPOSE up -d >> "$LOG_FILE" 2>&1
             log_ok "NetBox started" ;;
         2)  confirm "Stop NetBox?" || { pause; continue; }
-            cd "$NETBOX_DIR" && docker compose down >> "$LOG_FILE" 2>&1
+            cd "$NETBOX_DIR" && $DOCKER_COMPOSE down >> "$LOG_FILE" 2>&1
             log_ok "NetBox stopped" ;;
-        3)  cd "$NETBOX_DIR" && docker compose restart >> "$LOG_FILE" 2>&1
+        3)  cd "$NETBOX_DIR" && $DOCKER_COMPOSE restart >> "$LOG_FILE" 2>&1
             log_ok "NetBox restarted" ;;
         4)  echo -e "${D}(Ctrl+C to exit)${NC}"
-            cd "$NETBOX_DIR" && docker compose logs -f --tail=50 netbox ;;
+            cd "$NETBOX_DIR" && $DOCKER_COMPOSE logs -f --tail=50 netbox ;;
         5)  read -rp "  API Token: " NETBOX_API_TOKEN; save_config ;;
         6)  NETBOX_API_TOKEN=$(cd "$NETBOX_DIR" && \
-                docker compose exec -T netbox python manage.py shell -c \
+                $DOCKER_COMPOSE exec -T netbox python manage.py shell -c \
                 "from users.models import Token; \
 from django.contrib.auth.models import User; \
 u=User.objects.get(username='admin'); \
@@ -1815,17 +1887,17 @@ t=Token.objects.create(user=u); print(t.key)" \
             echo -e "  New token: ${W}$NETBOX_API_TOKEN${NC}" ;;
         7)  local bk="$BASE_DIR/backup_$(date +%Y%m%d_%H%M%S).sql.gz"
             log_info "Backing up..."
-            cd "$NETBOX_DIR" && docker compose exec -T postgres \
+            cd "$NETBOX_DIR" && $DOCKER_COMPOSE exec -T postgres \
                 pg_dump -U netbox netbox | gzip > "$bk"
             log_ok "Backup: $bk" ;;
         8)  read -rp "  Backup file (.sql.gz): " bkf
             if [[ -f "$bkf" ]]; then
                 confirm "Restore will OVERWRITE the current database. Continue?" || continue
                 cd "$NETBOX_DIR"
-                docker compose exec -T postgres psql -U netbox -c \
+                $DOCKER_COMPOSE exec -T postgres psql -U netbox -c \
                     "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" \
                     netbox >> "$LOG_FILE" 2>&1
-                zcat "$bkf" | docker compose exec -T postgres \
+                zcat "$bkf" | $DOCKER_COMPOSE exec -T postgres \
                     psql -U netbox netbox >> "$LOG_FILE" 2>&1
                 log_ok "Database restored"
             else
@@ -1833,10 +1905,10 @@ t=Token.objects.create(user=u); print(t.key)" \
             fi ;;
         9)  log_info "Updating NetBox..."
             cd "$NETBOX_DIR" && git pull -q \
-                && docker compose pull >> "$LOG_FILE" 2>&1
-            docker compose up -d >> "$LOG_FILE" 2>&1
+                && $DOCKER_COMPOSE pull >> "$LOG_FILE" 2>&1
+            $DOCKER_COMPOSE up -d >> "$LOG_FILE" 2>&1
             log_ok "Update complete" ;;
-        10) cd "$NETBOX_DIR" && docker compose ps ;;
+        10) cd "$NETBOX_DIR" && $DOCKER_COMPOSE ps ;;
         0)  return ;;
         esac
         pause
@@ -2030,6 +2102,7 @@ main() {
     init_dirs
     load_config
     init_creds
+    detect_docker_compose
     log_info "================================================"
     log_info "NetBox Discovery Suite v${SCRIPT_VERSION} started"
     log_info "User: $(id -un)  PID: $$"
