@@ -2,7 +2,13 @@
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite
 #  For Ubuntu 24.04
-#  Version: 2.0.2
+#  Version: 2.0.3
+#
+#  Changelog v2.0.3 
+#   — Removed version: '3.4'
+#     Obsolete in Compose v2+; causes the warning
+#   — Removed netbox-housekeeping service
+#     Dropped in netbox-docker 3.4.0 — NetBox 4.4.0+ handles housekeeping internally.
 #
 #  Changelog v2.0.2:
 #   - Removed ALL non-ASCII characters (box-drawing, braille spinner, bullets)
