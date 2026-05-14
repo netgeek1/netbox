@@ -2,7 +2,14 @@
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite
 #  For Ubuntu 24.04
-#  Version: 2.0.4
+#  Version: 2.0.7
+#
+#  Changelog v2.0.5
+#   — Password now saved to NETBOX_ADMIN_PASS in config at deploy time
+#   — Added --root-user-action=ignore to both pip3
+#   — Added PROCESSES: "2" to the netbox service in docker-compose.override.yml
+#   — Removed all U: UDP ports from -p (need -sU flag separately — we get UDP services via SNMP walk instead)
+#   — Replaced the single failing nb_get check with a two-step diagnostic: ① nc TCP port check ("is NetBox even running?")
 #
 #  Changelog v2.0.4 
 #   — Auto-sudo added
@@ -37,7 +44,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.0.4"
+SCRIPT_VERSION="2.0.7"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 
 BASE_DIR="/opt/netbox-discovery"
@@ -47,7 +54,7 @@ CREDS_FILE="$BASE_DIR/.credentials.enc"
 CREDS_KEY_FILE="$BASE_DIR/.creds.key"
 DISCOVERY_DIR="$BASE_DIR/discovery"
 NETBOX_DIR="/opt/netbox-docker"
-DOCKER_COMPOSE="$DOCKER_COMPOSE"   # overridden by detect_docker_compose()
+DOCKER_COMPOSE=""   # overridden by detect_docker_compose()
 
 # -- Colours (pure ANSI escape codes, no Unicode) --
 R='\033[0;31m'
@@ -62,6 +69,7 @@ NC='\033[0m'
 NETBOX_PORT=8000
 NETBOX_API_URL="http://localhost:${NETBOX_PORT}"
 NETBOX_API_TOKEN=""
+NETBOX_ADMIN_PASS=""
 DEFAULT_SITE_NAME="Default Site"
 SCAN_TIMEOUT=5
 SNMP_TIMEOUT=3
@@ -187,6 +195,7 @@ save_config() {
 NETBOX_PORT=${NETBOX_PORT}
 NETBOX_API_URL=${NETBOX_API_URL}
 NETBOX_API_TOKEN=${NETBOX_API_TOKEN}
+NETBOX_ADMIN_PASS=${NETBOX_ADMIN_PASS}
 DEFAULT_SITE_NAME=${DEFAULT_SITE_NAME}
 SCAN_TIMEOUT=${SCAN_TIMEOUT}
 SNMP_TIMEOUT=${SNMP_TIMEOUT}
@@ -326,7 +335,12 @@ install_deps() {
     log_info "Installing Python network libraries..."
     local pylib
     for pylib in netmiko napalm pysnmp paramiko requests pynetbox scapy; do
-        pip3 install --break-system-packages --quiet             --ignore-installed "$pylib" >> "$LOG_FILE" 2>&1             || pip3 install --break-system-packages --quiet                "$pylib" >> "$LOG_FILE" 2>&1 || true
+        pip3 install --break-system-packages --quiet \
+            --root-user-action=ignore --ignore-installed "$pylib" \
+            >> "$LOG_FILE" 2>&1 \
+            || pip3 install --break-system-packages --quiet \
+               --root-user-action=ignore "$pylib" \
+               >> "$LOG_FILE" 2>&1 || true
     done
 
     local svc
@@ -358,8 +372,9 @@ deploy_netbox() {
     admin_pass="NetBox@$(openssl rand -hex 5)"
     api_token=$(openssl rand -hex 20)
     secret_key=$(openssl rand -base64 60 | tr -d '\n/+=' | head -c 50)
-    # Store token immediately so deploy failures still leave it in config
+    # Store credentials immediately so deploy failures still leave them in config
     NETBOX_API_TOKEN="$api_token"
+    NETBOX_ADMIN_PASS="$admin_pass"
     save_config
 
     if [[ -d "$NETBOX_DIR/.git" ]]; then
@@ -377,6 +392,21 @@ deploy_netbox() {
     # Removed netbox-housekeeping service: dropped in netbox-docker 3.4.0 because
     # NetBox 4.4.0+ handles housekeeping internally. Including it with no image/build
     # causes "invalid compose project" errors on current releases.
+    # Write credentials file NOW before any waiting -- available even if deploy times out
+    local creds_out="$BASE_DIR/netbox-credentials.txt"
+    cat > "$creds_out" <<CREDEOF
+NetBox Access Credentials
+=========================
+URL:       http://localhost:${NETBOX_PORT}
+Username:  admin
+Password:  ${admin_pass}
+API Token: ${api_token}
+
+KEEP THIS FILE SECURE -- DELETE AFTER NOTING CREDENTIALS
+CREDEOF
+    chmod 600 "$creds_out"
+    log_info "Credentials saved to: $creds_out"
+
     cat > docker-compose.override.yml <<DCEOF
 services:
   netbox:
@@ -384,14 +414,16 @@ services:
       - "${NETBOX_PORT}:8080"
     environment:
       SKIP_SUPERUSER: "false"
-      SUPERUSER_NAME: admin
-      SUPERUSER_PASSWORD: ${admin_pass}
-      SUPERUSER_EMAIL: admin@netbox.local
-      SUPERUSER_API_TOKEN: ${api_token}
-      SECRET_KEY: ${secret_key}
+      SUPERUSER_NAME: "admin"
+      SUPERUSER_PASSWORD: "${admin_pass}"
+      SUPERUSER_EMAIL: "admin@netbox.local"
+      SUPERUSER_API_TOKEN: "${api_token}"
+      SUPERUSER_API_KEY: "${api_token}"
+      SECRET_KEY: "${secret_key}"
+      PROCESSES: "2"
   netbox-worker:
     environment:
-      SECRET_KEY: ${secret_key}
+      SECRET_KEY: "${secret_key}"
 DCEOF
 
     log_info "Pulling Docker images (may take several minutes)..."
@@ -406,33 +438,53 @@ DCEOF
     wait $!
 
     echo -ne "  Waiting for NetBox to initialize "
-    local retries=0
-    until curl -sf "http://localhost:${NETBOX_PORT}/api/" &>/dev/null; do
-        sleep 5; echo -n "."; (( retries++ ))
+    local retries=0 http_code
+    # Accept 2xx, 3xx, or 4xx -- all mean NetBox is alive.
+    # (API returns 403 without a token; login page returns 200.)
+    # Do NOT use curl -f here: it would treat 403 as failure.
+    until http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 5 \
+              "http://localhost:${NETBOX_PORT}/" 2>/dev/null) \
+          && [[ "$http_code" =~ ^[234] ]]; do
+        sleep 5; echo -n "."; (( retries++ )) || true
         if (( retries > 36 )); then
-            echo -e "\n${R}Timeout -- NetBox did not start within 3 minutes.${NC}"
-            pause; return 1
+            echo -e "\n${Y}Timeout waiting for HTTP response.${NC}"
+            echo -e "  NetBox may still be initialising -- check logs:"
+            echo -e "  cd $NETBOX_DIR && $DOCKER_COMPOSE logs netbox | tail -20"
+            pause
+            break
         fi
     done
-    echo -e " ${G}Ready!${NC}"
+    echo -e " ${G}Ready (HTTP $http_code)!${NC}"
 
-    # API token was pre-generated and set as SUPERUSER_API_TOKEN in the override.
-    # netbox-docker creates the superuser and assigns this token on first start.
-    log_info "API token pre-configured: ${NETBOX_API_TOKEN:0:8}..."
-    save_config
-
-    local creds_out="$BASE_DIR/netbox-credentials.txt"
-    cat > "$creds_out" <<CREDEOF
-NetBox Access Credentials
-=========================
-URL:       http://localhost:${NETBOX_PORT}
-Username:  admin
-Password:  ${admin_pass}
-API Token: ${api_token}
-
-KEEP THIS FILE SECURE -- DELETE AFTER NOTING CREDENTIALS
-CREDEOF
-    chmod 600 "$creds_out"
+    # Forcibly configure admin password AND token via Django shell.
+    # More reliable than env-var injection which some netbox-docker versions ignore.
+    log_info "Configuring admin user and API token via Django shell..."
+    local admin_setup_script
+    admin_setup_script="from django.contrib.auth.models import User\n"
+    admin_setup_script+="from users.models import Token\n"
+    admin_setup_script+="u,_=User.objects.get_or_create(username='admin')\n"
+    admin_setup_script+="u.set_password('${admin_pass}')\n"
+    admin_setup_script+="u.is_superuser=True; u.is_staff=True; u.save()\n"
+    admin_setup_script+="t,_=Token.objects.get_or_create(user=u,key='${api_token}')\n"
+    admin_setup_script+="print('SETUP_OK:'+t.key)"
+    local setup_result setup_tries=0
+    until setup_result=$(${DOCKER_COMPOSE} exec -T netbox \
+        python manage.py shell -c "$admin_setup_script" 2>/dev/null \
+        | grep "^SETUP_OK:"); do
+        sleep 5; (( setup_tries++ )) || true
+        [[ $setup_tries -gt 12 ]] && { log_warn "Django shell admin setup timed out"; break; }
+    done
+    if [[ "$setup_result" == SETUP_OK:* ]]; then
+        NETBOX_API_TOKEN="${setup_result#SETUP_OK:}"
+        log_ok "Admin user and API token configured: ${NETBOX_API_TOKEN:0:12}..."
+        save_config
+        sed -i "s|^API Token:.*|API Token: ${NETBOX_API_TOKEN}|" "$creds_out" 2>/dev/null || true
+        sed -i "s|^Password:.*|Password: ${admin_pass}|" "$creds_out" 2>/dev/null || true
+    else
+        log_warn "Django shell setup failed -- password/token from credentials file may not work"
+        log_warn "Manual fix: docker exec -it <netbox-container> python manage.py changepassword admin"
+    fi
 
     echo ""
     echo -e "${G}+----------------------------------------------+${NC}"
@@ -759,6 +811,26 @@ discover_live_hosts() {
           done > "$LIVE_HOSTS_FILE"
     rm -f "$tmp_all"
 
+    # Filter: remove IPs outside the requested target network.
+    # This prevents docker bridge IPs, host IPs, etc. from leaking in
+    # when ARP cache is scanned without a subnet restriction.
+    if valid_cidr "$target"; then
+        python3 -c "
+import ipaddress, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=False)
+    with open(sys.argv[2]) as f:
+        for line in f:
+            ip = line.strip()
+            if ip:
+                try:
+                    if ipaddress.ip_address(ip) in net: print(ip)
+                except ValueError: pass
+except Exception: sys.exit(1)
+" "$target" "$LIVE_HOSTS_FILE" > "${LIVE_HOSTS_FILE}.filtered" \
+            && mv "${LIVE_HOSTS_FILE}.filtered" "$LIVE_HOSTS_FILE" || true
+    fi
+
     local count; count=$(wc -l < "$LIVE_HOSTS_FILE")
     log_ok "Phase 1 complete -- $count live hosts found"
     echo -e "\n  ${G}Found: ${W}${count} live hosts${NC}"
@@ -815,14 +887,20 @@ probe_nmap() {
     local ip="$1" tmp="$2"
     local xml="$tmp/nmap.xml"
 
-    nmap -sV -sC -O --osscan-guess \
-        -p "T:1-1024,T:1433,T:1521,T:3306,T:3389,T:5432,T:5900,T:5901,\
-T:6379,T:8080,T:8443,T:8888,T:9200,T:9300,T:27017,\
-U:53,U:67,U:68,U:69,U:123,U:161,U:162,U:500,U:514,U:5353" \
-        --script "banner,ssh-hostkey,snmp-info,snmp-sysdescr,snmp-interfaces,\
-http-title,http-server-header,ssl-cert,nbstat,smb-security-mode,\
-ftp-banner,telnet-ntlm-info,dns-service-discovery,ms-sql-info,\
-mysql-info,mongodb-info,rdp-enum-encryption,vnc-info" \
+    # v2.0.5: TCP-only scan -- removed U: ports (need -sU separately).
+    # Removed -sC (triggers broken default scripts on some nmap builds).
+    # Removed ftp-banner (dropped in nmap 7.90+), telnet-ntlm-info,
+    #   snmp-sysdescr, snmp-interfaces (not valid nmap script names).
+    # banner script covers FTP/telnet banners generically.
+    nmap -sV -O --osscan-guess \
+        -p "21-23,25,53,80,110,139,143,443,445,512-514,587,631,\
+1433,1521,3306,3389,5432,5900,5901,6379,\
+8080,8443,8888,9200,9300,27017" \
+        --script "banner,ssh-hostkey,snmp-info,\
+http-title,http-server-header,ssl-cert,\
+nbstat,smb-security-mode,dns-service-discovery,\
+ms-sql-info,mysql-info,mongodb-info,\
+rdp-enum-encryption,vnc-info" \
         -T4 --host-timeout 90s --max-retries 2 \
         -oX "$xml" "$ip" >> "$LOG_FILE" 2>&1 || true
 
@@ -1396,10 +1474,13 @@ PRINTER  = ['printer','jetdirect','xerox','ricoh','canon','brother']
 UPS      = ['ups','apc','eaton','powerware']
 CAMERA   = ['camera','axis comm','hikvision','dahua']
 
-if   any(k in combined for k in FIREWALL):  host['device_role'] = 'Firewall'
-elif any(k in combined for k in ROUTER) and '161' in open_ports: host['device_role'] = 'Router'
-elif any(k in combined for k in SWITCH) and '161' in open_ports: host['device_role'] = 'Switch'
-elif any(k in combined for k in AP):        host['device_role'] = 'Wireless AP'
+# Use SNMP availability (snmp.available) as a proxy for "is a managed network device".
+# Removes dependency on TCP port 161 which nmap does not scan by default.
+snmp_up = bool(snmp.get('available'))
+if   any(k in combined for k in FIREWALL):                                          host['device_role'] = 'Firewall'
+elif any(k in combined for k in ROUTER) and (snmp_up or '161' in open_ports):     host['device_role'] = 'Router'
+elif any(k in combined for k in SWITCH) and (snmp_up or '161' in open_ports):     host['device_role'] = 'Switch'
+elif any(k in combined for k in AP):                                                host['device_role'] = 'Wireless AP'
 elif any(k in combined for k in PRINTER) or '9100' in open_ports: host['device_role'] = 'Printer'
 elif any(k in combined for k in UPS):       host['device_role'] = 'UPS'
 elif any(k in combined for k in CAMERA):    host['device_role'] = 'IP Camera'
@@ -1586,8 +1667,30 @@ sync_to_netbox() {
         save_config
     fi
 
-    if ! nb_get "dcim/sites/" &>/dev/null; then
-        log_error "Cannot reach NetBox API at $NETBOX_API_URL"
+    # Two-step check: TCP port reachability, then API token validity
+    if ! nc -z -w 5 localhost "${NETBOX_PORT}" 2>/dev/null; then
+        log_error "NetBox port ${NETBOX_PORT} not reachable -- is it running?"
+        log_info  "Start it: Menu -> NetBox Management -> Start NetBox"
+        pause; return 1
+    fi
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time 10 \
+        -H "Authorization: Token $NETBOX_API_TOKEN" \
+        "${NETBOX_API_URL}/api/dcim/sites/" 2>/dev/null)
+    if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
+        log_error "NetBox API auth failed (HTTP $http_code) -- token may be wrong"
+        log_info  "Token in use : ${NETBOX_API_TOKEN:0:12}..."
+        log_info  "Credentials  : cat $BASE_DIR/netbox-credentials.txt"
+        read -rp "  Enter correct API token (blank to cancel): " new_token
+        if [[ -n "$new_token" ]]; then
+            NETBOX_API_TOKEN="$new_token"; save_config
+        else
+            pause; return 1
+        fi
+    elif [[ "$http_code" != "200" ]]; then
+        log_error "NetBox API returned HTTP $http_code"
+        log_info  "Logs: cd $NETBOX_DIR && $DOCKER_COMPOSE logs netbox | tail -30"
         pause; return 1
     fi
 
@@ -1618,12 +1721,16 @@ sync_to_netbox() {
         dmethods=$(echo "$host" | jq -r '.discovery_methods | join(", ")')
 
         comments="Discovered by NetBox Discovery Suite v${SCRIPT_VERSION}"
-        [[ -n "$loc"      ]] && comments="${comments}; Location: $loc"
-        [[ -n "$contact"  ]] && comments="${comments}; Contact: $contact"
-        [[ -n "$uptime"   ]] && comments="${comments}; Uptime: $uptime"
-        [[ -n "$cpu"      ]] && comments="${comments}; CPU: $cpu"
-        [[ -n "$mem"      ]] && comments="${comments}; Mem: $mem"
-        comments="${comments}; Discovery: $dmethods"
+        [[ -n "$loc"     ]] && comments="${comments}\nLocation : $loc"
+        [[ -n "$contact" ]] && comments="${comments}\nContact  : $contact"
+        [[ -n "$uptime"  ]] && comments="${comments}\nUptime   : $uptime"
+        [[ -n "$cpu"     ]] && comments="${comments}\nCPU      : $cpu"
+        [[ -n "$mem"     ]] && comments="${comments}\nMem      : $mem"
+        local snmp_oid snmp_community
+        snmp_oid=$(echo "$host"       | jq -r '.snmp_details.sys_oid // ""')
+        snmp_community=$(echo "$host" | jq -r '.snmp_details.community // ""')
+        [[ -n "$snmp_oid"       ]] && comments="${comments}\nSNMP OID : $snmp_oid"
+        comments="${comments}\nDiscovery: $dmethods"
 
         printf "  ${C}[%d/%d]${NC} ${W}%-16s${NC} %-30s %-16s " \
             "$idx" "$total" "$ip" "$hostname" "$role"
@@ -1643,22 +1750,67 @@ sync_to_netbox() {
                 "$mac_addr" "Management")
             nb_add_ip "$ip" "$dev_id" "$mgmt_if_id" >/dev/null
 
-            # Add SNMP interfaces
-            local iface
+            # Add SNMP interfaces with enriched descriptions
+            local iface lldp_nbrs cdp_nbrs
+            lldp_nbrs=$(echo "$host" | jq -c '.lldp_neighbors // []' 2>/dev/null || echo "[]")
+            cdp_nbrs=$(echo "$host"  | jq -c '.cdp_neighbors // []' 2>/dev/null || echo "[]")
             while IFS= read -r iface; do
-                local if_name if_mac if_type nb_type
+                local if_name if_mac if_type nb_type if_idx if_desc
                 if_name=$(echo "$iface" | jq -r '.name // "if"')
                 if_mac=$(echo "$iface"  | jq -r '.mac // ""')
                 if_type=$(echo "$iface" | jq -r '.type // "other"')
+                if_idx=$(echo "$iface"  | jq -r '.index // ""')
                 nb_type="other"
                 case "$if_type" in
                     6)   nb_type="1000base-t"     ;;
                     53)  nb_type="1000base-x-sfp" ;;
                     161) nb_type="ieee802-11a"     ;;
+                    24)  nb_type="virtual"         ;;
                 esac
-                nb_add_interface "$dev_id" "$if_name" \
-                    "$nb_type" "$if_mac" "" >/dev/null 2>&1 || true
+                # Build description from LLDP/CDP neighbors on this port
+                if_desc=$(echo "$lldp_nbrs" | jq -r \
+                    "[.[] | select(.port_id=="$if_name" or .port_desc=="$if_name") \
+                     | "LLDP: "+(.sys_name//"?")] | join(", ")" 2>/dev/null || echo "")
+                local cdp_desc
+                cdp_desc=$(echo "$cdp_nbrs" | jq -r \
+                    "[.[] | select(.remote_port=="$if_name") \
+                     | "CDP: "+(.device_id//"?")] | join(", ")" 2>/dev/null || echo "")
+                [[ -n "$cdp_desc" ]] && if_desc="${if_desc:+$if_desc; }$cdp_desc"
+                local if_id
+                if_id=$(nb_add_interface "$dev_id" "$if_name" \
+                    "$nb_type" "$if_mac" "${if_desc:0:200}" 2>/dev/null) || true
             done < <(echo "$host" | jq -c '.interfaces[]?' 2>/dev/null || true)
+
+            # Create LLDP/CDP topology cables
+            while IFS= read -r nbr; do
+                local nbr_name nbr_port_desc local_port
+                nbr_name=$(echo "$nbr" | jq -r '.sys_name // .device_id // empty')
+                local_port=$(echo "$nbr" | jq -r '.port_id // .remote_port // empty')
+                nbr_port_desc=$(echo "$nbr" | jq -r '.port_desc // .remote_port // empty')
+                [[ -z "$nbr_name" ]] && continue
+                # Look up neighbor device in NetBox
+                local nbr_dev_id nbr_enc
+                nbr_enc=$(nb_urlencode "$nbr_name")
+                nbr_dev_id=$(nb_get "dcim/devices/?name=${nbr_enc}" \
+                    | jq -r '.results[0].id // empty' 2>/dev/null || echo "")
+                [[ -z "$nbr_dev_id" || ! "$nbr_dev_id" =~ ^[0-9]+$ ]] && continue
+                # Find or create local interface for this connection
+                local local_if_id
+                local_if_id=$(nb_add_interface "$dev_id" \
+                    "${local_port:-to-$nbr_name}" "other" "" \
+                    "Connected to $nbr_name" 2>/dev/null) || continue
+                # Find or create neighbor interface
+                local nbr_if_id
+                nbr_if_id=$(nb_add_interface "$nbr_dev_id" \
+                    "${nbr_port_desc:-to-$hostname}" "other" "" \
+                    "Connected to $hostname" 2>/dev/null) || continue
+                [[ -z "$local_if_id" || ! "$local_if_id" =~ ^[0-9]+$ ]] && continue
+                [[ -z "$nbr_if_id"   || ! "$nbr_if_id"   =~ ^[0-9]+$ ]] && continue
+                nb_create_cable "$local_if_id" "$nbr_if_id" \
+                    "${hostname} <-> ${nbr_name}" >/dev/null 2>&1 || true
+                log_info "Cable: $hostname <-> $nbr_name"
+            done < <({ echo "$host" | jq -c '.lldp_neighbors[]?' 2>/dev/null; \
+                        echo "$host" | jq -c '.cdp_neighbors[]?' 2>/dev/null; } || true)
 
         else
             echo -e "${R}FAIL${NC}"
@@ -1848,9 +2000,10 @@ menu_netbox_mgmt() {
         docker ps --filter "name=netbox" --format "{{.Status}}" 2>/dev/null \
             | grep -q Up && nb_status="Running"
 
-        echo -e "  Status : ${W}${nb_status}${NC}"
-        echo -e "  URL    : ${W}${NETBOX_API_URL}${NC}"
-        echo -e "  Token  : ${W}${NETBOX_API_TOKEN:-<not set>}${NC}"
+        echo -e "  Status   : ${W}${nb_status}${NC}"
+        echo -e "  URL      : ${W}${NETBOX_API_URL}${NC}"
+        echo -e "  Token    : ${W}${NETBOX_API_TOKEN:-<not set>}${NC}"
+        echo -e "  Admin PW : ${W}${NETBOX_ADMIN_PASS:-see $BASE_DIR/netbox-credentials.txt}${NC}"
         echo ""
         echo "   1) Start NetBox"
         echo "   2) Stop NetBox"
