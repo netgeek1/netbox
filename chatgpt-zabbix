@@ -1,0 +1,335 @@
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Helper: prompt with default
+# ------------------------------------------------------------
+prompt() {
+    local message="$1"
+    local default="$2"
+    read -rp "$message [$default]: " input
+    echo "${input:-$default}"
+}
+
+REAL_USER="${SUDO_USER:-${LOGNAME:-$(whoami)}}"
+
+log()   { printf '[INFO] %s\n' "$*"; }
+warn()  { printf '[WARN] %s\n' "$*" >&2; }
+error() { printf '[ERROR] %s\n' "$*" >&2; }
+
+# ------------------------------------------------------------
+# Root handling
+# ------------------------------------------------------------
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "[INFO] Elevation required — re-running with sudo..."
+        sudo -E bash "$0" "$@"
+        exit $?
+    fi
+}
+
+# ------------------------------------------------------------
+# Docker install
+# ------------------------------------------------------------
+install_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    log "Docker already installed."
+    return
+  fi
+
+  log "Installing Docker Engine..."
+
+  apt-get update
+  apt-get install -y ca-certificates curl gnupg lsb-release openssl git
+
+  mkdir -p /etc/apt/keyrings
+
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+  chmod a+r /etc/apt/keyrings/docker.gpg
+
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  apt-get update
+
+  apt-get install -y \
+    docker-ce \
+    docker-ce-cli \
+    containerd.io \
+    docker-compose-plugin
+
+  systemctl enable docker
+  systemctl start docker
+
+  log "Docker installed."
+}
+
+# ------------------------------------------------------------
+# Docker group
+# ------------------------------------------------------------
+ensure_docker_group() {
+  getent group docker >/dev/null || groupadd docker
+
+  if ! id "$REAL_USER" | grep -q docker; then
+    log "Adding user '$REAL_USER' to docker group"
+    usermod -aG docker "$REAL_USER"
+    warn "You may need to log out/in for group changes to apply."
+  fi
+}
+
+require_root
+install_docker
+ensure_docker_group
+
+# ------------------------------------------------------------
+# Ask for configuration
+# ------------------------------------------------------------
+TZ_VALUE=$(prompt "Enter your timezone" "America/New_York")
+
+BASE_DIR=$(prompt \
+  "Enter base directory for Zabbix stack" \
+  "/opt/zabbix-stack")
+
+ZABBIX_PORT=$(prompt "Zabbix web port" "8080")
+GRAFANA_PORT=$(prompt "Grafana port" "3000")
+
+echo "Generating random PostgreSQL password..."
+POSTGRES_PASSWORD=$(openssl rand -base64 24 | tr -d '\n')
+
+echo
+echo "Optional SMTP configuration"
+
+SMTP_HOST=$(prompt "SMTP host" "smtp.gmail.com")
+SMTP_PORT=$(prompt "SMTP port" "587")
+SMTP_USER=$(prompt "SMTP username" "user@example.com")
+SMTP_PASS=$(prompt "SMTP password" "changeme")
+SMTP_FROM=$(prompt "SMTP from address" "$SMTP_USER")
+
+# ------------------------------------------------------------
+# Determine compose command
+# ------------------------------------------------------------
+if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD="docker-compose"
+else
+    apt-get install -y docker-compose-plugin || true
+
+    if docker compose version >/dev/null 2>&1; then
+        COMPOSE_CMD="docker compose"
+    else
+        echo "Docker Compose not available"
+        exit 1
+    fi
+fi
+
+# ------------------------------------------------------------
+# Prepare directory
+# ------------------------------------------------------------
+mkdir -p "$BASE_DIR"
+
+mkdir -p "$BASE_DIR/postgres"
+mkdir -p "$BASE_DIR/grafana"
+mkdir -p "$BASE_DIR/zabbix/alertscripts"
+mkdir -p "$BASE_DIR/zabbix/externalscripts"
+mkdir -p "$BASE_DIR/zabbix/mibs"
+mkdir -p "$BASE_DIR/zabbix/snmptraps"
+
+cd "$BASE_DIR"
+
+# ------------------------------------------------------------
+# Write .env
+# ------------------------------------------------------------
+cat > .env <<EOF
+TZ="${TZ_VALUE}"
+
+POSTGRES_DB="zabbix"
+POSTGRES_USER="zabbix"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD}"
+
+ZABBIX_PORT="${ZABBIX_PORT}"
+GRAFANA_PORT="${GRAFANA_PORT}"
+EOF
+
+# ------------------------------------------------------------
+# Write smtp.env
+# ------------------------------------------------------------
+cat > smtp.env <<EOF
+SMTP_HOST="${SMTP_HOST}"
+SMTP_PORT="${SMTP_PORT}"
+SMTP_USER="${SMTP_USER}"
+SMTP_PASS="${SMTP_PASS}"
+SMTP_FROM="${SMTP_FROM}"
+EOF
+
+# ------------------------------------------------------------
+# Write compose.yml
+# ------------------------------------------------------------
+cat > compose.yml <<'EOF'
+name: zabbix
+
+services:
+
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: zabbix_postgres
+    restart: always
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - "./postgres:/var/lib/postgresql/data"
+
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:alpine-7.0-latest
+    container_name: zabbix_server
+
+    depends_on:
+      - postgres
+
+    restart: always
+
+    ports:
+      - "10051:10051"
+
+    environment:
+      DB_SERVER_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+      ZBX_CACHESIZE: 512M
+      ZBX_HISTORYCACHESIZE: 256M
+      ZBX_HISTORYINDEXCACHESIZE: 128M
+      ZBX_TRENDCACHESIZE: 128M
+      ZBX_VALUECACHESIZE: 256M
+
+      ZBX_STARTPOLLERS: 50
+      ZBX_STARTPINGERS: 20
+      ZBX_STARTDISCOVERERS: 10
+      ZBX_STARTSNMPPOLLERS: 20
+
+      ZBX_TIMEOUT: 15
+
+      ZBX_ENABLE_SNMP_TRAPS: "true"
+
+    volumes:
+      - "./zabbix/alertscripts:/usr/lib/zabbix/alertscripts"
+      - "./zabbix/externalscripts:/usr/lib/zabbix/externalscripts"
+      - "./zabbix/mibs:/usr/share/snmp/mibs"
+      - "./zabbix/snmptraps:/var/lib/zabbix/snmptraps"
+
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:alpine-7.0-latest
+    container_name: zabbix_web
+
+    depends_on:
+      - zabbix-server
+
+    restart: always
+
+    ports:
+      - "${ZABBIX_PORT}:8080"
+
+    environment:
+      ZBX_SERVER_HOST: zabbix-server
+
+      DB_SERVER_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+      PHP_TZ: ${TZ}
+
+  snmptraps:
+    image: zabbix/zabbix-snmptraps:alpine-7.0-latest
+    container_name: zabbix_snmptraps
+
+    restart: always
+
+    ports:
+      - "162:1162/udp"
+
+    volumes:
+      - "./zabbix/snmptraps:/var/lib/zabbix/snmptraps"
+      - "./zabbix/mibs:/usr/share/snmp/mibs"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+
+    restart: always
+
+    ports:
+      - "${GRAFANA_PORT}:3000"
+
+    environment:
+      GF_INSTALL_PLUGINS: alexanderzobnin-zabbix-app
+
+    volumes:
+      - "./grafana:/var/lib/grafana"
+EOF
+
+# ------------------------------------------------------------
+# Firewall rules
+# ------------------------------------------------------------
+if command -v ufw >/dev/null 2>&1; then
+    log "Configuring UFW firewall rules"
+
+    ufw allow "${ZABBIX_PORT}/tcp" || true
+    ufw allow "${GRAFANA_PORT}/tcp" || true
+    ufw allow 10051/tcp || true
+    ufw allow 162/udp || true
+fi
+
+# ------------------------------------------------------------
+# Deploy stack
+# ------------------------------------------------------------
+log "Starting Zabbix stack..."
+
+$COMPOSE_CMD up -d
+
+# ------------------------------------------------------------
+# Wait for web UI
+# ------------------------------------------------------------
+echo "Waiting for Zabbix web UI to become available..."
+
+for i in {1..90}; do
+    if curl -fs "http://localhost:${ZABBIX_PORT}" >/dev/null 2>&1; then
+        echo
+        echo "=================================================="
+        echo "Zabbix is ready"
+        echo "=================================================="
+        echo
+        echo "Zabbix:  http://localhost:${ZABBIX_PORT}"
+        echo "Grafana: http://localhost:${GRAFANA_PORT}"
+        echo
+        echo "Default Zabbix login:"
+        echo "Username: Admin"
+        echo "Password: zabbix"
+        echo
+        echo "IMPORTANT:"
+        echo "- Change Admin password immediately"
+        echo "- Configure SNMPv3"
+        echo "- Import templates"
+        echo "- Tune alerts before enabling notifications"
+        echo
+        exit 0
+    fi
+
+    sleep 2
+done
+
+echo
+echo "Warning: Zabbix did not become ready within expected time."
+echo
+echo "Check logs with:"
+echo "$COMPOSE_CMD logs -f"
+```
