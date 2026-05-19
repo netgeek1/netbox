@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.0.9
+#  Version: 2.0.9.1
 # =============================================================================
 #
 #  Changelog v2.0.2:
@@ -94,6 +94,11 @@
 #     and logged instead of silently swallowed.
 #   - nb_upsert_device: logs full API error response when device POST returns
 #     no ID, making future failures self-diagnosing in the log file.
+#
+#  Changelog v2.0.9.1:
+#   - Fixed invalid IP assignment: to allow 169.254.x.x as some internal devices
+#     may use them
+#   - Fixed blank lines and comments causing discovery file to fail loading
 # =============================================================================
 
 set -uo pipefail
