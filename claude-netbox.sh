@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.0.8
+#  Version: 2.0.9
 # =============================================================================
 #
 #  Changelog v2.0.2:
@@ -77,6 +77,23 @@
 #     SETUP_OK response and written to config + credentials file
 #   - Credentials file shows placeholder until real token is confirmed
 #   - 0 non-ASCII characters; all changelogs retained; syntax verified clean
+#
+#  Changelog v2.0.9:
+#   - Fixed silent FAIL for devices whose SNMP entity MIB returns an error
+#     string instead of a serial number (e.g. pfSense returns
+#     "iso.3.6.1.2.1.47.1.1.1.1.11.1 = No Such Object..."). NetBox serial
+#     field is max_length=50; the 85-char error string caused a silent 400.
+#     Serial is now cleared when it contains "No Such Object", "iso.", or
+#     any value exceeding 50 characters.
+#   - Fixed device-type slug collision on re-runs: nb_get_or_create_device_type
+#     now falls back to a slug search when the model POST returns no ID,
+#     preventing the cascade failure (empty dtype_id -> validation abort).
+#   - Fixed invalid IP assignment: 0.0.0.0, 127.x, 169.254.x addresses from
+#     SNMP ip_table are now skipped before sending to NetBox.
+#   - nb_api: removed -f flag from curl so API error responses are captured
+#     and logged instead of silently swallowed.
+#   - nb_upsert_device: logs full API error response when device POST returns
+#     no ID, making future failures self-diagnosing in the log file.
 # =============================================================================
 
 set -uo pipefail
@@ -84,7 +101,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.0.8"
+SCRIPT_VERSION="2.0.9"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 
 BASE_DIR="/opt/netbox-discovery"
@@ -526,7 +543,7 @@ PYEOF
 nb_api() {
     local method="$1" endpoint="$2" data="${3:-}"
     [[ -z "$NETBOX_API_TOKEN" ]] && { log_error "API token not set"; return 1; }
-    local args=(-sf -X "$method"
+    local args=(-s -X "$method"
         -H "Authorization: Token $NETBOX_API_TOKEN"
         -H "Content-Type: application/json")
     [[ -n "$data" ]] && args+=(-d "$data")
@@ -564,14 +581,27 @@ nb_get_or_create_manufacturer() {
 }
 
 nb_get_or_create_device_type() {
-    local mfr_id="$1" model="$2" slug enc res id
-    slug=$(slugify "$model"); enc=$(nb_urlencode "$model")
+    local mfr_id="$1" model="$2" slug enc res id slug_enc
+    # Truncate model to 64 chars; NetBox allows 100 but slugs of long names
+    # collide on re-runs when the model string varies slightly.
+    model="${model:0:64}"
+    slug=$(slugify "$model")
+    # Ensure slug is never empty
+    [[ -z "$slug" ]] && slug="unknown-model"
+    enc=$(nb_urlencode "$model")
     res=$(nb_get "dcim/device-types/?model=${enc}")
     id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
     if [[ -z "$id" ]]; then
         res=$(nb_post "dcim/device-types/" \
             "{\"manufacturer\":$mfr_id,\"model\":\"$model\",\"slug\":\"$slug\"}")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
+        # POST failed (likely slug collision from a previous partial run).
+        # Fall back: search by slug to recover the existing entry.
+        if [[ -z "$id" ]]; then
+            slug_enc=$(nb_urlencode "$slug")
+            res=$(nb_get "dcim/device-types/?slug=${slug_enc}")
+            id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
+        fi
     fi
     echo "$id"
 }
@@ -682,21 +712,39 @@ nb_upsert_device() {
     local existing; existing=$(nb_get "dcim/devices/?name=${enc}")
     local dev_id; dev_id=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
 
+    # Sanitize serial: SNMP entity MIB often returns error strings like
+    # "iso.3.6.1... = No Such Object..." which are 80+ chars and fail
+    # NetBox validation (serial max_length=50). Clear those.
+    local clean_serial=""
+    if [[ -n "$serial" \
+          && ${#serial} -le 50 \
+          && "$serial" != *"No Such"* \
+          && "$serial" != *"iso."* \
+          && "$serial" != *"Not avail"* ]]; then
+        clean_serial="$serial"
+    fi
+
     local payload
     payload=$(jq -n \
         --arg     name     "$name" \
         --argjson dt       "$dtype_id" \
         --argjson role     "$role_id" \
         --argjson site     "$site_id" \
-        --arg     serial   "$serial" \
+        --arg     serial   "$clean_serial" \
         --arg     comments "$comments" \
         '{name:$name,device_type:$dt,role:$role,site:$site,
           status:"active",serial:$serial,comments:$comments}')
 
     if [[ -z "$dev_id" ]]; then
-        dev_id=$(nb_post "dcim/devices/" "$payload" \
-            | jq -r '.id // empty' 2>/dev/null)
-        log_info "Created device: $name (ID: $dev_id)"
+        local api_resp
+        api_resp=$(nb_post "dcim/devices/" "$payload")
+        dev_id=$(echo "$api_resp" | jq -r '.id // empty' 2>/dev/null)
+        if [[ -n "$dev_id" && "$dev_id" =~ ^[0-9]+$ ]]; then
+            log_info "Created device: $name (ID: $dev_id)"
+        else
+            log_error "Device POST failed for $name: $(echo "$api_resp" | jq -c '.detail // .name // .' 2>/dev/null | head -c 200)"
+            return 1
+        fi
     else
         nb_patch "dcim/devices/${dev_id}/" "$payload" >/dev/null 2>&1
         log_info "Updated device: $name (ID: $dev_id)"
@@ -1007,6 +1055,10 @@ probe_snmp() {
     sys_uptime=$(  _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.3.0)
     sys_oid=$(     _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.2.0)
     chassis_ser=$( _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.47.1.1.1.1.11.1)
+    # Clear SNMP error strings from serial (they start with "iso." or contain "No Such")
+    if [[ "$chassis_ser" == *"No Such"* || "$chassis_ser" == iso.* ]]; then
+        chassis_ser=""
+    fi
 
     # Walk tables to temp files (avoids arg-length limits on large outputs)
     _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.2.2         > "$tmp/snmp_ifaces.txt"
@@ -1836,17 +1888,20 @@ sync_to_netbox() {
             iface_ip=$(echo "$ip_table_json" | jq -r \
                 "[.[] | select(.if_index==\"$if_idx\") | .ip][0] // empty" \
                 2>/dev/null || echo "")
-            if [[ -n "$iface_ip" ]]; then
-                iface_mask=$(echo "$ip_table_json" | jq -r \
-                    "[.[] | select(.ip==\"$iface_ip\") | .mask][0] \
-                     // \"255.255.255.0\"" 2>/dev/null || echo "255.255.255.0")
-                iface_prefix=$(python3 -c \
-                    "import ipaddress; \
-print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
-                    2>/dev/null || echo "24")
-                nb_add_ip "${iface_ip}/${iface_prefix}" "" "$if_id" \
-                    >/dev/null 2>&1 || true
-            fi
+                # Skip unroutable/invalid addresses before sending to NetBox
+                if [[ -n "$iface_ip" \
+                      && "$iface_ip" != "0.0.0.0" \
+                      && "$iface_ip" != 127.* ]]; then
+                    iface_mask=$(echo "$ip_table_json" | jq -r \
+                        "[.[] | select(.ip==\"$iface_ip\") | .mask][0] \
+                         // \"255.255.255.0\"" 2>/dev/null || echo "255.255.255.0")
+                    iface_prefix=$(python3 -c \
+                        "import ipaddress; \
+print(ipaddress.IPv4Network(\'$iface_ip/$iface_mask\',strict=False).prefixlen)" \
+                        2>/dev/null || echo "24")
+                    nb_add_ip "${iface_ip}/${iface_prefix}" "" "$if_id" \
+                        >/dev/null 2>&1 || true
+                fi
 
             # Assign VLAN from dot1qPvid
             local pvid vlan_nm vlan_id
