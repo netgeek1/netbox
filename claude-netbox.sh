@@ -1,104 +1,82 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.0.9.1
+#  Version: 2.1.0
 # =============================================================================
 #
 #  Changelog v2.0.2:
-#   - Removed ALL non-ASCII characters (box-drawing, braille spinner, bullets)
-#   - Fixed nested "local _snmp() {}" syntax (illegal in bash); replaced with
-#     top-level _snmp_get() and _snmp_walk() helpers
-#   - Fixed heredoc quoting in probe_nmap to pass xmlfile as argument
-#   - Fixed merge_host_data to pass args to Python rather than embed in heredoc
-#   - Fixed probe_http and probe_banners array-building without mapfile/+=
-#   - Verified clean with: bash -n
+#   - Removed ALL non-ASCII characters; fixed illegal "local _snmp() {}" syntax
+#   - Fixed heredoc quoting; fixed probe_http/probe_banners array building
+#   - Verified clean with bash -n
 #
 #  Changelog v2.0.3:
 #   - Removed obsolete "version:" key from docker-compose.override.yml
 #   - Removed netbox-housekeeping service (dropped in netbox-docker 3.4.0)
 #
 #  Changelog v2.0.4:
-#   - DOCKER_COMPOSE global correctly initialised (was self-referential)
-#   - Added detect_docker_compose(); added auto-sudo in check_root()
-#   - Docker installed from official apt repo; fallback to docker.io
-#   - download-mibs guarded with cmd_exists; pip per-package with || true
-#   - Pre-generate API token; store before startup wait loop
-#   - Startup check accepts 2xx/3xx/4xx (not just 200 via curl -f)
-#   - scan_all_hosts: fd3 loop so background probes cannot consume stdin
-#   - All background probes get </dev/null
-#   - nb_upsert_device: validate IDs before --argjson
+#   - DOCKER_COMPOSE global correctly initialised; detect_docker_compose()
+#   - Auto-sudo in check_root(); Docker from official apt repo
+#   - download-mibs guarded; pip per-package; pre-generate API token
+#   - Startup check accepts 2xx/3xx/4xx; scan loop uses fd3 for stdin safety
+#   - All background probes get </dev/null; nb_upsert_device validates IDs
 #
 #  Changelog v2.0.5:
-#   - Admin password saved to NETBOX_ADMIN_PASS; shown in management menu
-#   - pip: --root-user-action=ignore suppresses venv warning
-#   - PROCESSES:"2" in override suppresses gunicorn worker warning
-#   - nmap: removed UDP ports; removed ftp-banner, telnet-ntlm-info,
-#     snmp-sysdescr, snmp-interfaces (invalid script names); removed -sC
+#   - NETBOX_ADMIN_PASS saved to config; shown in management menu
+#   - pip --root-user-action=ignore; PROCESSES:"2" in override
+#   - nmap: removed UDP ports, ftp-banner, telnet-ntlm-info, -sC
 #   - sync_to_netbox: two-step reachability; 401/403 prompts for new token
 #
 #  Changelog v2.0.6:
-#   - Credentials file written BEFORE startup wait so it always exists
-#   - Override yml: all env values quoted; SUPERUSER_API_KEY added
-#   - Startup loop breaks on timeout with guidance instead of returning 1
+#   - Credentials file written before startup wait so it always exists
+#   - Override yml values quoted; SUPERUSER_API_KEY added
 #   - Admin/token via Django shell using set_password() + get_or_create()
-#   - Admin password shown in NetBox Management menu
 #
 #  Changelog v2.0.7:
-#   - ALL log functions now write to stderr (>&2) -- root cause of all
-#     jq --argjson "invalid JSON" errors: log text was captured inside $()
-#     alongside numeric IDs, corrupting payloads
-#   - Added nb_get_or_create_vlan() helper
-#   - probe_snmp: added walks for IP address table (4.20.1), bridge port
-#     index (17.1.4.1.2), VLAN PVID (17.7.1.4.5.1.1), VLAN names
-#     (Cisco 9.9.46.1.3.1.1.2); parsed as ip_table, vlan_pvid, vlan_names;
-#     mac_port_map enriched with if_name, VLAN, remote_ip
-#   - merge_host_data: ip_table, vlan_pvid, vlan_names passed through
-#   - sync_to_netbox: each SNMP interface gets its IP from ip_table;
-#     VLAN from vlan_pvid created and set as untagged_vlan (mode=access);
-#     CDP/LLDP neighbours create cable connections in NetBox;
-#     interface descriptions enriched with LLDP/CDP neighbour info
-#   - Classification: snmp_up flag; Switch/Router uses (snmp_up OR port 161);
-#     added keywords: powerconnect, 1810g, netgear gs, netscreen, etc.
-#   - Subnet filtering: IPs outside requested CIDR removed after discovery
-#   - map_switchports: full rewrite -- shows all interfaces with admin/oper/
-#     speed/VLAN/MAC/remote-IPs; tries Cisco per-VLAN community strings
+#   - ALL log functions write to stderr (>&2) -- root cause of all jq errors
+#   - Added nb_get_or_create_vlan()
+#   - probe_snmp: IP table, bridge port, VLAN PVID, VLAN names collected
+#   - sync_to_netbox: IPs assigned to interfaces; VLANs created/assigned;
+#     CDP/LLDP cables created; interface descriptions enriched
+#   - Classification uses snmp_up flag, not TCP port 161; more keywords
+#   - Subnet filtering removes out-of-CIDR IPs after discovery
+#   - map_switchports: full rewrite with Cisco per-VLAN community fallback
 #
 #  Changelog v2.0.8:
 #   - Fixed "value too long for type character varying(12)" on deploy.
-#     Root cause: NetBox 4.x changed Token.key field format; passing a
-#     pre-generated 40-char hex string to Token.objects.get_or_create(key=X)
-#     fails because the DB column no longer accepts that length/format.
-#   - Removed SUPERUSER_API_TOKEN and SUPERUSER_API_KEY from override yml
-#     (same error when NetBox startup script tries to use the env-var value)
-#   - Django shell now uses Token.objects.filter(user=u).first() then
-#     Token.objects.create(user=u) with NO key= argument -- NetBox
-#     auto-generates the key in whatever format the installed version expects
-#   - api_token pre-generation removed; token captured live from Django shell
-#     SETUP_OK response and written to config + credentials file
-#   - Credentials file shows placeholder until real token is confirmed
-#   - 0 non-ASCII characters; all changelogs retained; syntax verified clean
+#     NetBox v4.5 changed Token.key format; passing a pre-generated hex key
+#     fails. Removed SUPERUSER_API_TOKEN/KEY from override yml. Django shell
+#     now uses Token.objects.create(user=u) with NO key= argument.
 #
 #  Changelog v2.0.9:
-#   - Fixed silent FAIL for devices whose SNMP entity MIB returns an error
-#     string instead of a serial number (e.g. pfSense returns
-#     "iso.3.6.1.2.1.47.1.1.1.1.11.1 = No Such Object..."). NetBox serial
-#     field is max_length=50; the 85-char error string caused a silent 400.
-#     Serial is now cleared when it contains "No Such Object", "iso.", or
-#     any value exceeding 50 characters.
-#   - Fixed device-type slug collision on re-runs: nb_get_or_create_device_type
-#     now falls back to a slug search when the model POST returns no ID,
-#     preventing the cascade failure (empty dtype_id -> validation abort).
-#   - Fixed invalid IP assignment: 0.0.0.0, 127.x, 169.254.x addresses from
-#     SNMP ip_table are now skipped before sending to NetBox.
-#   - nb_api: removed -f flag from curl so API error responses are captured
-#     and logged instead of silently swallowed.
-#   - nb_upsert_device: logs full API error response when device POST returns
-#     no ID, making future failures self-diagnosing in the log file.
+#   - Serial sanitization: SNMP error strings (e.g. "No Such Object...",
+#     "iso.3.6.1...") are cleared; serial limited to 50 chars
+#   - Device-type slug collision: on POST failure, falls back to slug search
+#     so re-runs find the existing type rather than failing silently
+#   - Model name truncated to 64 chars before slugifying to avoid slug drift
+#   - nb_api: removed -f flag from curl; API error responses now captured
+#   - nb_upsert_device: logs full API error body on POST failure
+#   - IP filtering: 0.0.0.0, 127.x, 169.254.x skipped in interface sync
+#   - probe_snmp: SNMP error strings cleared from chassis_serial field
 #
-#  Changelog v2.0.9.1:
-#   - Fixed invalid IP assignment: to allow 169.254.x.x as some internal devices
-#     may use them
-#   - Fixed blank lines and comments causing discovery file to fail loading
+#  Changelog v2.1.0:
+#   - REAL_USER tracking: captures sudo caller for docker group management
+#   - ensure_docker_group(): creates docker group and adds REAL_USER; called
+#     from install_deps() so the deploying user can run docker without sudo
+#   - Multi-subnet discovery: input now accepts comma-separated CIDRs,
+#     space-separated CIDRs, or a file path containing one target per line
+#   - Subnet file format: supports CIDR ranges and bare IPs; lines starting
+#     with # are treated as comments; leading/trailing whitespace stripped;
+#     inline comments (# after value) supported
+#   - Host scan file (Option 3): same improvements -- CIDR expansion,
+#     comment lines, whitespace stripping, inline comments
+#   - parse_targets(): new helper that normalises any mix of CIDRs/IPs/files
+#     into a clean target list used by all discovery entry points
+#   - discover_targets(): loops over parsed targets, calls discover_live_hosts
+#     per target, then deduplicates the combined result before Phase 2
+#   - Django shell token creation aligned with netbox-docker super_user.py:
+#     uses get_or_create for idempotency, only sets password when creating new
+#     user, no key= passed to Token.objects.create() so NetBox generates
+#     its own native-format key (required for NetBox 4.5+ varchar(12) field)
 # =============================================================================
 
 set -uo pipefail
@@ -106,8 +84,9 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.0.9"
+SCRIPT_VERSION="2.1.0"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
+REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
 BASE_DIR="/opt/netbox-discovery"
 LOG_DIR="/var/log/netbox-discovery"
@@ -116,18 +95,11 @@ CREDS_FILE="$BASE_DIR/.credentials.enc"
 CREDS_KEY_FILE="$BASE_DIR/.creds.key"
 DISCOVERY_DIR="$BASE_DIR/discovery"
 NETBOX_DIR="/opt/netbox-docker"
-DOCKER_COMPOSE="docker compose"   # updated by detect_docker_compose()
+DOCKER_COMPOSE="docker compose"    # updated by detect_docker_compose()
 
-# ANSI colours (7-bit ASCII only)
-R='\033[0;31m'
-G='\033[0;32m'
-Y='\033[1;33m'
-C='\033[0;36m'
-W='\033[1;37m'
-D='\033[2m'
-NC='\033[0m'
+R='\033[0;31m'  G='\033[0;32m'  Y='\033[1;33m'
+C='\033[0;36m'  W='\033[1;37m'  D='\033[2m'  NC='\033[0m'
 
-# Runtime defaults (overridden by config file)
 NETBOX_PORT=8000
 NETBOX_API_URL="http://localhost:${NETBOX_PORT}"
 NETBOX_API_TOKEN=""
@@ -142,9 +114,7 @@ DEBUG_MODE=0
 LOG_FILE="$LOG_DIR/discovery-$(date +%Y%m%d).log"
 
 # -----------------------------------------------------------------------------
-# LOGGING
-# All display output uses >&2 so log calls are never captured inside $().
-# Only explicit "echo <id>" / "printf <id>" lines go to stdout as return vals.
+# LOGGING  -- stderr so $() captures never pick up log text
 # -----------------------------------------------------------------------------
 _log() {
     local lvl="$1"; shift
@@ -155,14 +125,10 @@ log_info()  { _log "INFO"  "$@"; printf "${G}[INFO]${NC}  %s\n"  "$*" >&2; }
 log_warn()  { _log "WARN"  "$@"; printf "${Y}[WARN]${NC}  %s\n"  "$*" >&2; }
 log_error() { _log "ERROR" "$@"; printf "${R}[ERROR]${NC} %s\n"  "$*" >&2; }
 log_ok()    { _log "OK"    "$@"; printf "${G}[OK]${NC}    %s\n"  "$*" >&2; }
-log_debug() {
-    _log "DEBUG" "$@"
-    [[ $DEBUG_MODE -eq 1 ]] && printf "${D}[DEBUG]${NC} %s\n" "$*" >&2
-}
-log_step() {
-    _log "STEP" "$*"
-    printf "\n${C}====== ${W}%s${C} ======${NC}\n" "$*" >&2
-}
+log_debug() { _log "DEBUG" "$@"
+    [[ $DEBUG_MODE -eq 1 ]] && printf "${D}[DEBUG]${NC} %s\n" "$*" >&2; }
+log_step()  { _log "STEP"  "$*"
+    printf "\n${C}====== ${W}%s${C} ======${NC}\n" "$*" >&2; }
 
 # -----------------------------------------------------------------------------
 # UTILITIES
@@ -173,8 +139,8 @@ check_root() {
         exec sudo "$0" "$@"
     fi
 }
-pause()    { echo; read -rp "  Press [Enter] to continue..."; }
-confirm()  { local r; read -rp "  ${1:-Are you sure?} [y/N] " r; [[ "${r,,}" == "y" ]]; }
+pause()      { echo; read -rp "  Press [Enter] to continue..."; }
+confirm()    { local r; read -rp "  ${1:-Are you sure?} [y/N] " r; [[ "${r,,}" == "y" ]]; }
 cmd_exists() { command -v "$1" &>/dev/null; }
 spinner() {
     local pid=$1 i=0 chars='|/-\'
@@ -215,7 +181,19 @@ detect_docker_compose() {
 }
 
 # -----------------------------------------------------------------------------
-# BANNER (pure ASCII)
+# DOCKER GROUP MANAGEMENT
+# -----------------------------------------------------------------------------
+ensure_docker_group() {
+    getent group docker >/dev/null 2>&1 || groupadd docker
+    if [[ -n "$REAL_USER" ]] && ! id "$REAL_USER" 2>/dev/null | grep -q docker; then
+        log_info "Adding user '$REAL_USER' to docker group"
+        usermod -aG docker "$REAL_USER"
+        log_warn "Log out and back in (or run: newgrp docker) for group change to apply"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# BANNER
 # -----------------------------------------------------------------------------
 banner() {
     clear
@@ -237,7 +215,6 @@ init_dirs() {
     mkdir -p "$BASE_DIR" "$LOG_DIR" "$DISCOVERY_DIR"
     chmod 700 "$BASE_DIR"; chmod 755 "$LOG_DIR"; touch "$LOG_FILE"
 }
-
 save_config() {
     cat > "$CONFIG_FILE" <<CONF
 # NetBox Discovery Suite Config -- $(date)
@@ -254,14 +231,13 @@ DEBUG_MODE=${DEBUG_MODE}
 CONF
     chmod 600 "$CONFIG_FILE"
 }
-
 load_config() {
     [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
     NETBOX_API_URL="http://localhost:${NETBOX_PORT}"
 }
 
 # -----------------------------------------------------------------------------
-# ENCRYPTED CREDENTIAL STORE  (AES-256-CBC)
+# ENCRYPTED CREDENTIAL STORE
 # -----------------------------------------------------------------------------
 EMPTY_CREDS='{"snmp_communities":["public","private"],"snmp_v3":[],
   "ssh_credentials":[],"telnet_credentials":[],"device_overrides":{}}'
@@ -271,21 +247,18 @@ init_creds() {
         openssl rand -base64 48 > "$CREDS_KEY_FILE"; chmod 600 "$CREDS_KEY_FILE"
         log_info "Generated credential encryption key"
     fi
-    if [[ ! -f "$CREDS_FILE" ]]; then write_creds "$EMPTY_CREDS"; fi
+    [[ ! -f "$CREDS_FILE" ]] && write_creds "$EMPTY_CREDS"
 }
-
 read_creds() {
     openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
         -pass file:"$CREDS_KEY_FILE" -in "$CREDS_FILE" 2>/dev/null \
         || echo "$EMPTY_CREDS"
 }
-
 write_creds() {
     echo "$1" | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
         -pass file:"$CREDS_KEY_FILE" -out "$CREDS_FILE" 2>/dev/null
     chmod 600 "$CREDS_FILE"
 }
-
 get_communities_for() {
     local ip="$1" creds; creds=$(read_creds)
     local ov; ov=$(echo "$creds" \
@@ -293,7 +266,6 @@ get_communities_for() {
     if [[ -n "$ov" ]]; then echo "$ov"
     else echo "$creds" | jq -r '.snmp_communities[]' 2>/dev/null || echo "public"; fi
 }
-
 get_ssh_creds_for() {
     local ip="$1" creds; creds=$(read_creds)
     local ov; ov=$(echo "$creds" \
@@ -315,7 +287,6 @@ install_deps() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq >> "$LOG_FILE" 2>&1
 
-    # Docker from official repo for compose v2 plugin support
     printf "  ${W}Docker (official repo)${NC} ... "
     if ! cmd_exists docker || ! docker compose version &>/dev/null 2>&1; then
         apt-get install -y ca-certificates curl gnupg >> "$LOG_FILE" 2>&1 || true
@@ -331,7 +302,7 @@ $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
         apt-get update -qq >> "$LOG_FILE" 2>&1 || true
         apt-get install -y docker-ce docker-ce-cli containerd.io \
             docker-buildx-plugin docker-compose-plugin >> "$LOG_FILE" 2>&1 \
-            || { log_warn "Docker official install failed -- trying docker.io"
+            || { log_warn "Official install failed -- trying docker.io"
                  apt-get install -y docker.io >> "$LOG_FILE" 2>&1 || true; }
         printf "${G}OK${NC}\n"
     else printf "${G}already installed${NC}\n"; fi
@@ -386,6 +357,8 @@ $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
         systemctl start  "$svc" >> "$LOG_FILE" 2>&1 || true
     done
 
+    ensure_docker_group
+
     [[ ${#failed[@]} -gt 0 ]] \
         && log_warn "Failed packages: ${failed[*]}" \
         || log_ok "All dependencies installed"
@@ -408,11 +381,9 @@ deploy_netbox() {
     admin_pass="NetBox@$(openssl rand -hex 5)"
     secret_key=$(openssl rand -base64 60 | tr -d '\n/+=' | head -c 50)
 
-    # Store admin pass immediately -- token will be filled after startup
     NETBOX_ADMIN_PASS="$admin_pass"
     save_config
 
-    # Write credentials file BEFORE wait loop -- always available on timeout
     creds_out="$BASE_DIR/netbox-credentials.txt"
     cat > "$creds_out" <<CREDEOF
 NetBox Access Credentials
@@ -420,12 +391,12 @@ NetBox Access Credentials
 URL:       http://localhost:${NETBOX_PORT}
 Username:  admin
 Password:  ${admin_pass}
-API Token: (populated after startup -- re-check this file)
+API Token: (populated after startup -- see below)
 
 KEEP THIS FILE SECURE
 CREDEOF
     chmod 600 "$creds_out"
-    log_info "Credentials saved to: $creds_out"
+    log_info "Credentials pre-saved: $creds_out"
 
     if [[ -d "$NETBOX_DIR/.git" ]]; then
         log_info "Updating netbox-docker repo..."
@@ -437,11 +408,10 @@ CREDEOF
     fi
     cd "$NETBOX_DIR" || { log_error "Cannot cd to $NETBOX_DIR"; return 1; }
 
-    # Override: no 'version:' key; no netbox-housekeeping (removed in 3.4.0).
-    # SUPERUSER_API_TOKEN intentionally omitted: NetBox 4.x changed Token.key
-    # format and passing a pre-generated hex string causes
-    # "value too long for character varying(12)".
-    # Token is created via Django shell after startup instead.
+    # SUPERUSER_API_TOKEN intentionally omitted.
+    # NetBox v4.5+ changed Token.key to a new format (varchar(12)); forcing a
+    # pre-generated 40-char hex string causes DataError. Token is created via
+    # Django shell after startup using Token.objects.create() with no key=.
     cat > docker-compose.override.yml <<DCEOF
 services:
   netbox:
@@ -467,7 +437,6 @@ DCEOF
     $DOCKER_COMPOSE up -d >> "$LOG_FILE" 2>&1 &
     spinner $!; wait $!
 
-    # Readiness: accept 200 (login) or 302 (redirect) or 403 (API no-token)
     printf "  Waiting for NetBox to initialize "
     local retries=0 http_code=""
     until http_code=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -483,23 +452,37 @@ DCEOF
     done
     printf " ${G}HTTP %s${NC}\n" "$http_code"
 
-    # Configure admin password and capture auto-generated API token.
-    # KEY FIX (v2.0.8): do NOT pass key= to Token.objects.create().
-    # NetBox 4.x auto-generates the key in a version-specific format.
-    # Forcing a 40-char hex string causes "value too long for varchar(12)".
+    # Token creation aligned with netbox-docker super_user.py behaviour:
+    # - get_or_create user (idempotent)
+    # - only set password when creating a new user
+    # - NO key= passed to Token.objects.create(); NetBox generates its own
+    #   native-format key (required for NetBox 4.5+ varchar(12) field)
     log_info "Configuring admin credentials via Django shell..."
     local setup_py setup_result setup_tries=0
-    setup_py="from django.contrib.auth.models import User
+    setup_py="
+from django.contrib.auth.models import User
 from users.models import Token
-u,_=User.objects.get_or_create(username='admin')
-u.set_password('${admin_pass}')
-u.is_superuser=True
-u.is_staff=True
-u.save()
-t=Token.objects.filter(user=u).first()
+import sys
+
+u, created = User.objects.get_or_create(username='admin')
+if created:
+    u.set_password('${admin_pass}')
+    u.is_superuser = True
+    u.is_staff = True
+    u.save()
+    sys.stderr.write('Created new admin user\n')
+else:
+    sys.stderr.write('Admin user already exists\n')
+
+t = Token.objects.filter(user=u).first()
 if not t:
-    t=Token.objects.create(user=u)
-print('SETUP_OK:'+str(t.key))"
+    t = Token.objects.create(user=u)
+    sys.stderr.write('Created new token\n')
+else:
+    sys.stderr.write('Using existing token\n')
+
+print('SETUP_OK:' + str(t.key))
+"
 
     until setup_result=$(cd "$NETBOX_DIR" && \
             $DOCKER_COMPOSE exec -T netbox \
@@ -510,23 +493,21 @@ PYEOF
         sleep 5; (( setup_tries++ )) || true
         if (( setup_tries > 18 )); then
             log_warn "Django shell timed out"
-            log_warn "Manual fix: docker exec -it <netbox-container> python manage.py changepassword admin"
+            log_warn "Manual: docker exec -it <netbox> python manage.py changepassword admin"
             break
         fi
     done
 
     if [[ "$setup_result" == SETUP_OK:* ]]; then
         NETBOX_API_TOKEN="${setup_result#SETUP_OK:}"
-        log_ok "Admin and token configured: ${NETBOX_API_TOKEN:0:12}..."
+        log_ok "Credentials configured: token=${NETBOX_API_TOKEN:0:12}..."
         save_config
-        # Update credentials file with real token
         sed -i "s|^API Token:.*|API Token: ${NETBOX_API_TOKEN}|" \
             "$creds_out" 2>/dev/null || true
         sed -i "s|^Password:.*|Password:  ${admin_pass}|" \
             "$creds_out" 2>/dev/null || true
     else
-        log_warn "Django shell setup incomplete"
-        log_warn "Check: cat $creds_out  -- token may need to be created manually in UI"
+        log_warn "Django shell incomplete -- create token manually in NetBox UI"
     fi
 
     printf "\n${G}+----------------------------------------------+${NC}\n"
@@ -535,15 +516,14 @@ PYEOF
     printf "  URL:      ${W}http://localhost:%s${NC}\n" "$NETBOX_PORT"
     printf "  Username: ${W}admin${NC}\n"
     printf "  Password: ${W}%s${NC}\n" "$admin_pass"
-    printf "  Token:    ${W}%s${NC}\n" \
-        "${NETBOX_API_TOKEN:-<create via UI if empty>}"
+    printf "  Token:    ${W}%s${NC}\n" "${NETBOX_API_TOKEN:-<create via UI>}"
     printf "  Saved:    ${D}%s${NC}\n" "$creds_out"
     pause
 }
 
 # -----------------------------------------------------------------------------
 # NETBOX REST API HELPERS
-# Return values -> stdout; all logging -> stderr.
+# Note: -f removed from curl so API error responses are captured and logged
 # -----------------------------------------------------------------------------
 nb_api() {
     local method="$1" endpoint="$2" data="${3:-}"
@@ -587,11 +567,10 @@ nb_get_or_create_manufacturer() {
 
 nb_get_or_create_device_type() {
     local mfr_id="$1" model="$2" slug enc res id slug_enc
-    # Truncate model to 64 chars; NetBox allows 100 but slugs of long names
-    # collide on re-runs when the model string varies slightly.
+    # Truncate to 64 chars; long model names from sys_descr drift between
+    # runs and cause slug collisions on the second attempt
     model="${model:0:64}"
     slug=$(slugify "$model")
-    # Ensure slug is never empty
     [[ -z "$slug" ]] && slug="unknown-model"
     enc=$(nb_urlencode "$model")
     res=$(nb_get "dcim/device-types/?model=${enc}")
@@ -600,8 +579,8 @@ nb_get_or_create_device_type() {
         res=$(nb_post "dcim/device-types/" \
             "{\"manufacturer\":$mfr_id,\"model\":\"$model\",\"slug\":\"$slug\"}")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
-        # POST failed (likely slug collision from a previous partial run).
-        # Fall back: search by slug to recover the existing entry.
+        # POST failed (likely slug collision from prior partial run).
+        # Recover by searching for the slug directly.
         if [[ -z "$id" ]]; then
             slug_enc=$(nb_urlencode "$slug")
             res=$(nb_get "dcim/device-types/?slug=${slug_enc}")
@@ -630,9 +609,7 @@ nb_get_or_create_vlan() {
     id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
     if [[ -z "$id" ]]; then
         payload=$(jq -n \
-            --argjson vid "$vid" \
-            --arg     name "$name" \
-            --argjson site "$site_id" \
+            --argjson vid "$vid" --arg name "$name" --argjson site "$site_id" \
             '{vid:$vid,name:$name,site:$site,status:"active"}')
         res=$(nb_post "ipam/vlans/" "$payload")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
@@ -642,13 +619,11 @@ nb_get_or_create_vlan() {
 }
 
 nb_add_ip() {
-    # nb_add_ip <cidr> <device_id_or_empty> <interface_id_or_empty>
     local ip="$1" device_id="${2:-}" iface_id="${3:-}"
     [[ "$ip" != */* ]] && ip="${ip}/32"
     local enc; enc=$(nb_urlencode "$ip")
     local existing; existing=$(nb_get "ipam/ip-addresses/?address=${enc}")
     local ip_id; ip_id=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
-
     local payload
     payload=$(jq -n --arg addr "$ip" '{address:$addr,status:"active"}')
     if [[ -n "$iface_id" && "$iface_id" =~ ^[0-9]+$ ]]; then
@@ -656,15 +631,12 @@ nb_add_ip() {
             ".assigned_object_type=\"dcim.interface\" \
              | .assigned_object_id=$iface_id")
     fi
-
     if [[ -z "$ip_id" ]]; then
         local res; res=$(nb_post "ipam/ip-addresses/" "$payload")
         ip_id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
     else
         nb_patch "ipam/ip-addresses/${ip_id}/" "$payload" >/dev/null 2>&1 || true
     fi
-
-    # Set as primary on device
     if [[ -n "$device_id" && "$device_id" =~ ^[0-9]+$ \
           && -n "$ip_id" && "$ip_id" =~ ^[0-9]+$ ]]; then
         nb_patch "dcim/devices/${device_id}/" \
@@ -713,13 +685,8 @@ nb_upsert_device() {
     if [[ -z "$site_id"  || ! "$site_id"  =~ ^[0-9]+$ ]]; then
         log_error "Invalid site ID for $name"; return 1; fi
 
-    local enc; enc=$(nb_urlencode "$name")
-    local existing; existing=$(nb_get "dcim/devices/?name=${enc}")
-    local dev_id; dev_id=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
-
-    # Sanitize serial: SNMP entity MIB often returns error strings like
-    # "iso.3.6.1... = No Such Object..." which are 80+ chars and fail
-    # NetBox validation (serial max_length=50). Clear those.
+    # Sanitize serial: SNMP entity MIB returns error strings like
+    # "iso.3.6.1... = No Such Object..." which exceed NetBox's max_length=50
     local clean_serial=""
     if [[ -n "$serial" \
           && ${#serial} -le 50 \
@@ -728,6 +695,10 @@ nb_upsert_device() {
           && "$serial" != *"Not avail"* ]]; then
         clean_serial="$serial"
     fi
+
+    local enc; enc=$(nb_urlencode "$name")
+    local existing; existing=$(nb_get "dcim/devices/?name=${enc}")
+    local dev_id; dev_id=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
 
     local payload
     payload=$(jq -n \
@@ -747,7 +718,10 @@ nb_upsert_device() {
         if [[ -n "$dev_id" && "$dev_id" =~ ^[0-9]+$ ]]; then
             log_info "Created device: $name (ID: $dev_id)"
         else
-            log_error "Device POST failed for $name: $(echo "$api_resp" | jq -c '.detail // .name // .' 2>/dev/null | head -c 200)"
+            local err_detail
+            err_detail=$(echo "$api_resp" \
+                | jq -c '.detail // .name // .' 2>/dev/null | head -c 200)
+            log_error "Device POST failed for $name: $err_detail"
             return 1
         fi
     else
@@ -793,6 +767,98 @@ _snmp_walk() {
 }
 
 # -----------------------------------------------------------------------------
+# TARGET PARSING  (multi-subnet support)
+# parse_targets: normalises any mix of CIDRs, IPs, and file paths into an
+# array of individual scan targets printed one-per-line to stdout.
+# Supports: "192.168.0.0/24,10.0.0.0/8" or "/path/to/subnets.txt"
+# File format: one target per line; # comments; blank lines ignored;
+#              inline comments supported; leading/trailing whitespace stripped.
+# -----------------------------------------------------------------------------
+parse_targets() {
+    local raw="$1"
+    python3 - "$raw" <<'PYEOF'
+import sys, os, re, ipaddress
+
+raw = sys.argv[1].strip()
+targets = []
+
+def add_target(t):
+    t = t.strip()
+    if not t or t.startswith('#'):
+        return
+    # Remove inline comments
+    t = t.split('#')[0].strip()
+    if not t:
+        return
+    try:
+        ipaddress.ip_network(t, strict=False)
+        targets.append(t)
+        return
+    except ValueError:
+        pass
+    try:
+        ipaddress.ip_address(t)
+        targets.append(t + '/32')
+        return
+    except ValueError:
+        pass
+
+# Check if the input is a file
+if os.path.isfile(raw):
+    with open(raw) as f:
+        for line in f:
+            add_target(line)
+else:
+    # Split on commas and whitespace
+    for part in re.split(r'[,\s]+', raw):
+        add_target(part)
+
+# Deduplicate while preserving order
+seen = set()
+for t in targets:
+    if t not in seen:
+        seen.add(t)
+        print(t)
+PYEOF
+}
+
+# expand_host_file: reads a host file containing IPs and/or CIDRs (with
+# comments and whitespace), writes individual host IPs to LIVE_HOSTS_FILE.
+expand_host_file() {
+    local file="$1"
+    python3 - "$file" <<'PYEOF'
+import sys, ipaddress
+
+results = []
+with open(sys.argv[1]) as f:
+    for raw_line in f:
+        line = raw_line.split('#')[0].strip()
+        if not line:
+            continue
+        try:
+            net = ipaddress.ip_network(line, strict=False)
+            if net.num_addresses == 1:
+                results.append(str(net.network_address))
+            else:
+                for host in net.hosts():
+                    results.append(str(host))
+        except ValueError:
+            try:
+                ipaddress.ip_address(line)
+                results.append(line)
+            except ValueError:
+                pass
+
+# Deduplicate, preserve order
+seen = set()
+for ip in results:
+    if ip not in seen:
+        seen.add(ip)
+        print(ip)
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
 # DISCOVERY ENGINE
 # -----------------------------------------------------------------------------
 DISC_RESULTS=""
@@ -804,18 +870,43 @@ init_scan_session() {
         '{scan_time:$ts,target:$tgt,hosts:[]}' > "$DISC_RESULTS"
     log_info "Session: $DISC_RESULTS"
 }
-
 append_host() {
     local tmp; tmp=$(mktemp)
     jq ".hosts += [$1]" "$DISC_RESULTS" > "$tmp" && mv "$tmp" "$DISC_RESULTS"
 }
 
-# ── Phase 1: Host discovery ───────────────────────────────────────────────────
-discover_live_hosts() {
-    local target="$1"
+# ── Multi-target wrapper ──────────────────────────────────────────────────────
+# Runs discover_live_hosts for each target, then deduplicates the combined
+# result so Phase 2 scans each unique host exactly once.
+discover_targets() {
+    local targets=("$@")
+    local combined; combined=$(mktemp)
     > "$LIVE_HOSTS_FILE"
+
+    local t
+    for t in "${targets[@]}"; do
+        log_step "Phase 1 -- Host Discovery: $t"
+        local tmp_hosts; tmp_hosts=$(mktemp)
+        _do_host_discovery "$t" "$tmp_hosts"
+        cat "$tmp_hosts" >> "$combined"
+        rm -f "$tmp_hosts"
+    done
+
+    # Dedup and sort combined result
+    sort -t. -k1,1n -k2,2n -k3,3n -k4,4n -u "$combined" \
+        > "$LIVE_HOSTS_FILE"
+    rm -f "$combined"
+
+    local count; count=$(wc -l < "$LIVE_HOSTS_FILE")
+    log_ok "Phase 1 complete -- $count unique live hosts across all targets"
+    printf "\n  ${G}Total found: ${W}%s hosts${NC}\n" "$count"
+}
+
+# Internal: runs all host-discovery probes for a single target, writes results
+# to the provided output file.
+_do_host_discovery() {
+    local target="$1" out_file="$2"
     local tmp_all; tmp_all=$(mktemp)
-    log_step "Phase 1 -- Host Discovery: $target"
 
     printf "  ${W}ARP scan${NC} .................. "
     if cmd_exists arp-scan; then
@@ -878,33 +969,34 @@ discover_live_hosts() {
     arp -n 2>/dev/null | awk 'NR>1&&$3!="(incomplete)"{print $1}' >> "$tmp_all"
     printf "${G}done${NC}\n"
 
-    # Deduplicate + validate
+    # Filter to target CIDR + dedup + validate
     sort -t. -k1,1n -k2,2n -k3,3n -k4,4n -u "$tmp_all" \
         | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
         | while IFS= read -r ip; do valid_ip "$ip" && echo "$ip"; done \
-        > "$LIVE_HOSTS_FILE"
+        > "$out_file"
     rm -f "$tmp_all"
 
-    # Filter: keep only IPs within the requested target CIDR
-    # Prevents docker bridge / host IPs leaking in from ARP cache
+    # Filter to requested CIDR only (removes docker-bridge / host IPs)
     if valid_cidr "$target"; then
-        python3 - "$target" "$LIVE_HOSTS_FILE" <<'PYEOF'
+        python3 - "$target" "$out_file" <<'PYEOF'
 import ipaddress, sys
-try:
-    net = ipaddress.ip_network(sys.argv[1], strict=False)
-    with open(sys.argv[2]) as f:
-        kept = [l.strip() for l in f
-                if l.strip() and ipaddress.ip_address(l.strip()) in net]
-    with open(sys.argv[2], 'w') as f:
-        f.write('\n'.join(kept) + ('\n' if kept else ''))
-except Exception:
-    pass
+net = ipaddress.ip_network(sys.argv[1], strict=False)
+with open(sys.argv[2]) as f:
+    kept = [l.strip() for l in f
+            if l.strip() and ipaddress.ip_address(l.strip()) in net]
+with open(sys.argv[2], 'w') as f:
+    f.write('\n'.join(kept) + ('\n' if kept else ''))
 PYEOF
     fi
 
-    local count; count=$(wc -l < "$LIVE_HOSTS_FILE")
-    log_ok "Phase 1 complete -- $count live hosts found"
-    printf "\n  ${G}Found: ${W}%s live hosts${NC}\n" "$count"
+    local count; count=$(wc -l < "$out_file")
+    log_info "$target: $count hosts"
+}
+
+# Legacy single-target wrapper (used internally and by --auto-scan)
+discover_live_hosts() {
+    local target="$1"
+    discover_targets "$target"
 }
 
 # ── Phase 2: Deep scan ────────────────────────────────────────────────────────
@@ -912,7 +1004,6 @@ scan_all_hosts() {
     local total; total=$(wc -l < "$LIVE_HOSTS_FILE")
     log_step "Phase 2 -- Deep Scanning $total Hosts"
     local idx=0 ip
-    # fd3 loop: background probes cannot consume the while-loop's stdin
     while IFS= read -r ip <&3; do
         (( idx++ )) || true
         printf "\n  ${C}[%d/%d]${NC} ${W}%s${NC}\n" "$idx" "$total" "$ip"
@@ -924,8 +1015,6 @@ scan_all_hosts() {
 scan_single_host() {
     local ip="$1"
     local tmp; tmp=$(mktemp -d)
-
-    # All probes get stdin=/dev/null to prevent accidental fd0 reads
     probe_nmap    "$ip" "$tmp" </dev/null &
     probe_snmp    "$ip" "$tmp" </dev/null &
     probe_ssh     "$ip" "$tmp" </dev/null &
@@ -935,11 +1024,9 @@ scan_single_host() {
     probe_banners "$ip" "$tmp" </dev/null &
     probe_mdns    "$ip" "$tmp" </dev/null &
     wait
-
     local host_json
     host_json=$(merge_host_data "$ip" "$tmp")
     append_host "$host_json"
-
     local hn role os
     hn=$(echo "$host_json"   | jq -r '.hostname // "?"')
     role=$(echo "$host_json" | jq -r '.device_role // "?"')
@@ -952,8 +1039,6 @@ scan_single_host() {
 probe_nmap() {
     local ip="$1" tmp="$2"
     local xml="$tmp/nmap.xml"
-
-    # TCP-only; no -sC; no U: prefix; removed invalid/removed scripts
     nmap -sV -O --osscan-guess \
         -p "21-23,25,53,80,110,139,143,443,445,512-514,587,631,\
 1433,1521,3306,3389,5432,5900,5901,6379,\
@@ -965,56 +1050,41 @@ ms-sql-info,mysql-info,mongodb-info,\
 rdp-enum-encryption,vnc-info" \
         -T4 --host-timeout 90s --max-retries 2 \
         -oX "$xml" "$ip" >> "$LOG_FILE" 2>&1 || true
-
     python3 /dev/stdin "$xml" <<'PYEOF' > "$tmp/nmap.json" 2>/dev/null
 import xml.etree.ElementTree as ET, json, sys
-
 def parse(f):
-    r = {"ports": [], "os": None, "os_accuracy": None,
-         "mac": None, "vendor": None, "hostname": None, "scripts": {}}
-    try:
-        tree = ET.parse(f)
-    except Exception:
-        return r
+    r = {"ports":[],"os":None,"os_accuracy":None,
+         "mac":None,"vendor":None,"hostname":None,"scripts":{}}
+    try: tree = ET.parse(f)
+    except: return r
     for host in tree.findall('host'):
         for hn in (host.find('hostnames') or []):
-            if hn.get('type') == 'PTR':
-                r['hostname'] = hn.get('name')
-            elif not r['hostname']:
-                r['hostname'] = hn.get('name')
+            if hn.get('type') == 'PTR': r['hostname'] = hn.get('name')
+            elif not r['hostname']:     r['hostname'] = hn.get('name')
         for addr in host.findall('address'):
             if addr.get('addrtype') == 'mac':
-                r['mac'] = addr.get('addr')
-                r['vendor'] = addr.get('vendor', '')
+                r['mac'] = addr.get('addr'); r['vendor'] = addr.get('vendor','')
         os_el = host.find('os')
         if os_el:
             for m in os_el.findall('osmatch'):
-                r['os'] = m.get('name')
-                r['os_accuracy'] = m.get('accuracy')
-                break
-        ports_el = host.find('ports')
-        if ports_el:
-            for port in ports_el.findall('port'):
-                st = port.find('state')
-                if st is None or st.get('state') != 'open':
-                    continue
-                p = {'port': port.get('portid'), 'proto': port.get('protocol'),
-                     'service': None, 'version': None, 'banner': None, 'scripts': {}}
-                svc = port.find('service')
-                if svc:
-                    p['service'] = svc.get('name', '')
-                    p['version'] = (svc.get('product', '') + ' ' +
-                                    svc.get('version', '')).strip()
-                for sc in port.findall('script'):
-                    out = (sc.get('output', '') or '')[:300]
-                    p['scripts'][sc.get('id', '')] = out
-                    if sc.get('id', '') == 'banner':
-                        p['banner'] = out
-                r['ports'].append(p)
+                r['os'] = m.get('name'); r['os_accuracy'] = m.get('accuracy'); break
+        for port in (host.find('ports') or []):
+            st = port.find('state')
+            if st is None or st.get('state') != 'open': continue
+            p = {'port':port.get('portid'),'proto':port.get('protocol'),
+                 'service':None,'version':None,'banner':None,'scripts':{}}
+            svc = port.find('service')
+            if svc:
+                p['service'] = svc.get('name','')
+                p['version'] = (svc.get('product','')+' '+svc.get('version','')).strip()
+            for sc in port.findall('script'):
+                out = (sc.get('output','') or '')[:300]
+                p['scripts'][sc.get('id','')] = out
+                if sc.get('id','') == 'banner': p['banner'] = out
+            r['ports'].append(p)
         for sc in host.findall('hostscript/script'):
-            r['scripts'][sc.get('id', '')] = (sc.get('output', '') or '')[:300]
+            r['scripts'][sc.get('id','')] = (sc.get('output','') or '')[:300]
     return r
-
 print(json.dumps(parse(sys.argv[1])))
 PYEOF
 }
@@ -1023,15 +1093,12 @@ PYEOF
 probe_snmp() {
     local ip="$1" tmp="$2"
     echo '{"available":false}' > "$tmp/snmp.json"
-
     local communities; communities=$(get_communities_for "$ip")
     local tok="" comm
     while IFS= read -r comm; do
         snmpget -v2c -c "$comm" -t "$SNMP_TIMEOUT" -r 1 \
             "$ip" 1.3.6.1.2.1.1.1.0 &>/dev/null && { tok="$comm"; break; }
     done <<< "$communities"
-
-    # Try SNMPv3 if v2c failed
     if [[ -z "$tok" ]]; then
         local creds; creds=$(read_creds)
         local v3c
@@ -1051,7 +1118,6 @@ probe_snmp() {
     [[ -z "$tok" ]] && return
 
     local t="$tok" ts="$SNMP_TIMEOUT"
-
     local sys_descr sys_name sys_loc sys_contact sys_uptime sys_oid chassis_ser
     sys_descr=$(   _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.1.0)
     sys_name=$(    _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.5.0)
@@ -1060,12 +1126,12 @@ probe_snmp() {
     sys_uptime=$(  _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.3.0)
     sys_oid=$(     _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.2.0)
     chassis_ser=$( _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.47.1.1.1.1.11.1)
-    # Clear SNMP error strings from serial (they start with "iso." or contain "No Such")
-    if [[ "$chassis_ser" == *"No Such"* || "$chassis_ser" == iso.* ]]; then
+    # Clear SNMP error strings from serial (v2.0.9)
+    if [[ "$chassis_ser" == *"No Such"* || "$chassis_ser" == iso.* \
+          || "$chassis_ser" == *"not available"* ]]; then
         chassis_ser=""
     fi
 
-    # Walk tables to temp files (avoids arg-length limits on large outputs)
     _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.2.2         > "$tmp/snmp_ifaces.txt"
     _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.17.4.3.1    > "$tmp/snmp_mac.txt"
     _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.17.1.4.1.2  > "$tmp/snmp_bport.txt"
@@ -1083,173 +1149,111 @@ probe_snmp() {
         "${chassis_ser:-}" \
         <<'PYEOF' > "$tmp/snmp.json" 2>/dev/null
 import re, json, sys, os
+tmp=sys.argv[1]; working_token=sys.argv[2]
+sys_descr=sys.argv[3].strip().strip('"'); sys_name=sys.argv[4].strip().strip('"')
+sys_loc=sys.argv[5].strip().strip('"');   sys_contact=sys.argv[6].strip().strip('"')
+sys_uptime=sys.argv[7].strip();           sys_oid=sys.argv[8].strip()
+chassis_ser=sys.argv[9].strip().strip('"')
 
-tmp            = sys.argv[1]
-working_token  = sys.argv[2]
-sys_descr      = sys.argv[3].strip().strip('"')
-sys_name       = sys.argv[4].strip().strip('"')
-sys_loc        = sys.argv[5].strip().strip('"')
-sys_contact    = sys.argv[6].strip().strip('"')
-sys_uptime     = sys.argv[7].strip()
-sys_oid        = sys.argv[8].strip()
-chassis_ser    = sys.argv[9].strip().strip('"')
-
-def rf(name):
-    p = os.path.join(tmp, name)
+def rf(n):
+    p=os.path.join(tmp,n)
     return open(p).read() if os.path.exists(p) else ''
 
-ifaces_raw    = rf('snmp_ifaces.txt')
-mac_table_raw = rf('snmp_mac.txt')
-bport_raw     = rf('snmp_bport.txt')
-arp_table_raw = rf('snmp_arp.txt')
-ip_table_raw  = rf('snmp_iptable.txt')
-pvid_raw      = rf('snmp_pvid.txt')
-vlan_name_raw = rf('snmp_vlannames.txt')
-cdp_raw       = rf('snmp_cdp.txt')
-lldp_raw      = rf('snmp_lldp.txt')
+ifaces_raw=rf('snmp_ifaces.txt'); mac_table_raw=rf('snmp_mac.txt')
+bport_raw=rf('snmp_bport.txt');   arp_table_raw=rf('snmp_arp.txt')
+ip_table_raw=rf('snmp_iptable.txt'); pvid_raw=rf('snmp_pvid.txt')
+vlan_name_raw=rf('snmp_vlannames.txt')
+cdp_raw=rf('snmp_cdp.txt'); lldp_raw=rf('snmp_lldp.txt')
 
-# ── interfaces ──
-ifaces = {}
+ifaces={}
 for line in ifaces_raw.split('\n'):
-    idx_m = re.search(r'(\d+)\s*=', line)
-    if not idx_m:
-        continue
-    idx = idx_m.group(1)
-    val_m = re.search(
-        r'=\s*(?:STRING|INTEGER|Gauge32|Counter32|PhysAddress):\s*(.*)', line)
-    if not val_m:
-        continue
-    val = val_m.group(1).strip().strip('"')
-    if idx not in ifaces:
-        ifaces[idx] = {}
-    if '2.2.1.2.'  in line: ifaces[idx]['name']         = val
-    elif '2.2.1.3.' in line: ifaces[idx]['type']        = val
-    elif '2.2.1.6.' in line: ifaces[idx]['mac']         = val
-    elif '2.2.1.7.' in line: ifaces[idx]['admin_status']= val
-    elif '2.2.1.8.' in line: ifaces[idx]['oper_status'] = val
-    elif '2.2.1.5.' in line: ifaces[idx]['speed']       = val
-interfaces = [{'index': k, **v} for k, v in ifaces.items() if 'name' in v]
+    idx_m=re.search(r'(\d+)\s*=',line)
+    if not idx_m: continue
+    idx=idx_m.group(1)
+    v=re.search(r'=\s*(?:STRING|INTEGER|Gauge32|Counter32|PhysAddress):\s*(.*)',line)
+    if not v: continue
+    val=v.group(1).strip().strip('"')
+    if idx not in ifaces: ifaces[idx]={}
+    if '2.2.1.2.'  in line: ifaces[idx]['name']        =val
+    elif '2.2.1.3.' in line: ifaces[idx]['type']       =val
+    elif '2.2.1.6.' in line: ifaces[idx]['mac']        =val
+    elif '2.2.1.7.' in line: ifaces[idx]['admin_status']=val
+    elif '2.2.1.8.' in line: ifaces[idx]['oper_status'] =val
+    elif '2.2.1.5.' in line: ifaces[idx]['speed']       =val
+interfaces=[{'index':k,**v} for k,v in ifaces.items() if 'name' in v]
 
-# ── bridge port -> ifIndex ──
-port_to_if = {}
+port_to_if={}
 for line in bport_raw.split('\n'):
-    m = re.match(r'.*\.(\d+)\s*=\s*INTEGER:\s*(\d+)', line)
-    if m:
-        port_to_if[m.group(1)] = m.group(2)
+    m=re.match(r'.*\.(\d+)\s*=\s*INTEGER:\s*(\d+)',line)
+    if m: port_to_if[m.group(1)]=m.group(2)
 
-# ── MAC table ──
-mac_port_map = []
+mac_port_map=[]
 for line in mac_table_raw.split('\n'):
-    m = re.match(
-        r'.*17\.4\.3\.1\.2\.(\d+\.\d+\.\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',
-        line)
+    m=re.match(r'.*17\.4\.3\.1\.2\.(\d+\.\d+\.\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',line)
     if m:
-        mac = ':'.join('{:02x}'.format(int(o)) for o in m.group(1).split('.'))
-        bp  = m.group(2)
-        ii  = port_to_if.get(bp, bp)
-        mac_port_map.append({
-            'mac':         mac,
-            'port_index':  bp,
-            'if_index':    ii,
-            'if_name':     ifaces.get(ii, {}).get('name', 'Port-' + ii),
-        })
+        mac=':'.join('{:02x}'.format(int(o)) for o in m.group(1).split('.'))
+        bp=m.group(2); ii=port_to_if.get(bp,bp)
+        mac_port_map.append({'mac':mac,'port_index':bp,'if_index':ii,
+            'if_name':ifaces.get(ii,{}).get('name','Port-'+ii)})
 
-# ── ARP table ──
-arp_entries = []
+arp_entries=[]
 for line in arp_table_raw.split('\n'):
-    m = re.match(
-        r'.*4\.22\.1\.2\.\d+\.(\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',
-        line)
-    if m:
-        arp_entries.append({'ip': m.group(1), 'if_index': m.group(2)})
+    m=re.match(r'.*4\.22\.1\.2\.\d+\.(\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',line)
+    if m: arp_entries.append({'ip':m.group(1),'if_index':m.group(2)})
 
-# ── IP address table ──
-ip_if_map   = {}
-ip_mask_map = {}
+ip_if_map={}; ip_mask_map={}
 for line in ip_table_raw.split('\n'):
-    m = re.match(
-        r'.*4\.20\.1\.2\.(\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)', line)
-    if m:
-        ip_if_map[m.group(1)] = m.group(2)
-    m = re.match(
-        r'.*4\.20\.1\.3\.(\d+\.\d+\.\d+\.\d+)\s*=\s*IpAddress:\s*(\S+)', line)
-    if m:
-        ip_mask_map[m.group(1)] = m.group(2)
-ip_table = [
-    {'ip': ip, 'if_index': idx, 'mask': ip_mask_map.get(ip, '255.255.255.0')}
-    for ip, idx in ip_if_map.items()
-]
+    m=re.match(r'.*4\.20\.1\.2\.(\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',line)
+    if m: ip_if_map[m.group(1)]=m.group(2)
+    m=re.match(r'.*4\.20\.1\.3\.(\d+\.\d+\.\d+\.\d+)\s*=\s*IpAddress:\s*(\S+)',line)
+    if m: ip_mask_map[m.group(1)]=m.group(2)
+ip_table=[{'ip':ip,'if_index':idx,'mask':ip_mask_map.get(ip,'255.255.255.0')}
+          for ip,idx in ip_if_map.items()]
 
-# ── VLAN PVID ──
-vlan_pvid = {}
+vlan_pvid={}
 for line in pvid_raw.split('\n'):
-    m = re.match(
-        r'.*\.(\d+)\s*=\s*(?:Gauge32|INTEGER|Unsigned32):\s*(\d+)', line)
-    if m:
-        vlan_pvid[m.group(1)] = m.group(2)
+    m=re.match(r'.*\.(\d+)\s*=\s*(?:Gauge32|INTEGER|Unsigned32):\s*(\d+)',line)
+    if m: vlan_pvid[m.group(1)]=m.group(2)
 
-# ── VLAN names (Cisco vtpVlanName) ──
-vlan_names = {}
+vlan_names={}
 for line in vlan_name_raw.split('\n'):
-    m = re.match(r'.*\.(\d+)\s*=\s*STRING:\s*(.+)', line)
-    if m:
-        vlan_names[m.group(1)] = m.group(2).strip().strip('"')
+    m=re.match(r'.*\.(\d+)\s*=\s*STRING:\s*(.+)',line)
+    if m: vlan_names[m.group(1)]=m.group(2).strip().strip('"')
 
-# ── Enrich mac_port_map with VLAN + remote IP ──
 for entry in mac_port_map:
-    bp = entry['port_index']
-    ii = entry['if_index']
-    entry['vlan']      = vlan_pvid.get(bp, vlan_pvid.get(ii, ''))
-    entry['vlan_name'] = vlan_names.get(entry['vlan'], '')
-    entry['remote_ip'] = next(
-        (a['ip'] for a in arp_entries if a['if_index'] == ii), '')
+    bp=entry['port_index']; ii=entry['if_index']
+    entry['vlan']=vlan_pvid.get(bp,vlan_pvid.get(ii,''))
+    entry['vlan_name']=vlan_names.get(entry['vlan'],'')
+    entry['remote_ip']=next((a['ip'] for a in arp_entries if a['if_index']==ii),'')
 
-# ── CDP neighbors ──
-cdp_devs = {}
+cdp_devs={}
 for line in cdp_raw.split('\n'):
-    for sfx, fld in [('.6.', 'device_id'), ('.8.', 'platform'),
-                     ('.7.', 'remote_port')]:
-        pattern = r'.*' + re.escape(sfx) + r'(\d+)\.(\d+)\s*=\s*STRING:\s*(.*)'
-        m = re.match(pattern, line)
+    for sfx,fld in [('.6.','device_id'),('.8.','platform'),('.7.','remote_port')]:
+        m=re.match(r'.*'+re.escape(sfx)+r'(\d+)\.(\d+)\s*=\s*STRING:\s*(.*)',line)
         if m:
-            key = '{}_{}'.format(m.group(1), m.group(2))
-            cdp_devs.setdefault(key, {})[fld] = m.group(3).strip().strip('"')
-cdp_neighbors = list(cdp_devs.values())
+            key='{}_{}'.format(m.group(1),m.group(2))
+            cdp_devs.setdefault(key,{})[fld]=m.group(3).strip().strip('"')
+cdp_neighbors=list(cdp_devs.values())
 
-# ── LLDP neighbors ──
-lldp_sys = {}
+lldp_sys={}
 for line in lldp_raw.split('\n'):
-    m = re.match(r'.*\.(\d+)\.(\d+)\.(\d+)\s*=\s*STRING:\s*(.*)', line)
-    if not m:
-        continue
-    lp, ri, val = m.group(2), m.group(3), m.group(4).strip().strip('"')
-    key = '{}_{}'.format(lp, ri)
-    lldp_sys.setdefault(key, {})
-    if '4.1.1.9'  in line: lldp_sys[key]['sys_name']  = val
-    if '4.1.1.10' in line: lldp_sys[key]['sys_desc']  = val[:100]
-    if '4.1.1.7'  in line: lldp_sys[key]['port_id']   = val
-    if '4.1.1.8'  in line: lldp_sys[key]['port_desc'] = val
-lldp_neighbors = list(lldp_sys.values())
+    m=re.match(r'.*\.(\d+)\.(\d+)\.(\d+)\s*=\s*STRING:\s*(.*)',line)
+    if not m: continue
+    lp,ri,val=m.group(2),m.group(3),m.group(4).strip().strip('"')
+    key='{}_{}'.format(lp,ri); lldp_sys.setdefault(key,{})
+    if '4.1.1.9'  in line: lldp_sys[key]['sys_name'] =val
+    if '4.1.1.10' in line: lldp_sys[key]['sys_desc'] =val[:100]
+    if '4.1.1.7'  in line: lldp_sys[key]['port_id']  =val
+    if '4.1.1.8'  in line: lldp_sys[key]['port_desc']=val
+lldp_neighbors=list(lldp_sys.values())
 
-print(json.dumps({
-    'available':      True,
-    'community':      working_token,
-    'sys_descr':      sys_descr,
-    'sys_name':       sys_name,
-    'sys_location':   sys_loc,
-    'sys_contact':    sys_contact,
-    'sys_uptime':     sys_uptime,
-    'sys_oid':        sys_oid,
-    'chassis_serial': chassis_ser,
-    'interfaces':     interfaces,
-    'ip_table':       ip_table,
-    'mac_port_map':   mac_port_map,
-    'vlan_pvid':      vlan_pvid,
-    'vlan_names':     vlan_names,
-    'arp_entries':    arp_entries,
-    'cdp_neighbors':  cdp_neighbors,
-    'lldp_neighbors': lldp_neighbors,
-}))
+print(json.dumps({'available':True,'community':working_token,
+    'sys_descr':sys_descr,'sys_name':sys_name,'sys_location':sys_loc,
+    'sys_contact':sys_contact,'sys_uptime':sys_uptime,'sys_oid':sys_oid,
+    'chassis_serial':chassis_ser,'interfaces':interfaces,'ip_table':ip_table,
+    'mac_port_map':mac_port_map,'vlan_pvid':vlan_pvid,'vlan_names':vlan_names,
+    'arp_entries':arp_entries,'cdp_neighbors':cdp_neighbors,
+    'lldp_neighbors':lldp_neighbors}))
 PYEOF
 }
 
@@ -1261,9 +1265,8 @@ probe_ssh() {
     local banner
     banner=$(nc -w 3 "$ip" 22 2>/dev/null | head -1 | tr -dc '[:print:]')
     local ssh_opts=(-o StrictHostKeyChecking=no
-        -o ConnectTimeout="$SSH_TIMEOUT"
-        -o BatchMode=yes -o LogLevel=error
-        -o UserKnownHostsFile=/dev/null
+        -o ConnectTimeout="$SSH_TIMEOUT" -o BatchMode=yes
+        -o LogLevel=error -o UserKnownHostsFile=/dev/null
         -o PreferredAuthentications=publickey,password)
     local remote_cmd
     remote_cmd='printf "HN=%s\n" "$(hostname)"; uname -a; \
@@ -1284,23 +1287,20 @@ free -h 2>/dev/null | head -2'
             sys_info=$(sshpass -p "$sp" ssh "${opts[@]}" \
                 "${su}@${ip}" "$remote_cmd" 2>/dev/null || true)
         else
-            sys_info=$(ssh "${opts[@]}" "${su}@${ip}" \
-                "$remote_cmd" 2>/dev/null || true)
+            sys_info=$(ssh "${opts[@]}" "${su}@${ip}" "$remote_cmd" 2>/dev/null || true)
         fi
         [[ -n "$sys_info" ]] && break
     done < <(get_ssh_creds_for "$ip")
     jq -n \
         --arg banner "$banner" \
-        --arg hn "$(echo "$sys_info" | grep '^HN=' | cut -d= -f2)" \
-        --arg os "$(echo "$sys_info" \
-            | grep -m1 'PRETTY_NAME=\|ProductName:' \
-            | sed 's/.*=//;s/.*: //' | tr -d '"')" \
+        --arg hn     "$(echo "$sys_info" | grep '^HN=' | cut -d= -f2)" \
+        --arg os     "$(echo "$sys_info" | grep -m1 'PRETTY_NAME=\|ProductName:' \
+                         | sed 's/.*=//;s/.*: //' | tr -d '"')" \
         --arg kernel "$(echo "$sys_info" | grep '^Linux\|^Darwin' | head -1)" \
-        --arg cpu "$(echo "$sys_info" \
-            | grep -i 'model name\|CPU' | head -1 | sed 's/.*: //')" \
-        '{available:true,banner:$banner,hostname:$hn,
-          os:$os,kernel:$kernel,cpu:$cpu}' \
-        > "$tmp/ssh.json"
+        --arg cpu    "$(echo "$sys_info" | grep -i 'model name\|CPU' \
+                         | head -1 | sed 's/.*: //')" \
+        '{available:true,banner:$banner,hostname:$hn,os:$os,
+          kernel:$kernel,cpu:$cpu}' > "$tmp/ssh.json"
 }
 
 # ── Probe: HTTP/HTTPS ─────────────────────────────────────────────────────────
@@ -1313,14 +1313,13 @@ probe_http() {
         [[ "$port" =~ ^(443|8443|9443|4443)$ ]] && proto="https"
         local hdr="$tmp/h${port}.txt"
         curl -skL --max-time "$SCAN_TIMEOUT" --max-redirs 3 \
-            -A "NetBox-Discovery/2.0" -D "$hdr" \
+            -A "NetBox-Discovery/2.1" -D "$hdr" \
             "${proto}://${ip}:${port}/" > "$tmp/b${port}.html" 2>/dev/null \
             || continue
         [[ ! -f "$hdr" ]] && continue
         local status server title cert_cn=""
         status=$(head -1 "$hdr" | awk '{print $2}')
-        server=$(grep -i '^Server:' "$hdr" \
-            | head -1 | cut -d' ' -f2- | tr -d '\r')
+        server=$(grep -i '^Server:' "$hdr" | head -1 | cut -d' ' -f2- | tr -d '\r')
         title=$(grep -oi '<title[^>]*>[^<]*</title>' "$tmp/b${port}.html" \
             | sed 's/<[^>]*>//g' | head -1 | xargs 2>/dev/null || true)
         if [[ "$proto" == "https" ]]; then
@@ -1338,9 +1337,7 @@ probe_http() {
     if [[ -s "$svc_file" ]]; then
         jq -s '{http_services:.}' "$svc_file" > "$tmp/http.json" 2>/dev/null \
             || echo '{"http_services":[]}' > "$tmp/http.json"
-    else
-        echo '{"http_services":[]}' > "$tmp/http.json"
-    fi
+    else echo '{"http_services":[]}' > "$tmp/http.json"; fi
 }
 
 # ── Probe: NetBIOS ────────────────────────────────────────────────────────────
@@ -1385,9 +1382,7 @@ probe_banners() {
     if [[ -s "$bnr_file" ]]; then
         jq -s '{banners:.}' "$bnr_file" > "$tmp/banners.json" 2>/dev/null \
             || echo '{"banners":[]}' > "$tmp/banners.json"
-    else
-        echo '{"banners":[]}' > "$tmp/banners.json"
-    fi
+    else echo '{"banners":[]}' > "$tmp/banners.json"; fi
 }
 
 # ── Probe: mDNS ───────────────────────────────────────────────────────────────
@@ -1399,74 +1394,52 @@ probe_mdns() {
     jq -n --arg n "$n" '{mdns_hostname:$n}' > "$tmp/mdns.json"
 }
 
-# ── Merge all probe data ──────────────────────────────────────────────────────
+# ── Merge probe data ──────────────────────────────────────────────────────────
 merge_host_data() {
     local ip="$1" tmp="$2"
-
     python3 /dev/stdin "$ip" "$tmp" <<'PYEOF'
 import json, os, sys
-
-ip  = sys.argv[1]
-tmp = sys.argv[2]
-
+ip=sys.argv[1]; tmp=sys.argv[2]
 def load(f):
-    p = os.path.join(tmp, f + '.json')
-    try:
-        return json.load(open(p)) if os.path.exists(p) else {}
-    except Exception:
-        return {}
+    p=os.path.join(tmp,f+'.json')
+    try: return json.load(open(p)) if os.path.exists(p) else {}
+    except: return {}
+nmap=load('nmap'); snmp=load('snmp'); ssh=load('ssh')
+http=load('http'); nb=load('netbios'); dns=load('dns')
+bnr=load('banners'); mdns=load('mdns')
 
-nmap = load('nmap'); snmp = load('snmp'); ssh  = load('ssh')
-http = load('http'); nb   = load('netbios'); dns  = load('dns')
-bnr  = load('banners'); mdns = load('mdns')
+host={'ip':ip,'hostname':None,'mac':None,'vendor':None,
+      'os':None,'os_accuracy':None,
+      'device_role':'Endpoint','manufacturer':'Unknown','model':'Unknown',
+      'serial':'',
+      'ports':nmap.get('ports',[]),'interfaces':snmp.get('interfaces',[]),
+      'ip_table':snmp.get('ip_table',[]),'mac_port_map':snmp.get('mac_port_map',[]),
+      'vlan_pvid':snmp.get('vlan_pvid',{}),'vlan_names':snmp.get('vlan_names',{}),
+      'arp_entries':snmp.get('arp_entries',[]),
+      'http_services':http.get('http_services',[]),'banners':bnr.get('banners',[]),
+      'lldp_neighbors':snmp.get('lldp_neighbors',[]),
+      'cdp_neighbors':snmp.get('cdp_neighbors',[]),
+      'snmp_details':{'sys_descr':snmp.get('sys_descr',''),
+          'sys_location':snmp.get('sys_location',''),
+          'sys_contact':snmp.get('sys_contact',''),
+          'sys_uptime':snmp.get('sys_uptime',''),
+          'sys_oid':snmp.get('sys_oid',''),
+          'community':snmp.get('community','')},
+      'ssh_details':{'cpu':ssh.get('cpu',''),'banner':ssh.get('banner',''),
+          'kernel':ssh.get('kernel','')},
+      'discovery_methods':[]}
 
-host = {
-    'ip': ip, 'hostname': None, 'mac': None, 'vendor': None,
-    'os': None, 'os_accuracy': None,
-    'device_role': 'Endpoint', 'manufacturer': 'Unknown', 'model': 'Unknown',
-    'serial': '',
-    'ports':          nmap.get('ports', []),
-    'interfaces':     snmp.get('interfaces', []),
-    'ip_table':       snmp.get('ip_table', []),
-    'mac_port_map':   snmp.get('mac_port_map', []),
-    'vlan_pvid':      snmp.get('vlan_pvid', {}),
-    'vlan_names':     snmp.get('vlan_names', {}),
-    'arp_entries':    snmp.get('arp_entries', []),
-    'http_services':  http.get('http_services', []),
-    'banners':        bnr.get('banners', []),
-    'lldp_neighbors': snmp.get('lldp_neighbors', []),
-    'cdp_neighbors':  snmp.get('cdp_neighbors', []),
-    'snmp_details': {
-        'sys_descr':   snmp.get('sys_descr', ''),
-        'sys_location':snmp.get('sys_location', ''),
-        'sys_contact': snmp.get('sys_contact', ''),
-        'sys_uptime':  snmp.get('sys_uptime', ''),
-        'sys_oid':     snmp.get('sys_oid', ''),
-        'community':   snmp.get('community', ''),
-    },
-    'ssh_details': {
-        'cpu':    ssh.get('cpu', ''),
-        'banner': ssh.get('banner', ''),
-        'kernel': ssh.get('kernel', ''),
-    },
-    'discovery_methods': [],
-}
-
-# Hostname priority: SNMP > SSH > nmap > DNS > mDNS > NetBIOS
-for src in (snmp.get('sys_name'), ssh.get('hostname'), nmap.get('hostname'),
-            dns.get('ptr_hostname'), mdns.get('mdns_hostname'),
-            nb.get('netbios_name')):
-    if src and src.strip() and src.lower() not in ('none', 'null', ''):
-        host['hostname'] = src.strip()
-        break
+for src in (snmp.get('sys_name'),ssh.get('hostname'),nmap.get('hostname'),
+            dns.get('ptr_hostname'),mdns.get('mdns_hostname'),nb.get('netbios_name')):
+    if src and src.strip() and src.lower() not in ('none','null',''):
+        host['hostname']=src.strip(); break
 if not host['hostname']:
-    host['hostname'] = 'device-' + ip.replace('.', '-')
+    host['hostname']='device-'+ip.replace('.', '-')
 
-host['mac']          = nmap.get('mac')
-host['vendor']       = nmap.get('vendor', '')
-host['os']           = nmap.get('os') or ssh.get('os') or ''
-host['os_accuracy']  = nmap.get('os_accuracy')
-host['serial']       = snmp.get('chassis_serial', '')
+host['mac']=nmap.get('mac'); host['vendor']=nmap.get('vendor','')
+host['os']=nmap.get('os') or ssh.get('os') or ''
+host['os_accuracy']=nmap.get('os_accuracy')
+host['serial']=snmp.get('chassis_serial','')
 
 if nmap.get('ports'):         host['discovery_methods'].append('nmap')
 if snmp.get('available'):     host['discovery_methods'].append('snmp')
@@ -1476,82 +1449,63 @@ if nb.get('available'):       host['discovery_methods'].append('netbios')
 if dns.get('ptr_hostname'):   host['discovery_methods'].append('dns')
 if bnr.get('banners'):        host['discovery_methods'].append('banner')
 
-# snmp_up: SNMP responded -- strong indicator this is a managed network device
-snmp_up = bool(snmp.get('available'))
+snmp_up=bool(snmp.get('available'))
+sys_descr=(snmp.get('sys_descr') or '').lower()
+os_str=(host['os'] or '').lower()
+open_ports={str(p.get('port','')) for p in host['ports']}
+http_ttl=' '.join(s.get('title','') for s in host['http_services']).lower()
+combined=' '.join([sys_descr,os_str,http_ttl])
 
-sys_descr  = (snmp.get('sys_descr') or '').lower()
-os_str     = (host['os'] or '').lower()
-open_ports = {str(p.get('port', '')) for p in host['ports']}
-http_ttl   = ' '.join(s.get('title', '') for s in host['http_services']).lower()
-combined   = ' '.join([sys_descr, os_str, http_ttl])
+FW=['firewall','fortigate','fortios','palo alto','checkpoint','asa','sonicwall',
+    'opnsense','pfsense','netscreen']
+RT=['router','gateway','ios xe','ios xr','junos','routeros','vyos ']
+SW=['switch','catalyst','nexus',' eos ','comware','procurve','arubaos',
+    'ex series','qfx','powerconnect','1810g','1910','2530','2920','2960',
+    '3750','3850','9300','netgear gs']
+AP=['access point','aironet','unifi','airmax','lightweight ap']
+SV=['linux','ubuntu','debian','centos','rhel','windows server','esxi',
+    'vmware','proxmox','freebsd']
+PR=['printer','jetdirect','xerox','ricoh','canon','brother','lexmark']
+UP=['ups','apc','eaton','powerware','uninterruptible']
+CA=['camera','axis comm','hikvision','dahua','hanwha']
 
-FIREWALL = ['firewall', 'fortigate', 'fortios', 'palo alto', 'checkpoint',
-            'asa', 'sonicwall', 'opnsense', 'pfsense', 'netscreen']
-ROUTER   = ['router', 'gateway', 'ios xe', 'ios xr', 'junos', 'routeros',
-            'vyos ']
-SWITCH   = ['switch', 'catalyst', 'nexus', ' eos ', 'comware', 'procurve',
-            'arubaos', 'ex series', 'qfx', 'powerconnect', '1810g', '1910',
-            '2530', '2920', '2960', '3750', '3850', '9300', 'netgear gs']
-AP       = ['access point', 'aironet', 'unifi', 'airmax', 'lightweight ap']
-SERVER   = ['linux', 'ubuntu', 'debian', 'centos', 'rhel', 'windows server',
-            'esxi', 'vmware', 'proxmox', 'freebsd']
-PRINTER  = ['printer', 'jetdirect', 'xerox', 'ricoh', 'canon', 'brother',
-            'lexmark']
-UPS      = ['ups', 'apc', 'eaton', 'powerware', 'uninterruptible']
-CAMERA   = ['camera', 'axis comm', 'hikvision', 'dahua', 'hanwha']
+if   any(k in combined for k in FW):  host['device_role']='Firewall'
+elif any(k in combined for k in RT) and (snmp_up or '161' in open_ports):
+    host['device_role']='Router'
+elif any(k in combined for k in SW) and (snmp_up or '161' in open_ports):
+    host['device_role']='Switch'
+elif any(k in combined for k in AP):  host['device_role']='Wireless AP'
+elif any(k in combined for k in PR) or '9100' in open_ports:
+    host['device_role']='Printer'
+elif any(k in combined for k in UP):  host['device_role']='UPS'
+elif any(k in combined for k in CA):  host['device_role']='IP Camera'
+elif '3389' in open_ports or 'windows' in os_str: host['device_role']='Server'
+elif any(k in combined for k in SV):  host['device_role']='Server'
+elif '5060' in open_ports or 'sip' in combined: host['device_role']='IP Phone'
+elif '445' in open_ports or nb.get('available'): host['device_role']='Workstation'
 
-if   any(k in combined for k in FIREWALL):
-    host['device_role'] = 'Firewall'
-elif any(k in combined for k in ROUTER) and (snmp_up or '161' in open_ports):
-    host['device_role'] = 'Router'
-elif any(k in combined for k in SWITCH) and (snmp_up or '161' in open_ports):
-    host['device_role'] = 'Switch'
-elif any(k in combined for k in AP):
-    host['device_role'] = 'Wireless AP'
-elif any(k in combined for k in PRINTER) or '9100' in open_ports:
-    host['device_role'] = 'Printer'
-elif any(k in combined for k in UPS):
-    host['device_role'] = 'UPS'
-elif any(k in combined for k in CAMERA):
-    host['device_role'] = 'IP Camera'
-elif '3389' in open_ports or 'windows' in os_str:
-    host['device_role'] = 'Server'
-elif any(k in combined for k in SERVER):
-    host['device_role'] = 'Server'
-elif '5060' in open_ports or 'sip' in combined:
-    host['device_role'] = 'IP Phone'
-elif '445' in open_ports or nb.get('available'):
-    host['device_role'] = 'Workstation'
-
-vendor = host.get('vendor', '') or ''
-if vendor not in ('', 'null', 'None'):
-    host['manufacturer'] = vendor
+vendor=host.get('vendor','') or ''
+if vendor not in ('','null','None'): host['manufacturer']=vendor
 else:
-    MFR = {'cisco': 'Cisco', 'juniper': 'Juniper', 'arista': 'Arista',
-           'procurve': 'HP', 'hp ': 'HP', 'hewlett': 'HP', 'dell': 'Dell',
-           'microsoft': 'Microsoft', 'vmware': 'VMware', 'apple': 'Apple',
-           'ubiquiti': 'Ubiquiti', 'mikrotik': 'MikroTik',
-           'fortigate': 'Fortinet', 'fortinet': 'Fortinet',
-           'palo alto': 'Palo Alto', 'checkpoint': 'Check Point',
-           'apc': 'APC', 'eaton': 'Eaton', 'netgear': 'Netgear',
-           'axis': 'Axis', 'hikvision': 'Hikvision',
-           'synology': 'Synology', 'qnap': 'QNAP',
-           'h3c': 'H3C', 'huawei': 'Huawei',
-           'meraki': 'Cisco Meraki', 'brocade': 'Brocade',
-           'extreme': 'Extreme Networks'}
-    for k, v in MFR.items():
-        if k in combined:
-            host['manufacturer'] = v
-            break
+    MFR={'cisco':'Cisco','juniper':'Juniper','arista':'Arista',
+         'procurve':'HP','hp ':'HP','hewlett':'HP','dell':'Dell',
+         'microsoft':'Microsoft','vmware':'VMware','apple':'Apple',
+         'ubiquiti':'Ubiquiti','mikrotik':'MikroTik','fortigate':'Fortinet',
+         'fortinet':'Fortinet','palo alto':'Palo Alto',
+         'checkpoint':'Check Point','apc':'APC','eaton':'Eaton',
+         'netgear':'Netgear','axis':'Axis','hikvision':'Hikvision',
+         'synology':'Synology','qnap':'QNAP','h3c':'H3C','huawei':'Huawei',
+         'meraki':'Cisco Meraki','brocade':'Brocade',
+         'extreme':'Extreme Networks'}
+    for k,v in MFR.items():
+        if k in combined: host['manufacturer']=v; break
 
-sd = snmp.get('sys_descr', '') or ''
-if sd:
-    host['model'] = sd[:120].strip()
+sd=snmp.get('sys_descr','') or ''
+if sd: host['model']=sd[:120].strip()
 elif ssh.get('net_device_info'):
-    lns = [l for l in ssh['net_device_info'].split('\n') if l.strip()]
-    host['model'] = lns[0][:120].strip() if lns else 'Unknown'
-else:
-    host['model'] = (host['os'] or 'Unknown')[:80]
+    lns=[l for l in ssh['net_device_info'].split('\n') if l.strip()]
+    host['model']=lns[0][:120].strip() if lns else 'Unknown'
+else: host['model']=(host['os'] or 'Unknown')[:80]
 
 print(json.dumps(host))
 PYEOF
@@ -1564,189 +1518,130 @@ map_switchports() {
     local switch_ip="$1"
     log_step "Switchport Mapping: $switch_ip"
     local community; community=$(get_communities_for "$switch_ip" | head -1)
-
     python3 /dev/stdin "$switch_ip" "$community" \
             "$SNMP_TIMEOUT" "$DISCOVERY_DIR" <<'PYEOF'
 import subprocess, json, re, sys, os
-
-ip        = sys.argv[1]
-community = sys.argv[2]
-timeout   = sys.argv[3]
-disc_dir  = sys.argv[4]
-
-def walk(oid, comm=None):
-    c = comm or community
+ip=sys.argv[1]; community=sys.argv[2]; timeout=sys.argv[3]; disc_dir=sys.argv[4]
+def walk(oid,comm=None):
+    c=comm or community
     try:
-        r = subprocess.run(
-            ['snmpwalk', '-v2c', '-c', c, '-t', timeout, '-r1', ip, oid],
-            capture_output=True, text=True, timeout=30)
+        r=subprocess.run(['snmpwalk','-v2c','-c',c,'-t',timeout,'-r1',ip,oid],
+                         capture_output=True,text=True,timeout=30)
         return r.stdout
-    except Exception:
-        return ''
+    except: return ''
 
 print('  Fetching interface table...')
-if_names  = {}
-if_status = {}
-if_admin  = {}
-if_speed  = {}
-if_mac    = {}
-
+if_names={}; if_status={}; if_admin={}; if_speed={}; if_mac={}
 for line in walk('1.3.6.1.2.1.2.2.1.2').split('\n'):
-    m = re.match(r'.*\.(\d+)\s*=\s*STRING:\s*(.+)', line)
-    if m: if_names[m.group(1)] = m.group(2).strip().strip('"')
-
+    m=re.match(r'.*\.(\d+)\s*=\s*STRING:\s*(.+)',line)
+    if m: if_names[m.group(1)]=m.group(2).strip().strip('"')
 for line in walk('1.3.6.1.2.1.2.2.1.8').split('\n'):
-    m = re.match(r'.*\.(\d+)\s*=\s*INTEGER:\s*(\d+)', line)
-    if m: if_status[m.group(1)] = 'up' if m.group(2) == '1' else 'down'
-
+    m=re.match(r'.*\.(\d+)\s*=\s*INTEGER:\s*(\d+)',line)
+    if m: if_status[m.group(1)]='up' if m.group(2)=='1' else 'down'
 for line in walk('1.3.6.1.2.1.2.2.1.7').split('\n'):
-    m = re.match(r'.*\.(\d+)\s*=\s*INTEGER:\s*(\d+)', line)
-    if m: if_admin[m.group(1)] = 'up' if m.group(2) == '1' else 'down'
-
+    m=re.match(r'.*\.(\d+)\s*=\s*INTEGER:\s*(\d+)',line)
+    if m: if_admin[m.group(1)]='up' if m.group(2)=='1' else 'down'
 for line in walk('1.3.6.1.2.1.2.2.1.5').split('\n'):
-    m = re.match(r'.*\.(\d+)\s*=\s*(?:Gauge32|INTEGER):\s*(\d+)', line)
-    if m: if_speed[m.group(1)] = m.group(2)
-
+    m=re.match(r'.*\.(\d+)\s*=\s*(?:Gauge32|INTEGER):\s*(\d+)',line)
+    if m: if_speed[m.group(1)]=m.group(2)
 for line in walk('1.3.6.1.2.1.2.2.1.6').split('\n'):
-    m = re.search(r'\.(\d+)\s*=\s*(?:STRING|Hex-STRING):\s*(.+)', line)
-    if m: if_mac[m.group(1)] = m.group(2).strip()
+    m=re.search(r'\.(\d+)\s*=\s*(?:STRING|Hex-STRING):\s*(.+)',line)
+    if m: if_mac[m.group(1)]=m.group(2).strip()
 
 print('  Fetching bridge port -> ifIndex mapping...')
-port_to_if = {}
+port_to_if={}
 for line in walk('1.3.6.1.2.1.17.1.4.1.2').split('\n'):
-    m = re.match(r'.*\.(\d+)\s*=\s*INTEGER:\s*(\d+)', line)
-    if m: port_to_if[m.group(1)] = m.group(2)
+    m=re.match(r'.*\.(\d+)\s*=\s*INTEGER:\s*(\d+)',line)
+    if m: port_to_if[m.group(1)]=m.group(2)
 
-print('  Fetching VLAN port assignments...')
-port_vlan = {}
+print('  Fetching VLAN assignments...')
+port_vlan={}
 for line in walk('1.3.6.1.2.1.17.7.1.4.5.1.1').split('\n'):
-    m = re.match(
-        r'.*\.(\d+)\s*=\s*(?:Gauge32|INTEGER|Unsigned32):\s*(\d+)', line)
-    if m: port_vlan[m.group(1)] = m.group(2)
+    m=re.match(r'.*\.(\d+)\s*=\s*(?:Gauge32|INTEGER|Unsigned32):\s*(\d+)',line)
+    if m: port_vlan[m.group(1)]=m.group(2)
 
 print('  Fetching VLAN names...')
-vlan_names = {}
+vlan_names={}
 for line in walk('1.3.6.1.4.1.9.9.46.1.3.1.1.2').split('\n'):
-    m = re.match(r'.*\.(\d+)\s*=\s*STRING:\s*(.+)', line)
-    if m: vlan_names[m.group(1)] = m.group(2).strip().strip('"')
+    m=re.match(r'.*\.(\d+)\s*=\s*STRING:\s*(.+)',line)
+    if m: vlan_names[m.group(1)]=m.group(2).strip().strip('"')
 if not vlan_names:
     for line in walk('1.3.6.1.2.1.17.7.1.4.2.1.4').split('\n'):
-        m = re.match(r'.*\.(\d+)\s*=\s*STRING:\s*(.+)', line)
-        if m: vlan_names[m.group(1)] = m.group(2).strip().strip('"')
+        m=re.match(r'.*\.(\d+)\s*=\s*STRING:\s*(.+)',line)
+        if m: vlan_names[m.group(1)]=m.group(2).strip().strip('"')
 
 print('  Fetching MAC address table...')
-mac_to_port = {}
+mac_to_port={}
 for line in walk('1.3.6.1.2.1.17.4.3.1.2').split('\n'):
-    m = re.match(
-        r'.*17\.4\.3\.1\.2\.(\d+\.\d+\.\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',
-        line)
+    m=re.match(r'.*17\.4\.3\.1\.2\.(\d+\.\d+\.\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',line)
     if m:
-        mac = ':'.join('{:02x}'.format(int(o)) for o in m.group(1).split('.'))
-        mac_to_port[mac] = m.group(2)
+        mac=':'.join('{:02x}'.format(int(o)) for o in m.group(1).split('.'))
+        mac_to_port[mac]=m.group(2)
 
-# Cisco per-VLAN community if standard bridge MIB returned 0 MACs
 if not mac_to_port and vlan_names:
     print('  Standard bridge MIB: 0 MACs -- trying Cisco per-VLAN communities...')
     for vid in list(vlan_names.keys())[:10]:
-        vlan_comm = '{0}@{1}'.format(community, vid)
-        for line in walk('1.3.6.1.2.1.17.4.3.1.2', comm=vlan_comm).split('\n'):
-            m = re.match(
-                r'.*17\.4\.3\.1\.2\.(\d+\.\d+\.\d+\.\d+\.\d+\.\d+)'
-                r'\s*=\s*INTEGER:\s*(\d+)', line)
+        vlan_comm='{0}@{1}'.format(community,vid)
+        for line in walk('1.3.6.1.2.1.17.4.3.1.2',comm=vlan_comm).split('\n'):
+            m=re.match(r'.*17\.4\.3\.1\.2\.(\d+\.\d+\.\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',line)
             if m:
-                mac = ':'.join(
-                    '{:02x}'.format(int(o)) for o in m.group(1).split('.'))
-                mac_to_port[mac] = m.group(2)
+                mac=':'.join('{:02x}'.format(int(o)) for o in m.group(1).split('.'))
+                mac_to_port[mac]=m.group(2)
         if mac_to_port:
-            print('  Found MACs via VLAN community @{0}'.format(vid))
-            break
+            print('  Found MACs via community @{0}'.format(vid)); break
 
-print('  Found {0} MAC table entries'.format(len(mac_to_port)))
-
-# ARP reverse lookup
-arp_map = {}
+print('  Found {0} MAC entries'.format(len(mac_to_port)))
+arp_map={}
 for line in walk('1.3.6.1.2.1.4.22.1.2').split('\n'):
-    m = re.search(r'\.(\d+\.\d+\.\d+\.\d+)\s*=\s*(?:STRING|Hex-STRING):\s*(.+)',
-                  line)
-    if m and '4.22.1.2' in line:
-        arp_map[m.group(2).strip().lower()] = m.group(1)
+    m=re.search(r'\.(\d+\.\d+\.\d+\.\d+)\s*=\s*(?:STRING|Hex-STRING):\s*(.+)',line)
+    if m and '4.22.1.2' in line: arp_map[m.group(2).strip().lower()]=m.group(1)
 
-# Build per-interface entries (all interfaces, with or without MACs)
-if_entries = {}
-for idx, name in if_names.items():
-    bports = [bp for bp, ii in port_to_if.items() if ii == idx]
-    vlan = ''
+if_entries={}
+for idx,name in if_names.items():
+    bports=[bp for bp,ii in port_to_if.items() if ii==idx]
+    vlan=''
     for bp in bports:
-        if bp in port_vlan:
-            vlan = port_vlan[bp]; break
-    if not vlan and idx in port_vlan:
-        vlan = port_vlan[idx]
-
-    macs_on_port = [
-        mac for mac, bp in mac_to_port.items()
-        if port_to_if.get(bp, bp) == idx
-    ]
-    remote_ips = []
+        if bp in port_vlan: vlan=port_vlan[bp]; break
+    if not vlan and idx in port_vlan: vlan=port_vlan[idx]
+    macs_on_port=[mac for mac,bp in mac_to_port.items()
+                  if port_to_if.get(bp,bp)==idx]
+    remote_ips=[]
     for mac in macs_on_port:
-        mac_norm = mac.replace(':', '').lower()
-        for k, v in arp_map.items():
-            if mac_norm in k.replace(':', '').replace(' ', ''):
+        mn=mac.replace(':','').lower()
+        for k,v in arp_map.items():
+            if mn in k.replace(':','').replace(' ',''):
                 remote_ips.append(v); break
+    spd=if_speed.get(idx,'0')
+    spd_m=str(int(spd)//1000000)+'M' if spd.isdigit() else '?'
+    if_entries[idx]={'if_index':idx,'if_name':name,
+        'admin':if_admin.get(idx,'?'),'oper':if_status.get(idx,'?'),
+        'speed':spd_m,'mac':if_mac.get(idx,''),
+        'vlan':vlan,'vlan_name':vlan_names.get(str(vlan),''),
+        'clients':macs_on_port,'remote_ips':remote_ips}
 
-    spd = if_speed.get(idx, '0')
-    spd_mbps = str(int(spd) // 1000000) + 'M' if spd.isdigit() else '?'
+port_entries=sorted(if_entries.values(),key=lambda x:x['if_name'])
+out_file=os.path.join(disc_dir,'switchport_'+ip.replace('.', '-')+'.json')
+with open(out_file,'w') as f:
+    json.dump({'switch_ip':ip,'interfaces':port_entries,
+               'vlan_names':vlan_names,'interface_count':len(if_names),
+               'mac_count':len(mac_to_port)},f,indent=2)
 
-    if_entries[idx] = {
-        'if_index':   idx,
-        'if_name':    name,
-        'admin':      if_admin.get(idx, '?'),
-        'oper':       if_status.get(idx, '?'),
-        'speed':      spd_mbps,
-        'mac':        if_mac.get(idx, ''),
-        'vlan':       vlan,
-        'vlan_name':  vlan_names.get(str(vlan), ''),
-        'clients':    macs_on_port,
-        'remote_ips': remote_ips,
-    }
-
-port_entries = sorted(if_entries.values(), key=lambda x: x['if_name'])
-
-out_file = os.path.join(
-    disc_dir, 'switchport_' + ip.replace('.', '-') + '.json')
-with open(out_file, 'w') as f:
-    json.dump({'switch_ip': ip, 'interfaces': port_entries,
-               'vlan_names': vlan_names,
-               'interface_count': len(if_names),
-               'mac_count': len(mac_to_port)}, f, indent=2)
-
-print('  Saved: ' + out_file)
-print('\n  Switch     : ' + ip)
+print('  Saved: '+out_file)
+print('\n  Switch     : '+ip)
 print('  Interfaces : {0}'.format(len(if_names)))
 print('  MAC entries: {0}'.format(len(mac_to_port)))
 if vlan_names:
-    pairs = sorted(vlan_names.items(),
-                   key=lambda x: int(x[0]) if x[0].isdigit() else 0)[:10]
-    print('  VLANs      : ' + ', '.join('{0}={1}'.format(k, v)
-                                        for k, v in pairs))
+    pairs=sorted(vlan_names.items(),key=lambda x:int(x[0]) if x[0].isdigit() else 0)[:10]
+    print('  VLANs      : '+', '.join('{0}={1}'.format(k,v) for k,v in pairs))
 print()
-
-hdr = '  {:<24} {:<5} {:<5} {:<8} {:<6} {:<18} {:<17} {}'.format(
-    'Interface', 'Adm', 'Oper', 'Speed', 'VLAN', 'VLAN Name',
-    'Port MAC', 'Remote IPs / Client MACs')
-print(hdr)
-print('  ' + '-' * 110)
+hdr='  {:<24} {:<5} {:<5} {:<8} {:<6} {:<18} {:<17} {}'.format(
+    'Interface','Adm','Oper','Speed','VLAN','VLAN Name','Port MAC','Remote IPs / Clients')
+print(hdr); print('  '+'-'*110)
 for e in port_entries:
-    clients_str = ', '.join(e['remote_ips']) if e['remote_ips'] \
-        else ', '.join(e['clients'][:3])
+    cl=', '.join(e['remote_ips']) if e['remote_ips'] else ', '.join(e['clients'][:3])
     print('  {:<24} {:<5} {:<5} {:<8} {:<6} {:<18} {:<17} {}'.format(
-        e['if_name'][:23],
-        e['admin'][:4],
-        e['oper'][:4],
-        e['speed'][:7],
-        str(e['vlan'])[:5],
-        e['vlan_name'][:17],
-        e['mac'][:16],
-        clients_str[:50]))
+        e['if_name'][:23],e['admin'][:4],e['oper'][:4],e['speed'][:7],
+        str(e['vlan'])[:5],e['vlan_name'][:17],e['mac'][:16],cl[:50]))
 if not port_entries:
     print('  (No interfaces found -- check SNMP community and device support)')
 PYEOF
@@ -1758,8 +1653,7 @@ PYEOF
 sync_to_netbox() {
     local results_file="${1:-}"
     [[ -z "$results_file" ]] \
-        && results_file=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
-            | head -1)
+        && results_file=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null | head -1)
     [[ ! -f "$results_file" ]] \
         && { log_error "No results file found"; pause; return 1; }
 
@@ -1769,7 +1663,6 @@ sync_to_netbox() {
         read -rp "  Enter NetBox API Token: " NETBOX_API_TOKEN; save_config
     fi
 
-    # Two-step reachability check
     if ! nc -z -w 5 localhost "${NETBOX_PORT}" 2>/dev/null; then
         log_error "NetBox port ${NETBOX_PORT} not reachable -- is it running?"
         log_info  "Start: Menu -> NetBox Management -> Start NetBox"
@@ -1784,11 +1677,8 @@ sync_to_netbox() {
         log_info  "Token : ${NETBOX_API_TOKEN:0:12}..."
         log_info  "Creds : cat $BASE_DIR/netbox-credentials.txt"
         read -rp "  Enter correct token (blank to cancel): " new_tok
-        if [[ -n "$new_tok" ]]; then
-            NETBOX_API_TOKEN="$new_tok"; save_config
-        else
-            pause; return 1
-        fi
+        if [[ -n "$new_tok" ]]; then NETBOX_API_TOKEN="$new_tok"; save_config
+        else pause; return 1; fi
     elif [[ "$http_code" != "200" ]]; then
         log_error "NetBox API HTTP $http_code"
         pause; return 1
@@ -1811,7 +1701,7 @@ sync_to_netbox() {
         hn=$(echo "$host"       | jq -r '.hostname // "unknown"')
         role=$(echo "$host"     | jq -r '.device_role // "Endpoint"')
         mfr=$(echo "$host"      | jq -r '.manufacturer // "Unknown"')
-        model=$(echo "$host"    | jq -r '.model // "Unknown"' | cut -c1-100)
+        model=$(echo "$host"    | jq -r '.model // "Unknown"' | cut -c1-64)
         os=$(echo "$host"       | jq -r '.os // ""')
         serial=$(echo "$host"   | jq -r '.serial // ""')
         loc=$(echo "$host"      | jq -r '.snmp_details.sys_location // ""')
@@ -1839,7 +1729,6 @@ sync_to_netbox() {
             printf "${R}FAIL${NC}\n"; (( fail++ )); continue
         fi
 
-        # Management interface + primary IP
         local mac_addr mgmt_id
         mac_addr=$(echo "$host" | jq -r '.mac // ""')
         mgmt_id=$(nb_add_interface \
@@ -1849,7 +1738,6 @@ sync_to_netbox() {
             nb_add_ip "$ip" "$dev_id" "$mgmt_id" >/dev/null 2>&1 || true
         fi
 
-        # SNMP interfaces with IPs and VLANs
         local ip_table_json vlan_pvid_json vlan_names_json lldp_json cdp_json
         ip_table_json=$(echo "$host"    | jq -c '.ip_table // []')
         vlan_pvid_json=$(echo "$host"   | jq -c '.vlan_pvid // {}')
@@ -1871,8 +1759,6 @@ sync_to_netbox() {
                 161) nb_type="ieee802-11a"       ;;
                 24)  nb_type="virtual"           ;;
             esac
-
-            # Interface description from LLDP/CDP
             lldp_d=$(echo "$lldp_json" | jq -r \
                 "[.[] | select(.port_id==\"$if_name\" or .port_desc==\"$if_name\")
                   | \"LLDP: \"+(.sys_name // \"?\")] | join(\"; \")" \
@@ -1888,34 +1774,32 @@ sync_to_netbox() {
                 "$if_mac" "${if_desc:0:200}" 2>/dev/null) || true
             [[ -z "$if_id" || ! "$if_id" =~ ^[0-9]+$ ]] && continue
 
-            # Assign IP from SNMP IP address table
+            # Assign IP from SNMP ip_table; skip unroutable addresses (v2.0.9)
             local iface_ip iface_mask iface_prefix
             iface_ip=$(echo "$ip_table_json" | jq -r \
                 "[.[] | select(.if_index==\"$if_idx\") | .ip][0] // empty" \
                 2>/dev/null || echo "")
-                # Skip unroutable/invalid addresses before sending to NetBox
-                if [[ -n "$iface_ip" \
-                      && "$iface_ip" != "0.0.0.0" \
-                      && "$iface_ip" != 127.* ]]; then
-                    iface_mask=$(echo "$ip_table_json" | jq -r \
-                        "[.[] | select(.ip==\"$iface_ip\") | .mask][0] \
-                         // \"255.255.255.0\"" 2>/dev/null || echo "255.255.255.0")
-                    iface_prefix=$(python3 -c \
-                        "import ipaddress; \
-print(ipaddress.IPv4Network(\'$iface_ip/$iface_mask\',strict=False).prefixlen)" \
-                        2>/dev/null || echo "24")
-                    nb_add_ip "${iface_ip}/${iface_prefix}" "" "$if_id" \
-                        >/dev/null 2>&1 || true
-                fi
+            if [[ -n "$iface_ip" \
+                  && "$iface_ip" != "0.0.0.0" \
+                  && "$iface_ip" != 127.* \
+                  && "$iface_ip" != 169.254.* ]]; then
+                iface_mask=$(echo "$ip_table_json" | jq -r \
+                    "[.[] | select(.ip==\"$iface_ip\") | .mask][0] \
+                     // \"255.255.255.0\"" 2>/dev/null || echo "255.255.255.0")
+                iface_prefix=$(python3 -c \
+                    "import ipaddress; \
+print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
+                    2>/dev/null || echo "24")
+                nb_add_ip "${iface_ip}/${iface_prefix}" "" "$if_id" \
+                    >/dev/null 2>&1 || true
+            fi
 
-            # Assign VLAN from dot1qPvid
             local pvid vlan_nm vlan_id
             pvid=$(echo "$vlan_pvid_json" | jq -r \
                 ".\"$if_idx\" // empty" 2>/dev/null || echo "")
             if [[ -n "$pvid" && "$pvid" =~ ^[0-9]+$ && "$pvid" != "0" ]]; then
                 vlan_nm=$(echo "$vlan_names_json" | jq -r \
-                    ".\"$pvid\" // \"VLAN-$pvid\"" 2>/dev/null \
-                    || echo "VLAN-$pvid")
+                    ".\"$pvid\" // \"VLAN-$pvid\"" 2>/dev/null || echo "VLAN-$pvid")
                 vlan_id=$(nb_get_or_create_vlan \
                     "$pvid" "$vlan_nm" "$site_id" 2>/dev/null) || true
                 if [[ -n "$vlan_id" && "$vlan_id" =~ ^[0-9]+$ ]]; then
@@ -1926,7 +1810,6 @@ print(ipaddress.IPv4Network(\'$iface_ip/$iface_mask\',strict=False).prefixlen)" 
             fi
         done < <(echo "$host" | jq -c '.interfaces[]?' 2>/dev/null || true)
 
-        # CDP/LLDP topology cables
         local nbr
         while IFS= read -r nbr; do
             local nbr_name nbr_local_port nbr_remote_port
@@ -1975,15 +1858,13 @@ menu_credentials() {
         printf "${C}======= Credential Management =======${NC}\n\n"
         local creds; creds=$(read_creds)
         printf "  ${W}SNMP v1/v2c:${NC}\n"
-        echo "$creds" | jq -r '.snmp_communities[] | "    * "+.' 2>/dev/null \
-            || echo "    (none)"
+        echo "$creds" | jq -r '.snmp_communities[] | "    * "+.' 2>/dev/null || echo "    (none)"
         printf "\n  ${W}SNMP v3:${NC}\n"
         echo "$creds" | jq -r \
             '.snmp_v3[] | "    * \(.username) [\(.auth_proto)/\(.priv_proto)]"' \
             2>/dev/null || echo "    (none)"
         printf "\n  ${W}SSH:${NC}\n"
-        echo "$creds" | jq -r \
-            '.ssh_credentials[] | "    * \(.username)"' \
+        echo "$creds" | jq -r '.ssh_credentials[] | "    * \(.username)"' \
             2>/dev/null || echo "    (none)"
         printf "\n  ${W}Device overrides:${NC}\n"
         echo "$creds" | jq -r \
@@ -2003,66 +1884,57 @@ menu_credentials() {
         read -rp $'\nChoice: ' c
         local v3e sshe deve
         case "$c" in
-        1) read -rp "  Community: " x
-           write_creds "$(echo "$creds" | jq ".snmp_communities += [\"$x\"]")"
-           log_info "Added: $x" ;;
-        2) read -rp "  Remove: " x
-           write_creds "$(echo "$creds" \
-               | jq "del(.snmp_communities[] | select(.==\"$x\"))")" ;;
-        3) read -rp "  Username: " u
-           read -rp "  Auth proto [SHA]: " ap; ap=${ap:-SHA}
-           read -rsp "  Auth pass: " ap2; echo
-           read -rp "  Priv proto [AES]: " pp; pp=${pp:-AES}
-           read -rsp "  Priv pass: " pp2; echo
-           v3e=$(jq -n \
-               --arg u "$u" --arg ap "$ap" --arg ap2 "$ap2" \
-               --arg pp "$pp" --arg pp2 "$pp2" \
-               '{username:$u,auth_proto:$ap,auth_pass:$ap2,
-                 priv_proto:$pp,priv_pass:$pp2}')
-           write_creds "$(echo "$creds" | jq ".snmp_v3 += [$v3e]")" ;;
-        4) read -rp "  Username: " u
-           read -rsp "  Password (blank=key): " p; echo
-           read -rp "  Key file (blank=password): " k
-           read -rsp "  Enable pass (opt): " e; echo
-           sshe=$(jq -n \
-               --arg u "$u" --arg p "$p" --arg k "$k" --arg e "$e" \
-               '{username:$u,
-                 password:(if $p!="" then $p else null end),
-                 key_file:(if $k!="" then $k else null end),
-                 enable_pass:(if $e!="" then $e else null end)}')
-           write_creds "$(echo "$creds" | jq ".ssh_credentials += [$sshe]")" ;;
-        5) read -rp "  Remove username: " u
-           write_creds "$(echo "$creds" \
-               | jq "del(.ssh_credentials[] | select(.username==\"$u\"))")" ;;
-        6) read -rp "  Device IP: " dip
-           read -rp "  SNMP community: " dc
-           read -rp "  SSH username: " du
-           read -rsp "  SSH password: " dp; echo
-           read -rp "  SSH key file: " dk
-           deve=$(jq -n \
-               --arg c "$dc" --arg u "$du" --arg p "$dp" --arg k "$dk" \
-               '{snmp_community:(if $c!="" then $c else null end),
-                 ssh_username:(if $u!="" then $u else null end),
-                 ssh_password:(if $p!="" then $p else null end),
-                 ssh_key:(if $k!="" then $k else null end)}')
-           write_creds "$(echo "$creds" \
-               | jq ".device_overrides[\"$dip\"] = $deve")" ;;
-        7) read -rp "  Device IP: " dip
-           write_creds "$(echo "$creds" \
-               | jq "del(.device_overrides[\"$dip\"])")" ;;
-        8) read -rp "  JSON file: " jf
-           if [[ -f "$jf" ]]; then
-               write_creds "$(cat "$jf")"
-               log_info "Imported: $jf"
-           else
-               printf "${R}  Not found${NC}\n"; sleep 1
-           fi ;;
-        9) printf "${R}  WARNING: plaintext export!${NC}\n"
-           confirm "Continue?" || continue
-           read -rp "  Output file: " of
-           read_creds > "$of"; chmod 600 "$of"
-           log_warn "Exported: $of" ;;
-        0) return ;;
+        1)  read -rp "  Community: " x
+            write_creds "$(echo "$creds" | jq ".snmp_communities += [\"$x\"]")"
+            log_info "Added: $x" ;;
+        2)  read -rp "  Remove: " x
+            write_creds "$(echo "$creds" \
+                | jq "del(.snmp_communities[] | select(.==\"$x\"))")" ;;
+        3)  read -rp "  Username: " u
+            read -rp "  Auth proto [SHA]: " ap; ap=${ap:-SHA}
+            read -rsp "  Auth pass: " ap2; echo
+            read -rp "  Priv proto [AES]: " pp; pp=${pp:-AES}
+            read -rsp "  Priv pass: " pp2; echo
+            v3e=$(jq -n --arg u "$u" --arg ap "$ap" --arg ap2 "$ap2" \
+                --arg pp "$pp" --arg pp2 "$pp2" \
+                '{username:$u,auth_proto:$ap,auth_pass:$ap2,priv_proto:$pp,priv_pass:$pp2}')
+            write_creds "$(echo "$creds" | jq ".snmp_v3 += [$v3e]")" ;;
+        4)  read -rp "  Username: " u
+            read -rsp "  Password (blank=key): " p; echo
+            read -rp "  Key file (blank=password): " k
+            read -rsp "  Enable pass (opt): " e; echo
+            sshe=$(jq -n --arg u "$u" --arg p "$p" --arg k "$k" --arg e "$e" \
+                '{username:$u,password:(if $p!="" then $p else null end),
+                  key_file:(if $k!="" then $k else null end),
+                  enable_pass:(if $e!="" then $e else null end)}')
+            write_creds "$(echo "$creds" | jq ".ssh_credentials += [$sshe]")" ;;
+        5)  read -rp "  Remove username: " u
+            write_creds "$(echo "$creds" \
+                | jq "del(.ssh_credentials[] | select(.username==\"$u\"))")" ;;
+        6)  read -rp "  Device IP: " dip
+            read -rp "  SNMP community: " dc
+            read -rp "  SSH username: " du
+            read -rsp "  SSH password: " dp; echo
+            read -rp "  SSH key file: " dk
+            deve=$(jq -n --arg c "$dc" --arg u "$du" --arg p "$dp" --arg k "$dk" \
+                '{snmp_community:(if $c!="" then $c else null end),
+                  ssh_username:(if $u!="" then $u else null end),
+                  ssh_password:(if $p!="" then $p else null end),
+                  ssh_key:(if $k!="" then $k else null end)}')
+            write_creds "$(echo "$creds" \
+                | jq ".device_overrides[\"$dip\"] = $deve")" ;;
+        7)  read -rp "  Device IP: " dip
+            write_creds "$(echo "$creds" \
+                | jq "del(.device_overrides[\"$dip\"])")" ;;
+        8)  read -rp "  JSON file: " jf
+            if [[ -f "$jf" ]]; then write_creds "$(cat "$jf")"
+                log_info "Imported: $jf"
+            else printf "${R}  Not found${NC}\n"; sleep 1; fi ;;
+        9)  printf "${R}  WARNING: plaintext export!${NC}\n"
+            confirm "Continue?" || continue
+            read -rp "  Output file: " of
+            read_creds > "$of"; chmod 600 "$of"; log_warn "Exported: $of" ;;
+        0)  return ;;
         esac
         pause
     done
@@ -2096,7 +1968,7 @@ menu_disc_settings() {
         6) read -rp "  Port: " NETBOX_PORT
            NETBOX_API_URL="http://localhost:${NETBOX_PORT}";    save_config ;;
         7) (( DEBUG_MODE ^= 1 ));                               save_config ;;
-        8) read -rp "  Network (CIDR): " snet
+        8) read -rp "  Networks (CIDRs or file): " snet
            read -rp "  Cron (e.g. 0 2 * * *): " scron
            (crontab -l 2>/dev/null
             echo "$scron root $SCRIPT_PATH --auto-scan '$snet' \
@@ -2150,7 +2022,8 @@ menu_netbox_mgmt() {
         5)  read -rp "  Token: " NETBOX_API_TOKEN; save_config ;;
         6)  cd "$NETBOX_DIR"
             local regen_py regen_result
-            regen_py="from users.models import Token
+            regen_py="
+from users.models import Token
 from django.contrib.auth.models import User
 u=User.objects.get(username='admin')
 t=Token.objects.create(user=u)
@@ -2163,9 +2036,9 @@ PYEOF
             if [[ "$regen_result" == TOKEN:* ]]; then
                 NETBOX_API_TOKEN="${regen_result#TOKEN:}"; save_config
                 log_ok "New token: ${NETBOX_API_TOKEN:0:12}..."
-            else
-                log_error "Token generation failed"
-            fi ;;
+                sed -i "s|^API Token:.*|API Token: ${NETBOX_API_TOKEN}|" \
+                    "$BASE_DIR/netbox-credentials.txt" 2>/dev/null || true
+            else log_error "Token generation failed"; fi ;;
         7)  local bk="$BASE_DIR/backup_$(date +%Y%m%d_%H%M%S).sql.gz"
             cd "$NETBOX_DIR" && $DOCKER_COMPOSE exec -T postgres \
                 pg_dump -U netbox netbox | gzip > "$bk"
@@ -2218,8 +2091,7 @@ menu_logs() {
            [[ -z "$latest" ]] && { echo "  No results"; pause; continue; }
            cnt=$(jq '.hosts | length' "$latest")
            printf "\n${W}%s${NC}  (hosts: %s)\n\n" "$latest" "$cnt"
-           printf "  %-16s %-28s %-16s %-16s %s\n" \
-               IP Hostname Role Manufacturer OS
+           printf "  %-16s %-28s %-16s %-16s %s\n" IP Hostname Role Manufacturer OS
            printf "  %s\n" "$(printf '%0.s-' {1..88})"
            jq -r '.hosts[] | [.ip,.hostname,.device_role,
                .manufacturer,(.os // "N/A")] | @tsv' "$latest" 2>/dev/null \
@@ -2243,72 +2115,109 @@ menu_discovery() {
     while true; do
         banner
         printf "${C}======= Network Discovery =======${NC}\n\n"
-        echo "  1) Discover Network (CIDR)"
+        echo "  1) Discover Network(s)"
+        echo "     (single CIDR, comma-separated CIDRs, or file path)"
         echo "  2) Scan Single Host"
         echo "  3) Scan Host List from File"
+        echo "     (IPs and/or CIDRs; # comments; whitespace stripped)"
         echo "  4) Map Switchports (SNMP)"
         echo "  5) View Latest Results"
         echo "  6) Sync Last Results to NetBox"
         echo "  7) Full Auto: Discover + Sync"
         echo "  0) Back"
         read -rp $'\nChoice: ' c
-        local net sip hf swip latest cnt
+        local input sip hf swip latest cnt
         case "$c" in
-        1) read -rp "  Network CIDR (e.g. 192.168.1.0/24): " net
-           if valid_cidr "$net" || valid_ip "${net%%/*}"; then
-               init_scan_session "$net"
-               discover_live_hosts "$net"
-               if [[ -s "$LIVE_HOSTS_FILE" ]]; then
-                   scan_all_hosts
-                   log_ok "Results: $DISC_RESULTS"
-                   confirm "  Sync to NetBox?" \
-                       && sync_to_netbox "$DISC_RESULTS"
-               fi
-           else printf "${R}  Invalid${NC}\n"; fi ;;
-        2) read -rp "  IP: " sip
-           if valid_ip "$sip"; then
-               init_scan_session "$sip"
-               echo "$sip" > "$LIVE_HOSTS_FILE"
-               scan_all_hosts
-               jq '.hosts[0] | del(.ports,.interfaces,
-                   .mac_port_map,.arp_entries)' \
-                   "$DISC_RESULTS" 2>/dev/null || cat "$DISC_RESULTS"
-           else printf "${R}  Invalid IP${NC}\n"; fi ;;
-        3) read -rp "  File path: " hf
-           if [[ -f "$hf" ]]; then
-               init_scan_session "file:$hf"
-               grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' "$hf" \
-                   > "$LIVE_HOSTS_FILE"
-               cnt=$(wc -l < "$LIVE_HOSTS_FILE")
-               log_info "Loaded $cnt hosts"
-               scan_all_hosts
-               confirm "  Sync to NetBox?" && sync_to_netbox "$DISC_RESULTS"
-           else printf "${R}  Not found${NC}\n"; fi ;;
-        4) read -rp "  Switch IP: " swip
-           valid_ip "$swip" && map_switchports "$swip" \
-               || printf "${R}  Invalid IP${NC}\n" ;;
-        5) latest=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null | head -1)
-           [[ -z "$latest" ]] && { echo "  No results"; pause; continue; }
-           cnt=$(jq '.hosts | length' "$latest")
-           printf "\n${W}%s  (%s hosts)${NC}\n\n" "$latest" "$cnt"
-           printf "  %-16s %-28s %-16s %-16s %s\n" IP Hostname Role Manufacturer OS
-           jq -r '.hosts[] | [.ip,.hostname,.device_role,
-               .manufacturer,(.os // "N/A")] | @tsv' "$latest" 2>/dev/null \
-               | while IFS=$'\t' read -r i h r m o; do
-                   printf "  %-16s %-28s %-16s %-16s %s\n" \
-                       "$i" "${h:0:27}" "${r:0:15}" "${m:0:15}" "${o:0:26}"
-                 done | head -80 ;;
-        6) sync_to_netbox ;;
-        7) read -rp "  Network CIDR: " net
-           if valid_cidr "$net" || valid_ip "${net%%/*}"; then
-               init_scan_session "$net"
-               discover_live_hosts "$net"
-               if [[ -s "$LIVE_HOSTS_FILE" ]]; then
-                   scan_all_hosts
-                   sync_to_netbox "$DISC_RESULTS"
-               fi
-           else printf "${R}  Invalid${NC}\n"; fi ;;
-        0) return ;;
+        1)  printf "  Enter target(s):\n"
+            printf "  Examples: 192.168.1.0/24\n"
+            printf "            192.168.1.0/24,10.0.0.0/8\n"
+            printf "            /path/to/subnets.txt\n"
+            read -rp "  > " input
+            if [[ -z "$input" ]]; then
+                printf "${R}  No input${NC}\n"; pause; continue
+            fi
+            # Parse targets
+            local target_list; target_list=$(parse_targets "$input")
+            if [[ -z "$target_list" ]]; then
+                printf "${R}  No valid targets found in input${NC}\n"
+                pause; continue
+            fi
+            local target_count; target_count=$(echo "$target_list" | wc -l)
+            log_info "Parsed $target_count target(s)"
+            printf "  Targets:\n"
+            echo "$target_list" | while read -r t; do printf "    - %s\n" "$t"; done
+            echo ""
+            init_scan_session "$input"
+            # Run discovery for all targets
+            local targets_arr=()
+            while IFS= read -r t; do targets_arr+=("$t"); done <<< "$target_list"
+            discover_targets "${targets_arr[@]}"
+            if [[ -s "$LIVE_HOSTS_FILE" ]]; then
+                scan_all_hosts
+                log_ok "Results: $DISC_RESULTS"
+                confirm "  Sync to NetBox?" && sync_to_netbox "$DISC_RESULTS"
+            else
+                printf "  ${Y}No live hosts found${NC}\n"
+            fi ;;
+        2)  read -rp "  IP: " sip
+            if valid_ip "$sip"; then
+                init_scan_session "$sip"
+                echo "$sip" > "$LIVE_HOSTS_FILE"
+                scan_all_hosts
+                jq '.hosts[0] | del(.ports,.interfaces,.mac_port_map,.arp_entries)' \
+                    "$DISC_RESULTS" 2>/dev/null || cat "$DISC_RESULTS"
+            else printf "${R}  Invalid IP${NC}\n"; fi ;;
+        3)  printf "  File format: one IP or CIDR per line\n"
+            printf "  Lines starting with # are comments\n"
+            printf "  Inline comments and whitespace are stripped\n"
+            read -rp "  File path: " hf
+            if [[ ! -f "$hf" ]]; then
+                printf "${R}  File not found${NC}\n"; pause; continue
+            fi
+            init_scan_session "file:$hf"
+            expand_host_file "$hf" > "$LIVE_HOSTS_FILE"
+            cnt=$(wc -l < "$LIVE_HOSTS_FILE")
+            log_info "Loaded $cnt hosts/IPs from $hf"
+            if [[ "$cnt" -eq 0 ]]; then
+                printf "${Y}  No valid IPs in file${NC}\n"; pause; continue
+            fi
+            scan_all_hosts
+            confirm "  Sync to NetBox?" && sync_to_netbox "$DISC_RESULTS" ;;
+        4)  read -rp "  Switch IP: " swip
+            valid_ip "$swip" && map_switchports "$swip" \
+                || printf "${R}  Invalid IP${NC}\n" ;;
+        5)  latest=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null | head -1)
+            [[ -z "$latest" ]] && { echo "  No results"; pause; continue; }
+            cnt=$(jq '.hosts | length' "$latest")
+            printf "\n${W}%s  (%s hosts)${NC}\n\n" "$latest" "$cnt"
+            printf "  %-16s %-28s %-16s %-16s %s\n" IP Hostname Role Manufacturer OS
+            jq -r '.hosts[] | [.ip,.hostname,.device_role,
+                .manufacturer,(.os // "N/A")] | @tsv' "$latest" 2>/dev/null \
+                | while IFS=$'\t' read -r i h r m o; do
+                    printf "  %-16s %-28s %-16s %-16s %s\n" \
+                        "$i" "${h:0:27}" "${r:0:15}" "${m:0:15}" "${o:0:26}"
+                  done | head -80 ;;
+        6)  sync_to_netbox ;;
+        7)  printf "  Enter target(s) (CIDR, comma-separated, or file):\n"
+            read -rp "  > " input
+            if [[ -z "$input" ]]; then
+                printf "${R}  No input${NC}\n"; pause; continue
+            fi
+            local target_list; target_list=$(parse_targets "$input")
+            if [[ -z "$target_list" ]]; then
+                printf "${R}  No valid targets${NC}\n"; pause; continue
+            fi
+            init_scan_session "$input"
+            local targets_arr=()
+            while IFS= read -r t; do targets_arr+=("$t"); done <<< "$target_list"
+            discover_targets "${targets_arr[@]}"
+            if [[ -s "$LIVE_HOSTS_FILE" ]]; then
+                scan_all_hosts
+                sync_to_netbox "$DISC_RESULTS"
+            else
+                printf "  ${Y}No live hosts found${NC}\n"
+            fi ;;
+        0)  return ;;
         esac
         pause
     done
@@ -2324,8 +2233,8 @@ main_menu() {
         $DOCKER_COMPOSE -f "$NETBOX_DIR/docker-compose.yml" \
             ps 2>/dev/null | grep -q "Up" && nb_st="Running"
         cmd_exists docker && dk_st="OK"
-        printf "  NetBox: ${W}%s${NC}   Docker: ${W}%s${NC}\n" \
-            "$nb_st" "$dk_st"
+        printf "  NetBox: ${W}%s${NC}   Docker: ${W}%s${NC}   User: ${D}%s${NC}\n" \
+            "$nb_st" "$dk_st" "$REAL_USER"
         printf "  Token : ${D}%s...${NC}\n" "${NETBOX_API_TOKEN:0:12}"
         echo ""
         printf "${C}  +--------------------------------------------+${NC}\n"
@@ -2349,8 +2258,7 @@ main_menu() {
         6) menu_netbox_mgmt ;;
         7) menu_logs ;;
         8) install_deps && deploy_netbox ;;
-        0) printf "\n  ${G}Goodbye!${NC}\n\n"
-           log_info "Session ended"; exit 0 ;;
+        0) printf "\n  ${G}Goodbye!${NC}\n\n"; log_info "Session ended"; exit 0 ;;
         *) printf "  ${R}Invalid choice${NC}\n"; sleep 1 ;;
         esac
     done
@@ -2367,16 +2275,20 @@ main() {
     detect_docker_compose
     log_info "================================================"
     log_info "NetBox Discovery Suite v${SCRIPT_VERSION} started"
-    log_info "User: $(id -un)  PID: $$  Compose: $DOCKER_COMPOSE"
+    log_info "User: $(id -un) (real: $REAL_USER)  PID: $$  Compose: $DOCKER_COMPOSE"
     log_info "================================================"
 
-    # Non-interactive: cron auto-scan
+    # Non-interactive: cron auto-scan (accepts multi-target input)
     if [[ "${1:-}" == "--auto-scan" && -n "${2:-}" ]]; then
-        init_scan_session "$2"
-        discover_live_hosts "$2"
-        [[ -s "$LIVE_HOSTS_FILE" ]] \
-            && scan_all_hosts \
-            && sync_to_netbox "$DISC_RESULTS"
+        local target_list; target_list=$(parse_targets "$2")
+        if [[ -n "$target_list" ]]; then
+            init_scan_session "$2"
+            local targets_arr=()
+            while IFS= read -r t; do targets_arr+=("$t"); done <<< "$target_list"
+            discover_targets "${targets_arr[@]}"
+            [[ -s "$LIVE_HOSTS_FILE" ]] \
+                && scan_all_hosts && sync_to_netbox "$DISC_RESULTS"
+        fi
         log_info "Auto-scan complete"; exit 0
     fi
 
