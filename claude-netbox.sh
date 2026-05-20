@@ -2,6 +2,7 @@
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
 #  Version: 2.1.0
+#   - 100% working with autodiscovery and adding to Netbox
 # =============================================================================
 #
 #  Changelog v2.0.2:
