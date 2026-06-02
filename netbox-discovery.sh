@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.1.4
+#  Version: 2.1.5
 #
 # In collaboration with ChatGPT, Claude and CoPilot - 20260531 - 1248
 # =============================================================================
@@ -11,7 +11,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.1.4"
+SCRIPT_VERSION="2.1.5"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2324,8 +2324,21 @@ $VerbosePreference     = "SilentlyContinue"
 $DebugPreference       = "SilentlyContinue"
 
 $uri        = $uri.TrimEnd("/")
-$hostName   = $env:COMPUTERNAME
-$clusterName = "Standalone-$hostName"
+# Determine FQDN
+$cs = Get-CimInstance Win32_ComputerSystem
+
+if ($cs.Domain -and $cs.Domain -ne "WORKGROUP") {{
+    # Domain-joined or resolvable DNS domain
+    $hostName = "$($cs.DNSHostName).$($cs.Domain)"
+}} else {{
+    # Standalone or no domain
+    try {{
+        $hostName = ([System.Net.Dns]::GetHostEntry($env:COMPUTERNAME)).HostName
+    }} catch {{
+        $hostName = $env:COMPUTERNAME
+    }}
+}}
+$clusterName = "Standalone-$env:COMPUTERNAME"
 
 $headers = $null
 function New-AuthHeaders {{
