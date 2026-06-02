@@ -1,3 +1,5 @@
+Changelog v2.1.5:
+ - Updated hostname to FQDN and modified clustername to ensure hostname only
 Changelog v2.1.4:
  - Added full Hyper-V host hardware inventory sync:
    * CPU model -> cpu_model (custom field)
