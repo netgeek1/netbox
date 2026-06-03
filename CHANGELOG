@@ -1,3 +1,22 @@
+#  Changelog v2.2.1:
+#   - probe_winrm() lightweight PS: adds IsHyperV flag by checking for
+#     the Hyper-V module; stored in winrm.json and host scan result
+#   - import_hyperv_powershell(): auto_mode param (2nd arg); non-
+#     interactive path uses first stored credential, always executes via
+#     WinRM, skips prompts and pause; used by sync_to_netbox() auto-path
+#   - sync_to_netbox(): after regular device sync, if scan_tier==1
+#     (WinRM) and host.is_hyperv and stored creds exist, auto-runs the
+#     full Hyper-V PS1 so VMs, disks and custom fields sync without
+#     needing the separate import menu option
+#   - PS1 Get-NetboxIPFull: falls back to IP-only search when CIDR not
+#     found; fixes 400 Bad Request when IP exists with different prefix
+#     (e.g. /24 stored, /32 queried after IPAM-prefix fallback)
+#   - PS1 VM IP loop: always PATCHes IP assignment to current NIC;
+#     previously skipped reassignment when IP already had any assignment,
+#     leaving IPs stranded on nmap-created mgmt0 interfaces
+#   - PS1 Set-NetboxVMPrimaryIP: returns bool; "Primary IP set" message
+#     only printed on success, eliminating contradictory error+set output
+#
 #  Changelog v2.2.0:
 #   - parse_targets(): bare IPs now normalise to explicit CIDR via str(net)
 #     (e.g. 192.168.0.241 -> 192.168.0.241/32) so the per-target CIDR
