@@ -1,3 +1,14 @@
+#  Changelog v2.2.2:
+#   - PS1 Assign-IPToNIC: clear-then-assign pattern fixes 400 Bad Request
+#     that occurs when NetBox rejects a direct dcim.interface ->
+#     vminterface reassignment; sends PATCH with null assignment first,
+#     then PATCHes with new vminterface assignment; returns bool
+#   - PS1 Assign-HostIPToNIC: same clear-then-assign pattern
+#   - PS1 VM IP loop: checks Assign-IPToNIC return value before setting
+#     $mgmtIpId so a failed assignment does not become primary_ip4
+#   - PS1: $clusterName changed from "Standalone-{hostname}" to just
+#     "{hostname}" (short computer name); device name retains FQDN
+#
 #  Changelog v2.2.1:
 #   - probe_winrm() lightweight PS: adds IsHyperV flag by checking for
 #     the Hyper-V module; stored in winrm.json and host scan result
