@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.1
+#  Version: 2.2.2
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.1"
+SCRIPT_VERSION="2.2.2"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2399,7 +2399,7 @@ if ($cs.Domain -and $cs.Domain -ne "WORKGROUP") {{
         $hostName = $env:COMPUTERNAME
     }}
 }}
-$clusterName = "Standalone-$env:COMPUTERNAME"
+$clusterName = "$env:COMPUTERNAME"
 
 $headers = $null
 function New-AuthHeaders {{
@@ -2993,9 +2993,21 @@ function Ensure-IPShared {{
 
 function Assign-IPToNIC {{
     param([int]$IpId,[int]$NicId)
+    # Step 1: clear any existing assignment (NetBox 400s on direct
+    # cross-type reassignment, e.g. dcim.interface -> vminterface)
+    try {{
+        Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH `
+            -Body '{"assigned_object_type": null, "assigned_object_id": null}' | Out-Null
+    }} catch {{}}
+    # Step 2: assign to the VM NIC
     $b=@{{assigned_object_type="virtualization.vminterface";assigned_object_id=$NicId}}|ConvertTo-Json
-    try {{Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $b|Out-Null}}
-    catch {{Write-Host "  [WARN] IP $IpId assign to NIC $NicId failed: $($_.Exception.Message)"}}
+    try {{
+        Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $b|Out-Null
+        return $true
+    }} catch {{
+        Write-Host "  [WARN] IP $IpId assign to NIC $NicId failed: $($_.Exception.Message)"
+        return $false
+    }}
 }}
 
 function Set-NetboxVMPrimaryIP {{
@@ -3037,8 +3049,11 @@ function Ensure-HostMac {{
 
 function Assign-HostIPToNIC {{
     param([int]$IpId,[int]$NicId)
-    # Always PATCH -- this reassigns the IP even if it was previously set
-    # on an nmap-created mgmt0 interface on the same device.
+    # Clear any existing assignment first to avoid cross-type 400 errors
+    try {{
+        Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH `
+            -Body '{"assigned_object_type": null, "assigned_object_id": null}' | Out-Null
+    }} catch {{}}
     $b=@{{assigned_object_type="dcim.interface";assigned_object_id=$NicId}}|ConvertTo-Json
     try {{Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $b|Out-Null}}
     catch {{Write-Host "  [WARN] Host IP $IpId assign to NIC $NicId failed: $($_.Exception.Message)"}}
@@ -3200,8 +3215,8 @@ foreach ($ip in $hostIPs) {{
     if ($nicId) {{
         Assign-HostIPToNIC -IpId $ipId -NicId $nicId
         Write-Host "  Assigned $cidr to NIC ID $nicId"
+        if (-not $hostPrimaryIpId) {{$hostPrimaryIpId=$ipId}}
     }}
-    if (-not $hostPrimaryIpId) {{$hostPrimaryIpId=$ipId}}
 }}
 
 if ($hostPrimaryIpId) {{
@@ -3268,17 +3283,19 @@ foreach ($vm in $vms) {{
             if ($exIP) {{
                 $ipId=[int]$exIP.id
                 Ensure-IPShared -IpId $ipId
-                # Always reassign -- handles IPs stranded on nmap mgmt0
-                Assign-IPToNIC -IpId $ipId -NicId $nicId
-                Write-Host "  Assigned/reassigned $cidr to NIC $nicId"
+                if (Assign-IPToNIC -IpId $ipId -NicId $nicId) {{
+                    Write-Host "  Assigned/reassigned $cidr to NIC $nicId"
+                    if (-not $mgmtIpId) {{$mgmtIpId=$ipId}}
+                }}
             }} else {{
                 $newIP=Create-NetboxIP -IP $ipObj -Mask $mask
                 if (-not $newIP) {{continue}}
                 $ipId=[int]$newIP.id
-                Assign-IPToNIC -IpId $ipId -NicId $nicId
-                Write-Host "  Created and assigned $cidr to NIC $nicId"
+                if (Assign-IPToNIC -IpId $ipId -NicId $nicId) {{
+                    Write-Host "  Created and assigned $cidr to NIC $nicId"
+                    if (-not $mgmtIpId) {{$mgmtIpId=$ipId}}
+                }}
             }}
-            if (-not $mgmtIpId) {{$mgmtIpId=$ipId}}
         }}
     }}
     if ($mgmtIpId) {{
