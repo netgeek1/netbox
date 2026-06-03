@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.0
+#  Version: 2.2.1
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1531,9 +1531,12 @@ $nics = Get-NetAdapter -Physical 2>$null | Where-Object { $_.Status -eq "Up" } |
                         MacAddress=($if.MacAddress -replace "-",":").ToUpper();
                         IPAddresses=@($v4.IPAddress); PrefixLens=@([int[]]$v4.PrefixLength) }
         }
+$isHyperV = $false
+try { $isHyperV = ($null -ne (Get-Command Get-VM -ErrorAction SilentlyContinue)) } catch {}
 [ordered]@{ Hostname=$cs.Name; Domain=$cs.Domain; Manufacturer=$cs.Manufacturer;
             Model=$cs.Model; SerialNumber=$bios.SerialNumber; OS=$os.Caption;
             OSVersion=$os.Version; IsServer=($os.ProductType -ne 1);
+            IsHyperV=$isHyperV;
             CPUName=$cpu.Name; CPUCores=[int]$cpu.NumberOfCores;
             MemoryGB=[math]::Round($cs.TotalPhysicalMemory/1GB,2);
             NetworkAdapters=@($nics) } | ConvertTo-Json -Depth 4
@@ -1579,7 +1582,7 @@ bnr=load('banners'); mdns=load('mdns'); winrm=load('winrm')
 host={'ip':ip,'hostname':None,'mac':None,'vendor':None,
       'os':None,'os_accuracy':None,
       'device_role':'Endpoint','manufacturer':'Unknown','model':'Unknown',
-      'serial':'','winrm_nics':[],'scan_tier':4,
+      'serial':'','winrm_nics':[],'scan_tier':4,'is_hyperv':False,
       'ports':nmap.get('ports',[]),'interfaces':snmp.get('interfaces',[]),
       'ip_table':snmp.get('ip_table',[]),'mac_port_map':snmp.get('mac_port_map',[]),
       'vlan_pvid':snmp.get('vlan_pvid',{}),'vlan_names':snmp.get('vlan_names',{}),
@@ -1622,6 +1625,7 @@ if winrm.get('available'):
         'mac':n.get('MacAddress',''),'ips':n.get('IPAddresses',[]) or [],
         'prefix_lens':n.get('PrefixLens',[]) or []}
         for n in (winrm.get('NetworkAdapters') or [])]
+    host['is_hyperv']=bool(winrm.get('IsHyperV',False))
 
 if nmap.get('ports'):         host['discovery_methods'].append('nmap')
 if snmp.get('available'):     host['discovery_methods'].append('snmp')
@@ -2066,6 +2070,20 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
 
         printf "${G}OK${NC}\n"; (( ok++ ))
 
+        # Auto-run full Hyper-V PS1 sync when discovery found a WinRM
+        # host with Hyper-V available and stored credentials exist
+        local _tier _is_hv
+        _tier=$(echo "$host" | jq -r '.scan_tier // 4' 2>/dev/null || echo 4)
+        _is_hv=$(echo "$host" | jq -r '.is_hyperv // false' 2>/dev/null || echo false)
+        if [[ "$_tier" == "1" && "$_is_hv" == "true" ]]; then
+            local _wcc
+            _wcc=$(get_windows_creds_for "$ip" | jq 'length' 2>/dev/null || echo 0)
+            if [[ "${_wcc:-0}" -gt 0 ]]; then
+                log_info "Auto-running Hyper-V PS1 sync for $ip (Hyper-V detected)"
+                import_hyperv_powershell "$ip" "auto"
+            fi
+        fi
+
     done < <(jq -c '.hosts[]' "$results_file")
 
     printf "\n  ${G}Complete:${NC} %d synced  ${R}%d failed${NC}  (total: %d)\n" \
@@ -2250,49 +2268,63 @@ deploy_agents_to_discovered() {
 # For Linux Hyper-V hosts: use deploy_agent_remote() with virtual.hypervisor=true
 # -----------------------------------------------------------------------------
 import_hyperv_powershell() {
-    # Runs the Hyper-V -> NetBox sync PowerShell script on a Windows Hyper-V
-    # host, either via WinRM (pywinrm) or by saving for manual execution.
-    local host_ip="$1"
+    # Runs the Hyper-V -> NetBox sync PS1 on a Windows host.
+    # $2=auto: non-interactive mode -- uses first stored credential,
+    #          executes via WinRM, no prompts, no pause at end.
+    local host_ip="$1" _auto_mode="${2:-}"
     log_step "Hyper-V PowerShell Sync: $host_ip"
 
-    # Credential resolution: stored windows_credentials list first --------
     local win_user="" win_pass="" win_port="5985" win_proto="http" _wp=""
     local win_creds; win_creds=$(get_windows_creds_for "$host_ip")
     local win_cred_count; win_cred_count=$(echo "$win_creds" | jq 'length' 2>/dev/null || echo 0)
 
-    if [[ "${win_cred_count:-0}" -gt 0 ]]; then
-        printf "\n  ${W}Stored Windows credentials:${NC}\n"
-        local _idx=0
-        while IFS= read -r _c; do
-            local _u _d
-            _u=$(echo "$_c" | jq -r '.username // ""' 2>/dev/null)
-            _d=$(echo "$_c" | jq -r '.domain   // ""' 2>/dev/null)
-            if [[ -n "$_d" ]]; then
-                printf "   %d) %s\\%s\n" "$(( _idx + 1 ))" "$_d" "$_u"
-            else
-                printf "   %d) .\\%s\n" "$(( _idx + 1 ))" "$_u"
-            fi
-            (( _idx++ )) || true
-        done < <(echo "$win_creds" | jq -c '.[]'  2>/dev/null)
-        printf "   0) Enter credentials manually\n"
-        local _pick
-        read -rp $'\n  Select [1]: ' _pick; _pick="${_pick:-1}"
-        if [[ "$_pick" =~ ^[1-9][0-9]*$ && "$_pick" -le "$win_cred_count" ]]; then
-            local _sel; _sel=$(echo "$win_creds" \
-                | jq -c ".[$(( _pick - 1 ))]" 2>/dev/null)
-            local _su _sd
-            _su=$(echo "$_sel" | jq -r '.username // ""' 2>/dev/null)
-            _sd=$(echo "$_sel" | jq -r '.domain   // ""' 2>/dev/null)
-            win_pass=$(echo "$_sel" | jq -r '.password // ""' 2>/dev/null)
-            win_user="${_sd:+$_sd\\}${_su}"
+    if [[ -n "$_auto_mode" ]]; then
+        # Non-interactive: use first available stored credential
+        if [[ "${win_cred_count:-0}" -eq 0 ]]; then
+            log_warn "No Windows credentials for $host_ip -- skipping auto Hyper-V sync"
+            return
         fi
+        local _sel; _sel=$(echo "$win_creds" | jq -c '.[0]' 2>/dev/null)
+        local _su _sd
+        _su=$(echo "$_sel" | jq -r '.username // ""' 2>/dev/null)
+        _sd=$(echo "$_sel" | jq -r '.domain   // ""' 2>/dev/null)
+        win_pass=$(echo "$_sel" | jq -r '.password // ""' 2>/dev/null)
+        win_user="${_sd:+$_sd\\}${_su}"
+    else
+        # Interactive: show stored credential list
+        if [[ "${win_cred_count:-0}" -gt 0 ]]; then
+            printf "\n  ${W}Stored Windows credentials:${NC}\n"
+            local _idx=0
+            while IFS= read -r _c; do
+                local _u _d
+                _u=$(echo "$_c" | jq -r '.username // ""' 2>/dev/null)
+                _d=$(echo "$_c" | jq -r '.domain   // ""' 2>/dev/null)
+                if [[ -n "$_d" ]]; then
+                    printf "   %d) %s\\%s\n" "$(( _idx + 1 ))" "$_d" "$_u"
+                else
+                    printf "   %d) .\\%s\n" "$(( _idx + 1 ))" "$_u"
+                fi
+                (( _idx++ )) || true
+            done < <(echo "$win_creds" | jq -c '.[]'  2>/dev/null)
+            printf "   0) Enter credentials manually\n"
+            local _pick
+            read -rp $'\n  Select [1]: ' _pick; _pick="${_pick:-1}"
+            if [[ "$_pick" =~ ^[1-9][0-9]*$ && "$_pick" -le "$win_cred_count" ]]; then
+                local _sel; _sel=$(echo "$win_creds" \
+                    | jq -c ".[$(( _pick - 1 ))]" 2>/dev/null)
+                local _su _sd
+                _su=$(echo "$_sel" | jq -r '.username // ""' 2>/dev/null)
+                _sd=$(echo "$_sel" | jq -r '.domain   // ""' 2>/dev/null)
+                win_pass=$(echo "$_sel" | jq -r '.password // ""' 2>/dev/null)
+                win_user="${_sd:+$_sd\\}${_su}"
+            fi
+        fi
+        # Fall back to manual entry if nothing selected
+        [[ -z "$win_user" ]] && read -rp  "  Windows username (domain\user): " win_user
+        [[ -z "$win_pass" ]] && { read -rsp "  Windows password: " win_pass; echo; }
+        read -rp "  WinRM port [5985]: " _wp
+        [[ -n "${_wp:-}" ]] && win_port="$_wp"
     fi
-
-    # Fall back to manual entry if no credential selected
-    [[ -z "$win_user" ]] && read -rp  "  Windows username (domain\user): " win_user
-    [[ -z "$win_pass" ]] && { read -rsp "  Windows password: " win_pass; echo; }
-    read -rp "  WinRM port [5985]: " _wp
-    [[ -n "${_wp:-}" ]] && win_port="$_wp"
 
     # Resolve NetBox IDs for cluster type and VM role ----------------------
     local site_id; site_id=$(nb_get_or_create_site)
@@ -2933,10 +2965,15 @@ function Remove-ObsoleteNetboxVirtualDisks {{
 
 function Get-NetboxIPFull {{
     param([string]$Cidr)
-    try {{
-        $r=((Invoke-NB -Uri "$uri/ipam/ip-addresses/?address=$Cidr").Content|ConvertFrom-Json).results
-        if($r.Count -gt 0){{return $r[0]}}
-    }} catch {{}}
+    # Try exact CIDR, then IP-only -- handles existing entries with a
+    # different prefix length (e.g. /24 stored, /32 queried)
+    foreach ($q in @($Cidr, $Cidr.Split("/")[0])) {{
+        try {{
+            $enc=[uri]::EscapeDataString($q)
+            $r=((Invoke-NB -Uri "$uri/ipam/ip-addresses/?address=$enc").Content|ConvertFrom-Json).results
+            if($r.Count -gt 0){{return $r[0]}}
+        }} catch {{}}
+    }}
     return $null
 }}
 
@@ -2963,9 +3000,14 @@ function Assign-IPToNIC {{
 
 function Set-NetboxVMPrimaryIP {{
     param([int]$VmId,[int]$IpId)
-    if (-not $VmId -or -not $IpId) {{ return }}
-    try {{Invoke-NB -Uri "$uri/virtualization/virtual-machines/$VmId/" -Method PATCH -Body (@{{primary_ip4=$IpId}}|ConvertTo-Json)|Out-Null}}
-    catch {{Write-Host "  [ERROR] Primary IP $IpId on VM $VmId failed"}}
+    if (-not $VmId -or -not $IpId) {{ return $false }}
+    try {{
+        Invoke-NB -Uri "$uri/virtualization/virtual-machines/$VmId/" -Method PATCH -Body (@{{primary_ip4=$IpId}}|ConvertTo-Json)|Out-Null
+        return $true
+    }} catch {{
+        Write-Host "  [ERROR] Primary IP $IpId on VM $VmId failed: $($_.Exception.Message)"
+        return $false
+    }}
 }}
 
 ############################################################
@@ -3226,10 +3268,9 @@ foreach ($vm in $vms) {{
             if ($exIP) {{
                 $ipId=[int]$exIP.id
                 Ensure-IPShared -IpId $ipId
-                if ($null -eq $exIP.assigned_object_id) {{
-                    Assign-IPToNIC -IpId $ipId -NicId $nicId
-                    Write-Host "  Assigned $cidr to NIC $nicId"
-                }} else {{Write-Host "  $cidr already assigned -- marked shared"}}
+                # Always reassign -- handles IPs stranded on nmap mgmt0
+                Assign-IPToNIC -IpId $ipId -NicId $nicId
+                Write-Host "  Assigned/reassigned $cidr to NIC $nicId"
             }} else {{
                 $newIP=Create-NetboxIP -IP $ipObj -Mask $mask
                 if (-not $newIP) {{continue}}
@@ -3241,8 +3282,9 @@ foreach ($vm in $vms) {{
         }}
     }}
     if ($mgmtIpId) {{
-        Set-NetboxVMPrimaryIP -VmId $vmId -IpId $mgmtIpId
-        Write-Host "  Primary IP set (ID $mgmtIpId)"
+        if (Set-NetboxVMPrimaryIP -VmId $vmId -IpId $mgmtIpId) {{
+            Write-Host "  Primary IP set (ID $mgmtIpId)"
+        }}
     }} else {{Write-Host "  [WARN] No primary IP for $vmName"}}
 }}
 
@@ -3262,11 +3304,16 @@ GENEOF
     log_ok "PS1 script generated: $ps1_file  ($(wc -l < "$ps1_file") lines)"
 
     # Execution mode -------------------------------------------------------
-    printf "\n  ${W}How to run the sync?${NC}\n"
-    echo "   1) Execute now via WinRM (pywinrm)"
-    echo "   2) Save PS1 to file for manual execution"
-    echo "   0) Cancel"
-    read -rp $'\n  Choice: ' run_mode
+    local run_mode
+    if [[ -n "$_auto_mode" ]]; then
+        run_mode="1"  # always execute via WinRM in auto mode
+    else
+        printf "\n  ${W}How to run the sync?${NC}\n"
+        echo "   1) Execute now via WinRM (pywinrm)"
+        echo "   2) Save PS1 to file for manual execution"
+        echo "   0) Cancel"
+        read -rp $'\n  Choice: ' run_mode
+    fi
 
     case "$run_mode" in
     1)  if ! python3 -c "import winrm" 2>/dev/null; then
@@ -3355,7 +3402,7 @@ RUNEOF
     0)  log_info "Cancelled" ;;
     esac
     rm -f "$ps1_file"
-    pause
+    [[ -z "$_auto_mode" ]] && pause
 }
 
 # -----------------------------------------------------------------------------
