@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.1.6
-#
-# In collaboration with ChatGPT, Claude and CoPilot - 20260602 - 2104
+#  Version: 2.1.0
 # =============================================================================
-#
 
 set -uo pipefail
 
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.1.6"
+SCRIPT_VERSION="2.1.8"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -629,8 +626,10 @@ nb_add_interface() {
 }
 
 nb_upsert_device() {
+    # primary_ip (8th arg): IP-first dedup -- find existing device by IP,
+    # update in-place, rename auto-gen name to real hostname if richer.
     local name="$1" role="$2" mfr="$3" model="$4" site_id="$5" \
-          serial="${6:-}" comments="${7:-}"
+          serial="${6:-}" comments="${7:-}" primary_ip="${8:-}"
     local mfr_id dtype_id role_id
     mfr_id=$(nb_get_or_create_manufacturer "$mfr")
     dtype_id=$(nb_get_or_create_device_type "$mfr_id" "$model")
@@ -656,9 +655,43 @@ nb_upsert_device() {
         clean_serial="$serial"
     fi
 
-    local enc; enc=$(nb_urlencode "$name")
-    local existing; existing=$(nb_get "dcim/devices/?name=${enc}")
-    local dev_id; dev_id=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
+    # ------ IP-first deduplication ---------------------------------------------------------------------------------------------------------------------------------
+    local dev_id=""
+    if [[ -n "${primary_ip:-}" ]]; then
+        local _ie _ir _at _ai
+        _ie=$(nb_urlencode "${primary_ip}/32")
+        _ir=$(nb_get "ipam/ip-addresses/?address=${_ie}&limit=1")
+        if [[ $(echo "$_ir" | jq '.count // 0' 2>/dev/null) == "0" ]]; then
+            _ie=$(nb_urlencode "$primary_ip")
+            _ir=$(nb_get "ipam/ip-addresses/?address=${_ie}&limit=1")
+        fi
+        _at=$(echo "$_ir" | jq -r '.results[0].assigned_object_type // empty' 2>/dev/null)
+        _ai=$(echo "$_ir" | jq -r '.results[0].assigned_object_id  // empty' 2>/dev/null)
+        if [[ "$_at" == "dcim.interface" && -n "${_ai:-}" && "$_ai" =~ ^[0-9]+$ ]]; then
+            local _id
+            _id=$(nb_get "dcim/interfaces/${_ai}/" | jq -r '.device.id // empty' 2>/dev/null)
+            if [[ -n "${_id:-}" && "$_id" =~ ^[0-9]+$ ]]; then
+                dev_id="$_id"
+                log_info "Found existing device by IP $primary_ip (ID: $dev_id)"
+                local _cn _ap="^device-[0-9]+-[0-9]+-[0-9]+-[0-9]+$"
+                _cn=$(nb_get "dcim/devices/${dev_id}/" | jq -r '.name // empty' 2>/dev/null)
+                if [[ -n "${_cn:-}" && "$_cn" != "$name" ]]; then
+                    if [[ "$_cn" =~ $_ap && ! "$name" =~ $_ap ]]; then
+                        log_info "Renaming device: $_cn -> $name"
+                    elif [[ ! "$_cn" =~ $_ap && "$name" =~ $_ap ]]; then
+                        log_debug "Keeping richer name $_cn over auto-gen $name"
+                        name="$_cn"
+                    fi
+                fi
+            fi
+        fi
+    fi
+    # ------ Name lookup (fallback) ---------------------------------------------------------------------------------------------------------------------------------
+    if [[ -z "$dev_id" || ! "$dev_id" =~ ^[0-9]+$ ]]; then
+        local enc; enc=$(nb_urlencode "$name")
+        local existing; existing=$(nb_get "dcim/devices/?name=${enc}")
+        dev_id=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
+    fi
 
     local payload
     payload=$(jq -n \
@@ -1544,7 +1577,7 @@ bnr=load('banners'); mdns=load('mdns'); winrm=load('winrm')
 host={'ip':ip,'hostname':None,'mac':None,'vendor':None,
       'os':None,'os_accuracy':None,
       'device_role':'Endpoint','manufacturer':'Unknown','model':'Unknown',
-      'serial':'','winrm_nics':[],
+      'serial':'','winrm_nics':[],'scan_tier':4,
       'ports':nmap.get('ports',[]),'interfaces':snmp.get('interfaces',[]),
       'ip_table':snmp.get('ip_table',[]),'mac_port_map':snmp.get('mac_port_map',[]),
       'vlan_pvid':snmp.get('vlan_pvid',{}),'vlan_names':snmp.get('vlan_names',{}),
@@ -1596,6 +1629,12 @@ if nb.get('available'):       host['discovery_methods'].append('netbios')
 if dns.get('ptr_hostname'):   host['discovery_methods'].append('dns')
 if bnr.get('banners'):        host['discovery_methods'].append('banner')
 if winrm.get('available'):    host['discovery_methods'].append('winrm')
+
+# scan_tier: 1=winrm(richest) 2=ssh 3=snmp 4=nmap/fallback
+if winrm.get('available'):      host['scan_tier']=1
+elif ssh.get('available'):      host['scan_tier']=2
+elif snmp.get('available'):     host['scan_tier']=3
+else:                           host['scan_tier']=4
 
 if winrm.get('available'):
     host['device_role']='Server' if winrm.get('IsServer') else 'Workstation'
@@ -1874,7 +1913,7 @@ sync_to_netbox() {
 
         local dev_id
         dev_id=$(nb_upsert_device "$hn" "$role" "$mfr" "$model" \
-            "$site_id" "$serial" "$comments" 2>>"$LOG_FILE")
+            "$site_id" "$serial" "$comments" "$ip" 2>>"$LOG_FILE")
 
         if [[ -z "$dev_id" || ! "$dev_id" =~ ^[0-9]+$ ]]; then
             printf "${R}FAIL${NC}\n"; (( fail++ )); continue
@@ -2205,18 +2244,44 @@ import_hyperv_powershell() {
     local host_ip="$1"
     log_step "Hyper-V PowerShell Sync: $host_ip"
 
-    # Credential resolution ------------------------------------------------
-    local win_user="" win_pass="" win_port="5985" win_proto="http"
-    local creds; creds=$(read_creds)
-    local ov; ov=$(echo "$creds" \
-        | jq -r ".device_overrides[\"$host_ip\"] // empty" 2>/dev/null || echo "")
-    if [[ -n "$ov" && "$ov" != "null" ]]; then
-        win_user=$(echo "$ov" | jq -r '.ssh_username // empty' 2>/dev/null || echo "")
-        win_pass=$(echo "$ov" | jq -r '.ssh_password // empty' 2>/dev/null || echo "")
+    # Credential resolution: stored windows_credentials list first --------
+    local win_user="" win_pass="" win_port="5985" win_proto="http" _wp=""
+    local win_creds; win_creds=$(get_windows_creds_for "$host_ip")
+    local win_cred_count; win_cred_count=$(echo "$win_creds" | jq 'length' 2>/dev/null || echo 0)
+
+    if [[ "${win_cred_count:-0}" -gt 0 ]]; then
+        printf "\n  ${W}Stored Windows credentials:${NC}\n"
+        local _idx=0
+        while IFS= read -r _c; do
+            local _u _d
+            _u=$(echo "$_c" | jq -r '.username // ""' 2>/dev/null)
+            _d=$(echo "$_c" | jq -r '.domain   // ""' 2>/dev/null)
+            if [[ -n "$_d" ]]; then
+                printf "   %d) %s\\%s\n" "$(( _idx + 1 ))" "$_d" "$_u"
+            else
+                printf "   %d) .\\%s\n" "$(( _idx + 1 ))" "$_u"
+            fi
+            (( _idx++ )) || true
+        done < <(echo "$win_creds" | jq -c '.[]'  2>/dev/null)
+        printf "   0) Enter credentials manually\n"
+        local _pick
+        read -rp $'\n  Select [1]: ' _pick; _pick="${_pick:-1}"
+        if [[ "$_pick" =~ ^[1-9][0-9]*$ && "$_pick" -le "$win_cred_count" ]]; then
+            local _sel; _sel=$(echo "$win_creds" \
+                | jq -c ".[$(( _pick - 1 ))]" 2>/dev/null)
+            local _su _sd
+            _su=$(echo "$_sel" | jq -r '.username // ""' 2>/dev/null)
+            _sd=$(echo "$_sel" | jq -r '.domain   // ""' 2>/dev/null)
+            win_pass=$(echo "$_sel" | jq -r '.password // ""' 2>/dev/null)
+            win_user="${_sd:+$_sd\\}${_su}"
+        fi
     fi
+
+    # Fall back to manual entry if no credential selected
     [[ -z "$win_user" ]] && read -rp  "  Windows username (domain\user): " win_user
     [[ -z "$win_pass" ]] && { read -rsp "  Windows password: " win_pass; echo; }
-    read -rp "  WinRM port [5985]: " _wp; [[ -n "$_wp" ]] && win_port="$_wp"
+    read -rp "  WinRM port [5985]: " _wp
+    [[ -n "${_wp:-}" ]] && win_port="$_wp"
 
     # Resolve NetBox IDs for cluster type and VM role ----------------------
     local site_id; site_id=$(nb_get_or_create_site)
@@ -2243,7 +2308,7 @@ hv_host    = sys.argv[4]   # used as $hyperVHost; set to localhost for on-host e
 ct_id      = sys.argv[5]
 role_id    = sys.argv[6]
 
-ps1 = textwrap.dedent(f"""\
+ps1 = textwrap.dedent(rf"""\
 ############################################################
 # Hyper-V to NetBox Sync  --  generated by NetBox Discovery Suite
 # Target host : {hv_host}   Cluster-type ID: {ct_id}   Role ID: {role_id}
@@ -2696,10 +2761,19 @@ GENEOF
         log_info "Connecting to $host_ip:$win_port as $win_user and running PS1..."
         python3 - "$host_ip" "$win_user" "$win_pass" \
                   "$win_port" "$win_proto" "$ps1_file" <<'RUNEOF'
-import sys, winrm
+import sys, winrm, base64, uuid
 
 host, user, passwd, port, proto, ps1_path = sys.argv[1:7]
+
+# WinRM rejects large scripts sent as a single run_ps() call with HTTP 500
+# (error 2147942606 "filename or extension is too long").
+# Fix: base64-encode the PS1, upload in 1800-char chunks, decode on the
+# remote host, execute the saved file, then clean up.
 try:
+    ps1_bytes = open(ps1_path, "rb").read()
+    ps1_b64   = base64.b64encode(ps1_bytes).decode("ascii")
+    chunks    = [ps1_b64[i:i+1800] for i in range(0, len(ps1_b64), 1800)]
+
     session = winrm.Session(
         f"{proto}://{host}:{port}/wsman",
         auth=(user, passwd),
@@ -2708,14 +2782,47 @@ try:
         operation_timeout_sec=600,
         read_timeout_sec=620
     )
-    ps1 = open(ps1_path).read()
-    print(f"Running PS1 ({len(ps1)} chars) on {host}...")
-    result = session.run_ps(ps1)
-    if result.std_out:
-        print(result.std_out.decode("utf-8", "replace"))
-    if result.std_err:
-        print("STDERR:", result.std_err.decode("utf-8", "replace")[:2000])
-    sys.exit(result.status_code)
+
+    uid     = uuid.uuid4().hex[:10]
+    tmp_b64 = f"C:\\Windows\\Temp\\nbs_{uid}.b64"
+    tmp_ps1 = f"C:\\Windows\\Temp\\nbs_{uid}.ps1"
+
+    print(f"Uploading PS1 ({len(ps1_bytes)} bytes, {len(chunks)} chunks) to {host}...")
+    for i, chunk in enumerate(chunks):
+        safe = chunk.replace('"', '`"')
+        cmd  = (f'Set-Content -Path "{tmp_b64}" -Value "{safe}" -NoNewline -Encoding ASCII'
+                if i == 0 else
+                f'Add-Content -Path "{tmp_b64}" -Value "{safe}" -NoNewline -Encoding ASCII')
+        r = session.run_ps(cmd)
+        if r.status_code != 0:
+            print(f"Chunk {i} failed: {r.std_err.decode("utf-8","replace")}", file=sys.stderr)
+            sys.exit(1)
+        if i % 20 == 0:
+            print(f"  chunk {i+1}/{len(chunks)}...")
+
+    decode_cmd = (
+        f'$b=(Get-Content "{tmp_b64}" -Raw -Encoding ASCII).Trim();'
+        f'$x=[System.Convert]::FromBase64String($b);'
+        f'[System.IO.File]::WriteAllBytes("{tmp_ps1}",$x);'
+        f'Remove-Item "{tmp_b64}" -Force -ErrorAction SilentlyContinue'
+    )
+    r = session.run_ps(decode_cmd)
+    if r.status_code != 0:
+        print("Decode failed: " + r.std_err.decode("utf-8","replace"), file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Executing on {host}...")
+    r = session.run_ps(
+        f'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & "{tmp_ps1}"'
+    )
+    if r.std_out:
+        print(r.std_out.decode("utf-8","replace"))
+    if r.std_err:
+        txt = r.std_err.decode("utf-8","replace").strip()
+        if txt:
+            print("STDERR:", txt[:3000])
+    session.run_ps(f'Remove-Item "{tmp_ps1}" -Force -ErrorAction SilentlyContinue')
+    sys.exit(r.status_code)
 except Exception as e:
     print(f"WinRM error: {e}", file=sys.stderr)
     sys.exit(1)
