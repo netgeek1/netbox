@@ -1,3 +1,21 @@
+#  Changelog v2.2.0:
+#   - parse_targets(): bare IPs now normalise to explicit CIDR via str(net)
+#     (e.g. 192.168.0.241 -> 192.168.0.241/32) so the per-target CIDR
+#     filter in _do_host_discovery always fires and prevents a bare IP
+#     from matching and returning the entire local ARP/mDNS cache
+#   - sync_to_netbox(): mgmt0 interface creation skipped when winrm_nics
+#     is non-empty; IPs land directly on the real WinRM-reported NIC
+#     instead of a placeholder mgmt0, eliminating the reassignment gap
+#     when a device was previously created from nmap data only
+#   - PS1 Set-NetboxDevice: IP-first deduplication added (same logic as
+#     bash nb_upsert_device); queries IPAM for existing IP, resolves
+#     owning device, updates in-place and smart-renames auto-gen names
+#     so the Hyper-V full sync never creates a duplicate alongside an
+#     nmap-discovered device
+#   - PS1: No IPAM prefix fallback -- instead of skipping a VM/host IP
+#     that has no matching IPAM prefix, assign it as /32; prevents "No
+#     primary IP" warnings when VMs have IPs in unconfigured subnets
+@
 #  Changelog v2.1.9:
 #   - GENEOF PS1 replaced with exact v2.1.5 version:
 #     * rf""" (no trailing backslash) -- script no longer starts with \
