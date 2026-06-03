@@ -1,4 +1,4 @@
-This script is a **large Bash-based automation suite for deploying, discovering, and synchronizing network infrastructure into NetBox** on Ubuntu 24.04. According to its header, it's called **"NetBox Auto-Deploy & Network Discovery Suite"** and is currently version 2.1.4. ([GitHub][1])
+This script is a **large Bash-based automation suite for deploying, discovering, and synchronizing network infrastructure into NetBox** on Ubuntu 24.04. According to its header, it's called **"NetBox Auto-Deploy & Network Discovery Suite"** and is currently version 2.2.1. 
 
 ### High-level purpose
 
@@ -9,13 +9,13 @@ It combines four major functions:
    * Installs Docker and Docker Compose.
    * Downloads and configures NetBox Docker.
    * Creates an admin account and API token automatically.
-   * Generates configuration files and stores credentials. ([GitHub][1])
+   * Generates configuration files and stores credentials. 
 
 2. **Discover devices on networks**
 
    * Scans one or more subnets.
    * Supports CIDRs, IP ranges, and files containing targets.
-   * Uses tools such as Nmap, Masscan, ARP scanning, SNMP, SSH, LLDP/CDP, DNS, and banner probing to identify devices and collect inventory data. ([GitHub][1])
+   * Uses tools such as Nmap, Masscan, ARP scanning, SNMP, SSH, LLDP/CDP, DNS, and banner probing to identify devices and collect inventory data. 
 
 3. **Populate and maintain NetBox**
 
@@ -30,14 +30,14 @@ It combines four major functions:
      * IP addresses
      * MAC addresses
      * Cables and topology relationships
-   * Uses the NetBox REST API extensively and is designed to be idempotent (safe to rerun). ([GitHub][1])
+   * Uses the NetBox REST API extensively and is designed to be idempotent (safe to rerun). 
 
 4. **Import servers, VMs, and Hyper-V environments**
 
    * Integrates with NetBox Agent.
    * Can deploy NetBox Agent to discovered Linux hosts.
    * Can query Windows Hyper-V hosts via WinRM and PowerShell.
-   * Imports virtualization clusters, VMs, NICs, disks, MAC addresses, and IPs into NetBox. ([GitHub][1])
+   * Imports virtualization clusters, VMs, NICs, disks, MAC addresses, and IPs into NetBox. 
 
 ---
 
@@ -62,7 +62,7 @@ The script installs a large set of network and automation tools, including:
 * NetBox Agent
 * PyWinRM
 
-along with many supporting utilities. ([GitHub][1])
+along with many supporting utilities. 
 
 ---
 
@@ -82,7 +82,7 @@ The changelog and dependency list indicate it can gather:
 * Cisco-specific CPU and memory metrics
 * Interface speeds, duplex settings, and descriptions
 
-and then synchronize that data into NetBox. ([GitHub][1])
+and then synchronize that data into NetBox. 
 
 ---
 
@@ -104,7 +104,7 @@ Recent versions added substantial virtualization support:
   * OS version
   * Disk inventory and capacities
 
-using NetBox custom fields. ([GitHub][1])
+using NetBox custom fields. 
 
 ---
 
@@ -116,7 +116,7 @@ The script:
 * Generates an encryption key file.
 * Stores credentials separately from configuration.
 * Automatically manages Docker group membership.
-* Uses API tokens rather than passwords for NetBox API access. ([GitHub][1])
+* Uses API tokens rather than passwords for NetBox API access. 
 
 ---
 
@@ -131,10 +131,10 @@ The workflow appears to be:
 5. Collect inventory and topology information.
 6. Create/update objects in NetBox.
 7. Optionally deploy NetBox Agent to discovered Linux systems.
-8. Optionally import Hyper-V infrastructure and virtual machines. ([GitHub][1])
+8. Optionally import Hyper-V infrastructure and virtual machines. 
 
 ### In one sentence
 
-This script is essentially a **turnkey network source-of-truth platform installer and discovery engine**: it deploys NetBox, scans networks using multiple protocols, gathers infrastructure inventory and topology information, and automatically builds and maintains a populated NetBox environment with devices, IPs, VLANs, interfaces, servers, and virtual machines. ([GitHub][1])
+This script is essentially a **turnkey network source-of-truth platform installer and discovery engine**: it deploys NetBox, scans networks using multiple protocols, gathers infrastructure inventory and topology information, and automatically builds and maintains a populated NetBox environment with devices, IPs, VLANs, interfaces, servers, and virtual machines. 
 
 [1]: https://raw.githubusercontent.com/netgeek1/netbox/refs/heads/main/netbox-discovery.sh "raw.githubusercontent.com"
