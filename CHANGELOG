@@ -1,3 +1,16 @@
+Changelog v2.1.8:
+ - import_hyperv_powershell(): reads stored windows_credentials and
+   presents a numbered list so the user picks a credential rather than
+   re-entering username/password each time; manual entry still offered
+   as option 0; device-override windows_username/domain also honoured
+ - RUNEOF WinRM executor: replaced direct run_ps(ps1) with chunked
+   base64 upload (1800-char chunks via Set-Content/Add-Content), remote
+   decode via [System.Convert]::FromBase64String + WriteAllBytes, then
+   execute saved .ps1 file; fixes HTTP 500 / error 2147942606 ("filename
+   or extension is too long") that occurs for scripts over ~8 KB
+ - PS1 generator: f-string changed to rf-string so PowerShell regex
+   literals (\d \( \) \-) no longer produce SyntaxWarning in Python 3.12+
+
 Changelog v2.1.7:
  - Device deduplication: nb_upsert_device() accepts primary_ip (8th arg);
    queries IPAM first, resolves owning interface/device, updates in-place
