@@ -1,3 +1,33 @@
+Changelog v2.1.6:
+ - Bug fix: missing # on "?? Merge probe data" section comment caused
+   bash to attempt executing ?? as a command on every host scan
+ - Bug fix: save_config() wrote DEFAULT_SITE_NAME unquoted; spaces in
+   the value (e.g. "Default Site") caused bash to execute "Site" as a
+   command when load_config() sourced the file; NETBOX_API_TOKEN and
+   NETBOX_ADMIN_PASS also quoted defensively
+ - Bug fix: global constants block retained v2.1.2 localhost value for
+   NETBOX_API_URL alongside the get_host_ip()-based assignment; global
+   constant now initialised to "" with real value set after get_host_ip()
+ - windows_credentials added to encrypted credential store (EMPTY_CREDS)
+ - get_windows_creds_for(): resolves Windows credentials per-device
+   override (windows_username/password/domain) first, then global list
+ - Credential menu: Windows display section added showing stored creds
+   in .\user or DOMAIN\user format; option 10 adds workgroup or domain
+   credential; option 11 removes by username; option 6 (device override)
+   extended with windows_username, windows_password, windows_domain
+ - nmap: ports 5985 (WinRM/HTTP) and 5986 (WinRM/HTTPS) added
+ - probe_winrm(): runs in parallel with all other probes; fast nc port
+   check first; iterates Windows credentials via pywinrm/NTLM; runs
+   lightweight PS discovery (hostname, manufacturer, model, serial, OS,
+   server/workstation flag, CPU, RAM, NICs with MACs and IPv4 addresses);
+   writes winrm.json; exits silently if port closed or pywinrm absent
+ - merge_host_data(): loads winrm.json; WinRM hostname/manufacturer/
+   model/serial/OS override weaker sources; device_role set to Server or
+   Workstation from PS ProductType bypassing keyword classifier; winrm
+   appended to discovery_methods; winrm_nics passed through host dict
+ - sync_to_netbox(): WinRM NIC loop creates dcim/interfaces records,
+   assigns MACs via nb_ensure_mac_address() (/dcim/mac-addresses/ model),
+   and assigns per-NIC IPv4 addresses with correct prefix lengths
 Changelog v2.1.5:
  - Updated hostname to FQDN and modified clustername to ensure hostname only
 Changelog v2.1.4:
