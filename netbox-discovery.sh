@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.5
+#  Version: 2.2.6
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.5"
+SCRIPT_VERSION="2.2.6"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2624,28 +2624,62 @@ function Test-NetboxConnectivity {{
 function Get-OrCreateManufacturer {{
     param([string]$Name)
     if (-not $Name) {{ $Name = "Unknown" }}
+    $slug = ($Name.ToLower() -replace '[^a-z0-9]+','-').Trim('-')
+    # GET by name first
     try {{
         $resp = Invoke-NB -Uri "$uri/dcim/manufacturers/?name=$([uri]::EscapeDataString($Name))"
         $res  = ($resp.Content | ConvertFrom-Json).results
         if ($res.Count -gt 0) {{ return $res[0] }}
     }} catch {{}}
-    $body = @{{ name = $Name; slug = ($Name.ToLower() -replace '[^a-z0-9]+','-').Trim('-') }} | ConvertTo-Json
-    $resp = Invoke-NB -Uri "$uri/dcim/manufacturers/" -Method POST -Body $body
-    return ($resp.Content | ConvertFrom-Json)
+    # Try POST
+    $body = @{{ name = $Name; slug = $slug }} | ConvertTo-Json
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/manufacturers/" -Method POST -Body $body
+        $obj  = $resp.Content | ConvertFrom-Json
+        if ($obj.id) {{ return $obj }}
+    }} catch {{}}
+    # POST failed (slug collision) -- fall back to GET by slug
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/manufacturers/?slug=$([uri]::EscapeDataString($slug))"
+        $res  = ($resp.Content | ConvertFrom-Json).results
+        if ($res.Count -gt 0) {{ return $res[0] }}
+    }} catch {{}}
+    Write-Host "  [ERROR] Cannot get or create manufacturer: $Name"
+    return $null
 }}
 
 function Get-OrCreateDeviceType {{
     param([int]$ManufacturerId,[string]$Model)
     if (-not $Model) {{ $Model = "Unknown" }}
     $slug = ($Model.ToLower() -replace '[^a-z0-9]+','-').Trim('-')
+    if ($slug.Length -gt 64) {{ $slug = $slug.Substring(0,64).TrimEnd('-') }}
+    # GET by model + manufacturer
     try {{
         $resp = Invoke-NB -Uri "$uri/dcim/device-types/?model=$([uri]::EscapeDataString($Model))&manufacturer_id=$ManufacturerId"
         $res  = ($resp.Content | ConvertFrom-Json).results
         if ($res.Count -gt 0) {{ return $res[0] }}
     }} catch {{}}
+    # Try POST
     $body = @{{ model = $Model; slug = $slug; manufacturer = $ManufacturerId; u_height = 1 }} | ConvertTo-Json
-    $resp = Invoke-NB -Uri "$uri/dcim/device-types/" -Method POST -Body $body
-    return ($resp.Content | ConvertFrom-Json)
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/device-types/" -Method POST -Body $body
+        $obj  = $resp.Content | ConvertFrom-Json
+        if ($obj.id) {{ return $obj }}
+    }} catch {{}}
+    # POST failed (slug collision) -- fall back to GET by slug
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/device-types/?slug=$([uri]::EscapeDataString($slug))"
+        $res  = ($resp.Content | ConvertFrom-Json).results
+        if ($res.Count -gt 0) {{ return $res[0] }}
+    }} catch {{}}
+    # Last resort: search by model name only (ignore manufacturer)
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/device-types/?model=$([uri]::EscapeDataString($Model))"
+        $res  = ($resp.Content | ConvertFrom-Json).results
+        if ($res.Count -gt 0) {{ return $res[0] }}
+    }} catch {{}}
+    Write-Host "  [ERROR] Cannot get or create device type: $Model"
+    return $null
 }}
 
 function Get-DeviceRoleByName {{
@@ -3181,11 +3215,19 @@ $modelName        = $cs.Model
 
 Write-Host "Host hardware: $manufacturerName $modelName"
 $manufacturer = Get-OrCreateManufacturer -Name $manufacturerName
-$deviceType   = Get-OrCreateDeviceType -ManufacturerId $manufacturer.id -Model $modelName
+if (-not $manufacturer -or -not $manufacturer.id) {{
+    Write-Host "[ERROR] Cannot resolve manufacturer -- aborting sync"
+    exit 1
+}}
+$deviceType = Get-OrCreateDeviceType -ManufacturerId ([int]$manufacturer.id) -Model $modelName
+if (-not $deviceType -or -not $deviceType.id) {{
+    Write-Host "[ERROR] Cannot resolve device type -- aborting sync"
+    exit 1
+}}
 $deviceRole   = Get-DeviceRoleByName -Name "Server"
 
 $clusterId = Set-NetboxCluster -Name $clusterName -NetboxHyperVClusterType $NetboxHyperVClusterType
-$deviceId  = Set-NetboxDevice -Name $hostName -ClusterId $clusterId -SiteId $SiteId -DeviceTypeId $deviceType.id -DeviceRoleId $deviceRole.id
+$deviceId  = Set-NetboxDevice -Name $hostName -ClusterId $clusterId -SiteId $SiteId -DeviceTypeId ([int]$deviceType.id) -DeviceRoleId ([int]$deviceRole.id)
 
 $serial = $bios.SerialNumber
 $asset  = $cs.IdentifyingNumber
