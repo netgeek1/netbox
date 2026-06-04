@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.6
+#  Version: 2.2.7
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.6"
+SCRIPT_VERSION="2.2.7"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1650,7 +1650,13 @@ sys_descr=(snmp.get('sys_descr') or '').lower()
 os_str=(host['os'] or '').lower()
 open_ports={str(p.get('port','')) for p in host['ports']}
 http_ttl=' '.join(s.get('title','') for s in host['http_services']).lower()
-combined=' '.join([sys_descr,os_str,http_ttl])
+# Include entity MIB descriptions + model names so devices whose sysDescr
+# is sparse (e.g. 'FortiGate-61E') still get classified from entity strings
+entity_text=' '.join(
+    ' '.join([e.get('desc',''),e.get('model','')])
+    for e in snmp.get('entity_inventory',[])
+).lower()
+combined=' '.join([sys_descr,os_str,http_ttl,entity_text])
 sys_oid=(snmp.get('sys_oid') or '').strip()
 
 # sysObjectID prefix table -- gives definitive vendor+role for SNMP devices
@@ -1671,7 +1677,10 @@ OID_MAP=[
     ('1.3.6.1.4.1.9.1.',    'Router',      'Cisco'),       # Cisco IOS routers
     ('1.3.6.1.4.1.2636.1.1.1.2.',  'Router','Juniper'),    # Juniper MX/EX routers
     ('1.3.6.1.4.1.9694.',   'Router',      'MikroTik'),    # MikroTik
-    ('1.3.6.1.4.1.41112.',  'Router',      'Ubiquiti'),    # Ubiquiti EdgeRouter
+    ('1.3.6.1.4.1.41112.1.19.','Firewall', 'Ubiquiti'),    # Ubiquiti UCG (Cloud Gateway)
+    ('1.3.6.1.4.1.41112.1.4.','Wireless AP','Ubiquiti'),   # Ubiquiti UniFi AP
+    ('1.3.6.1.4.1.41112.1.6.','Router',    'Ubiquiti'),    # Ubiquiti EdgeRouter
+    ('1.3.6.1.4.1.41112.',  'Router',      'Ubiquiti'),    # Ubiquiti (generic catch-all)
     ('1.3.6.1.4.1.4413.',   'Router',      'Broadcom'),    # Broadcom (EdgeRouter)
     ('1.3.6.1.4.1.30065.',  'Router',      'Arista'),      # Arista
     ('1.3.6.1.4.1.18060.',  'Router',      'OpenBSD'),     # OpenBSD/OpenVPN
@@ -1686,7 +1695,6 @@ OID_MAP=[
     ('1.3.6.1.4.1.12356.106.','Switch',     'Fortinet'),   # FortiSwitch
     # Wireless APs
     ('1.3.6.1.4.1.14823.',  'Wireless AP', 'Aruba'),       # Aruba
-    ('1.3.6.1.4.1.41112.1.4.','Wireless AP','Ubiquiti'),   # Ubiquiti UniFi AP
     ('1.3.6.1.4.1.388.',    'Wireless AP', 'Symbol'),      # Symbol/Zebra AP
     ('1.3.6.1.4.1.25053.',  'Wireless AP', 'Ruckus'),      # Ruckus
     ('1.3.6.1.4.1.9.1.525', 'Wireless AP', 'Cisco'),       # Cisco Aironet
@@ -1733,7 +1741,8 @@ if sys_oid:
 
 FW=['firewall','fortigate','fortios','palo alto','checkpoint','asa','sonicwall',
     'opnsense','pfsense','netscreen','juniper srx','srx','watchguard','sophos','cisco asa',
-    'stonegate','netscaler','bigip','f5 ']
+    'stonegate','netscaler','bigip','f5 ',
+    'ucg-fiber','ucg-ultra','ucg-max','ucg-enterprise','unifi ucg']
 RT=['router','gateway','ios xe','ios xr','junos','routeros','vyos ','edgeos',
     'edgerouter','unifi security gateway','usg','mikrotik','rb ','tilfa','cisco ios']
 SW=['switch','catalyst','nexus',' eos ','comware','procurve','arubaos',
@@ -1743,7 +1752,9 @@ SW=['switch','catalyst','nexus',' eos ','comware','procurve','arubaos',
     'unmanaged switch','smart switch','managed switch','fortiswitch','fsl-']
 AP=['access point','aironet','unifi','airmax','lightweight ap',
     'aruba','instant ap','iap-','wap','wifi','wireless ap','802.11','ath0',
-    'ubiquiti','ruijie ap','ruckus','meraki mr']
+    'ubiquiti','ruijie ap','ruckus','meraki mr',
+    'u6-','u6pro','u7-','uap-','uap-ac','u-lte','ulte','unifi6',
+    'nanostation','litebeam','nanobeam','powerbeam','airfiber']
 SV=['linux','ubuntu','debian','centos','rhel','windows server','esxi',
     'vmware','proxmox','freebsd']
 PR=['printer','jetdirect','xerox','ricoh','canon','brother','lexmark',
