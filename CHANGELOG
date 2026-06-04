@@ -1,3 +1,21 @@
+#  Changelog v2.2.8:
+#   - FortiGate fix: sys_oid normalised from iso. to 1. prefix so OID-prefix
+#     table matches correctly; sys_descr/chassis_ser cleared when they contain
+#     raw snmpget OID lines (FortiGate returns empty sysDescr); nmap port
+#     script text (http-title, banners) added to "combined" so "FortiGate"
+#     in the http-title script result contributes to FW classification
+#   - banner(): NetBox URL, masked token, and admin password shown on every
+#     menu screen so connection details are always visible
+#   - sync_to_netbox(): "discovered_ports" text custom field created and
+#     updated on every device with open port/service pairs from the scan
+#   - install_deps(): RustScan installed from GitHub releases (optional);
+#     probe_nmap() uses RustScan for full 1-65535 port pre-scan when
+#     available, then passes found ports to nmap for service/version
+#     detection; falls back to targeted port list if not installed
+#   - menu_import(): option 7 "Sync Device Type Library" installs
+#     Device-Type-Library-Import, clones community device type library,
+#     and bulk-imports all YAML device types into NetBox
+#
 #  Changelog v2.2.7:
 #   - merge_host_data: entity MIB descriptions + model names added to
 #     "combined" classification string; catches devices like FortiGate where
