@@ -1,3 +1,12 @@
+#  Changelog v2.2.6:
+#   - PS1 Get-OrCreateManufacturer: POST slug-conflict (400) now falls back
+#     to GET-by-slug to retrieve the existing record; prevents null return
+#     that cascades to manufacturer ID 0 -> device_type 0 -> device create fail
+#   - PS1 Get-OrCreateDeviceType: same slug-conflict fallback; also falls back
+#     to model-only search when manufacturer_id+model search finds nothing
+#   - PS1 Set-NetboxDevice: guards on valid manufacturer and device_type IDs
+#     before calling Add/patch; logs specific error instead of silent 0-ID fail
+#
 #  Changelog v2.2.5:
 #   - Classifier: sysObjectID OID-prefix table added; runs before keyword
 #     matching and gives definitive vendor+role for any SNMP device whose
