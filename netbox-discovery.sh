@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.2
+#  Version: 2.2.3
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.2"
+SCRIPT_VERSION="2.2.3"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2996,8 +2996,8 @@ function Assign-IPToNIC {{
     # Step 1: clear any existing assignment (NetBox 400s on direct
     # cross-type reassignment, e.g. dcim.interface -> vminterface)
     try {{
-        Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH `
-            -Body '{"assigned_object_type": null, "assigned_object_id": null}' | Out-Null
+        $clearBody=(@{{assigned_object_type=$null;assigned_object_id=$null}}|ConvertTo-Json)
+        Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $clearBody|Out-Null
     }} catch {{}}
     # Step 2: assign to the VM NIC
     $b=@{{assigned_object_type="virtualization.vminterface";assigned_object_id=$NicId}}|ConvertTo-Json
@@ -3051,8 +3051,8 @@ function Assign-HostIPToNIC {{
     param([int]$IpId,[int]$NicId)
     # Clear any existing assignment first to avoid cross-type 400 errors
     try {{
-        Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH `
-            -Body '{"assigned_object_type": null, "assigned_object_id": null}' | Out-Null
+        $clearBody=(@{{assigned_object_type=$null;assigned_object_id=$null}}|ConvertTo-Json)
+        Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $clearBody|Out-Null
     }} catch {{}}
     $b=@{{assigned_object_type="dcim.interface";assigned_object_id=$NicId}}|ConvertTo-Json
     try {{Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $b|Out-Null}}
