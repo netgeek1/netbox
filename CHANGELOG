@@ -1,3 +1,15 @@
+#  Changelog v2.2.7:
+#   - merge_host_data: entity MIB descriptions + model names added to
+#     "combined" classification string; catches devices like FortiGate where
+#     entity MIB has the vendor/product string but sysDescr is sparse
+#   - OID table: Ubiquiti split into specific entries -- UniFi APs
+#     (1.3.6.1.4.1.41112.1.4.*) -> Wireless AP; UCG gateways
+#     (1.3.6.1.4.1.41112.1.19.*) -> Firewall; EdgeRouter catch-all -> Router
+#   - FW keywords: added ucg, ucg-fiber, ucg-ultra, ucg-max (Ubiquiti Cloud
+#     Gateway line; sysDescr contains "UniFi UCG-*" which previously hit AP)
+#   - AP keywords: added u6-, u7-, uap-, u-lte, ulte, unifi6, nanostation,
+#     litebeam, nanobeam (Ubiquiti AP model prefixes missing from list)
+#
 #  Changelog v2.2.6:
 #   - PS1 Get-OrCreateManufacturer: POST slug-conflict (400) now falls back
 #     to GET-by-slug to retrieve the existing record; prevents null return
