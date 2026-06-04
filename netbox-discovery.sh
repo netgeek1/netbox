@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.3
+#  Version: 2.2.4
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.3"
+SCRIPT_VERSION="2.2.4"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1129,9 +1129,9 @@ probe_nmap() {
     local ip="$1" tmp="$2"
     local xml="$tmp/nmap.xml"
     nmap -sV -O --osscan-guess \
-        -p "21-23,25,53,80,110,139,143,443,445,512-514,587,631,\
-1433,1521,3306,3389,5432,5900,5901,5985,5986,6379,\
-8080,8443,8888,9200,9300,27017" \
+        -p "21-23,25,53,80,110,139,143,443,445,512-514,587,623,631,\
+830,1433,1521,3306,3389,5432,5900,5901,5985,5986,6379,\
+8080,8291,8443,8728-8729,8888,9100,9200,9300,10443,27017" \
         --script "banner,ssh-hostkey,snmp-info,\
 http-title,http-server-header,ssl-cert,\
 nbstat,smb-security-mode,dns-service-discovery,\
@@ -1653,30 +1653,47 @@ http_ttl=' '.join(s.get('title','') for s in host['http_services']).lower()
 combined=' '.join([sys_descr,os_str,http_ttl])
 
 FW=['firewall','fortigate','fortios','palo alto','checkpoint','asa','sonicwall',
-    'opnsense','pfsense','netscreen']
-RT=['router','gateway','ios xe','ios xr','junos','routeros','vyos ']
+    'opnsense','pfsense','netscreen','juniper srx','srx','watchguard','sophos','cisco asa',
+    'stonegate','netscaler','bigip','f5 ']
+RT=['router','gateway','ios xe','ios xr','junos','routeros','vyos ','edgeos',
+    'edgerouter','unifi security gateway','usg','mikrotik','rb ','tilfa','cisco ios']
 SW=['switch','catalyst','nexus',' eos ','comware','procurve','arubaos',
     'ex series','qfx','powerconnect','1810g','1910','2530','2920','2960',
-    '3750','3850','9300','netgear gs']
-AP=['access point','aironet','unifi','airmax','lightweight ap']
+    '3750','3850','9300','netgear gs','sg300','sg500','sf ','icx ','fcs ',
+    'flexfabric','hp 1910','hp 1810','tplink','tp-link','d-link','dgs-','des-',
+    'unmanaged switch','smart switch','managed switch']
+AP=['access point','aironet','unifi','airmax','lightweight ap',
+    'aruba','instant ap','iap-','wap','wifi','wireless ap','802.11','ath0',
+    'ubiquiti','ruijie ap','ruckus','meraki mr']
 SV=['linux','ubuntu','debian','centos','rhel','windows server','esxi',
     'vmware','proxmox','freebsd']
-PR=['printer','jetdirect','xerox','ricoh','canon','brother','lexmark']
-UP=['ups','apc','eaton','powerware','uninterruptible']
-CA=['camera','axis comm','hikvision','dahua','hanwha']
+PR=['printer','jetdirect','xerox','ricoh','canon','brother','lexmark',
+    'epson','kyocera','konica','minolta','sharp','samsung clp','samsung ml',
+    'hp laserjet','hp officejet','hp deskjet','hp color','pagewide',
+    'print server','multifunction','mfp','all-in-one']
+UP=['ups','apc','eaton','powerware','uninterruptible',
+    'cyberpower','tripp lite','tripplite','schneider electric ups',
+    'liebert','vertiv','pdu','power distribution']
+CA=['camera','axis comm','hikvision','dahua','hanwha',
+    'bosch cam','pelco','vivotek','avigilon','genetec','milestone',
+    'ip cam','ipcam','nvr','dvr','cctv']
 
 if   any(k in combined for k in FW):  host['device_role']='Firewall'
-elif any(k in combined for k in RT) and (snmp_up or '161' in open_ports):
+elif any(k in combined for k in RT) and (snmp_up or '161' in open_ports
+     or '830' in open_ports or '8291' in open_ports):
     host['device_role']='Router'
 elif any(k in combined for k in SW) and (snmp_up or '161' in open_ports):
     host['device_role']='Switch'
 elif any(k in combined for k in AP):  host['device_role']='Wireless AP'
-elif any(k in combined for k in PR) or '9100' in open_ports:
+elif any(k in combined for k in PR) or '9100' in open_ports or '631' in open_ports:
     host['device_role']='Printer'
 elif any(k in combined for k in UP):  host['device_role']='UPS'
 elif any(k in combined for k in CA):  host['device_role']='IP Camera'
-elif '3389' in open_ports or 'windows' in os_str: host['device_role']='Server'
+elif 'windows server' in os_str or 'windows server' in combined:
+    host['device_role']='Server'
+elif '3389' in open_ports: host['device_role']='Server'
 elif any(k in combined for k in SV):  host['device_role']='Server'
+elif 'windows' in os_str:  host['device_role']='Workstation'
 elif '5060' in open_ports or 'sip' in combined: host['device_role']='IP Phone'
 elif '445' in open_ports or nb.get('available'): host['device_role']='Workstation'
 
