@@ -1,3 +1,10 @@
+#  Changelog v2.2.5:
+#   - Classifier: sysObjectID OID-prefix table added; runs before keyword
+#     matching and gives definitive vendor+role for any SNMP device whose
+#     enterprise OID is in the table (Cisco, Juniper, Fortinet, F5, Check
+#     Point, Palo Alto, SonicWall, Aruba, Ubiquiti, APC, Eaton, Axis, etc.)
+#   - SW keywords: added fortiswitch, fsl- (FortiSwitch model prefix)
+# 
 #  Changelog v2.2.4:
 #   - nmap: added ports 623 (IPMI), 830 (NETCONF), 8291 (MikroTik Winbox),
 #     8728-8729 (MikroTik API), 9100 (JetDirect/raw print), 10443 (mgmt HTTPS)
