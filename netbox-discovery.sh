@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.7
+#  Version: 2.2.8
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.7"
+SCRIPT_VERSION="2.2.8"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -137,6 +137,11 @@ banner() {
     printf "${NC}\n"
     printf "  ${D}Log   : %s${NC}\n" "$LOG_FILE"
     printf "  ${D}Config: %s${NC}\n" "$CONFIG_FILE"
+    printf "  ${D}NetBox: %s${NC}\n" "${NETBOX_API_URL:-<not set>}"
+    local _tok_disp="${NETBOX_API_TOKEN:0:8}...${NETBOX_API_TOKEN: -4}"
+    [[ -z "$NETBOX_API_TOKEN" ]] && _tok_disp="<not set>"
+    printf "  ${D}Token : %s${NC}  ${D}Admin: %s${NC}\n" \
+        "$_tok_disp" "${NETBOX_ADMIN_PASS:-<see creds file>}"
     echo ""
 }
 
@@ -313,6 +318,24 @@ $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
         systemctl enable "$svc" >> "$LOG_FILE" 2>&1 || true
         systemctl start  "$svc" >> "$LOG_FILE" 2>&1 || true
     done
+
+    printf "  ${W}RustScan${NC} (fast port scanner) ... "
+    if ! cmd_exists rustscan; then
+        local _rs_ver
+        _rs_ver=$(curl -sf \
+            https://api.github.com/repos/RustScan/RustScan/releases/latest \
+            | jq -r '.tag_name // "v2.3.0"' 2>/dev/null || echo "v2.3.0")
+        local _rs_deb="rustscan_${_rs_ver#v}_amd64.deb"
+        if curl -sfL \
+            "https://github.com/RustScan/RustScan/releases/download/${_rs_ver}/${_rs_deb}" \
+            -o /tmp/rustscan.deb 2>/dev/null \
+            && dpkg -i /tmp/rustscan.deb >> "$LOG_FILE" 2>&1; then
+            printf "${G}OK${NC}\n"
+        else
+            printf "${Y}skipped (optional)${NC}\n"
+        fi
+        rm -f /tmp/rustscan.deb
+    else printf "${G}already installed${NC}\n"; fi
 
     ensure_docker_group
 
@@ -732,6 +755,21 @@ nb_create_cable() {
           \"label\":\"$label\"}" >/dev/null 2>&1 || true
 }
 
+# Idempotent custom field creator -- only POSTs if field does not yet exist
+nb_ensure_custom_field() {
+    local name="$1" label="$2" type="${3:-text}" obj_types="${4:-dcim.device}"
+    local enc; enc=$(nb_urlencode "$name")
+    local res; res=$(nb_get "extras/custom-fields/?name=${enc}")
+    local id; id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
+    if [[ -z "$id" ]]; then
+        nb_post "extras/custom-fields/" \
+            "$(jq -n --arg n "$name" --arg l "$label" --arg t "$type" \
+                --argjson ot "[\"$obj_types\"]" \
+                '{name:$n,label:$l,type:$t,object_types:$ot}')" \
+            >/dev/null 2>&1 || true
+    fi
+}
+
 nb_get_or_create_cluster_type() {
     local name="$1" slug enc res id
     slug=$(slugify "$name"); enc=$(nb_urlencode "$name")
@@ -1128,10 +1166,23 @@ scan_single_host() {
 probe_nmap() {
     local ip="$1" tmp="$2"
     local xml="$tmp/nmap.xml"
-    nmap -sV -O --osscan-guess \
-        -p "21-23,25,53,80,110,139,143,443,445,512-514,587,623,631,\
+    local nmap_ports="21-23,25,53,80,110,139,143,443,445,512-514,587,623,631,\
 830,1433,1521,3306,3389,5432,5900,5901,5985,5986,6379,\
-8080,8291,8443,8728-8729,8888,9100,9200,9300,10443,27017" \
+8080,8291,8443,8728-8729,8888,9100,9200,9300,10443,27017"
+
+    # Use RustScan when available: scans all 65535 ports fast, hands
+    # found ports to nmap for service/version detection
+    if cmd_exists rustscan; then
+        local rs_ports
+        rs_ports=$(rustscan -a "$ip" --ulimit 5000 --range 1-65535 \
+            --no-nmap 2>/dev/null \
+            | grep -oP "(?<=:)\d+" | sort -un | tr "\n" "," | sed "s/,$//") \
+            || true
+        [[ -n "$rs_ports" ]] && nmap_ports="$rs_ports"
+    fi
+
+    nmap -sV -O --osscan-guess \
+        -p "$nmap_ports" \
         --script "banner,ssh-hostkey,snmp-info,\
 http-title,http-server-header,ssl-cert,\
 nbstat,smb-security-mode,dns-service-discovery,\
@@ -1243,6 +1294,14 @@ sys_descr=sys.argv[3].strip().strip('"'); sys_name=sys.argv[4].strip().strip('"'
 sys_loc=sys.argv[5].strip().strip('"');   sys_contact=sys.argv[6].strip().strip('"')
 sys_uptime=sys.argv[7].strip();           sys_oid=sys.argv[8].strip()
 chassis_ser=sys.argv[9].strip().strip('"')
+# Normalize sys_oid: snmpget may return 'iso.3.6.1.4.1.X' instead of '1.3.6.1.4.1.X'
+if sys_oid.startswith('iso.'): sys_oid='1.'+sys_oid[4:]
+# Clear fields that contain raw snmpget OID lines rather than actual values
+# (happens when device returns empty/no value, e.g. FortiGate empty sysDescr)
+def _is_raw_oid(v): return v.startswith('iso.') or (v.startswith('1.3.6.') and '=' in v)
+if _is_raw_oid(sys_descr):    sys_descr=''
+if _is_raw_oid(chassis_ser):  chassis_ser=''
+if _is_raw_oid(sys_name):     sys_name=''
 
 def rf(n):
     p=os.path.join(tmp,n)
@@ -1656,8 +1715,15 @@ entity_text=' '.join(
     ' '.join([e.get('desc',''),e.get('model','')])
     for e in snmp.get('entity_inventory',[])
 ).lower()
-combined=' '.join([sys_descr,os_str,http_ttl,entity_text])
+# Include nmap port script output (http-title, banners, etc.) in combined
+# so devices identified via port scripts (e.g. FortiGate http-title) classify
+nmap_scripts=' '.join(
+    str(v) for p in host.get('ports',[]) for v in (p.get('scripts') or {}).values()
+    if isinstance(v,str)
+).lower()
+combined=' '.join([sys_descr,os_str,http_ttl,entity_text,nmap_scripts])
 sys_oid=(snmp.get('sys_oid') or '').strip()
+if sys_oid.startswith('iso.'): sys_oid='1.'+sys_oid[4:]
 
 # sysObjectID prefix table -- gives definitive vendor+role for SNMP devices
 # before any keyword matching runs. Enterprise OID prefix -> (role, manufacturer)
@@ -2001,6 +2067,9 @@ sync_to_netbox() {
     [[ -z "$site_id" || ! "$site_id" =~ ^[0-9]+$ ]] \
         && { log_error "Cannot create site"; pause; return 1; }
     log_info "Site ID: $site_id"
+    # Ensure custom fields exist (idempotent)
+    nb_ensure_custom_field "discovered_ports" "Discovered Ports" "text" "dcim.device"
+    nb_ensure_custom_field "discovery_methods" "Discovery Methods" "text" "dcim.device"
 
     local total; total=$(jq '.hosts | length' "$results_file")
     local ok=0 fail=0 idx=0
@@ -2184,6 +2253,20 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
             echo "$host" | jq -c '.lldp_neighbors[]?' 2>/dev/null
             echo "$host" | jq -c '.cdp_neighbors[]?'  2>/dev/null
         } 2>/dev/null || true)
+
+        # Populate custom fields: open ports + discovery methods
+        local _ports_cf _dmethods_cf
+        _ports_cf=$(echo "$host" | jq -r \
+            '[.ports[] | .port + "/" + (.service // "unknown")] | join(", ")' \
+            2>/dev/null || echo "")
+        _dmethods_cf=$(echo "$host" | jq -r \
+            '.discovery_methods | join(", ")' 2>/dev/null || echo "")
+        if [[ -n "$_ports_cf" || -n "$_dmethods_cf" ]]; then
+            nb_patch "dcim/devices/${dev_id}/" \
+                "$(jq -n --arg p "$_ports_cf" --arg d "$_dmethods_cf" \
+                    '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')" \
+                >/dev/null 2>&1 || true
+        fi
 
         printf "${G}OK${NC}\n"; (( ok++ ))
 
@@ -3596,6 +3679,7 @@ menu_import() {
         echo "   4) Import Windows Hyper-V host (WinRM)"
         echo "   5) Generate agent config file (netbox_agent.yaml)"
         echo "   6) Show agent config for manual install"
+        echo "   7) Sync NetBox Device Type Library (community YAML)"
         echo "   0) Back"
         read -rp $'\nChoice: ' c
         local tip
@@ -3625,9 +3709,72 @@ menu_import() {
            printf "EOF\n"
            printf "netbox_agent -c /etc/netbox_agent.yaml --register\n\n"
            pause ;;
+        7) import_device_type_library ;;
         0) return ;;
         esac
     done
+}
+
+# -----------------------------------------------------------------------------
+# DEVICE TYPE LIBRARY IMPORT
+# -----------------------------------------------------------------------------
+import_device_type_library() {
+    log_step "NetBox Device Type Library Import"
+    if [[ -z "$NETBOX_API_TOKEN" ]]; then
+        log_error "API token not set -- run Deploy NetBox first"
+        pause; return 1
+    fi
+
+    local dtl_dir="$BASE_DIR/devicetype-library"
+    local dtli_dir="$BASE_DIR/Device-Type-Library-Import"
+
+    # 1. Clone / update community device type library
+    log_info "Syncing NetBox device type library..."
+    if [[ -d "$dtl_dir/.git" ]]; then
+        git -C "$dtl_dir" pull -q >> "$LOG_FILE" 2>&1 \
+            && log_ok "Library updated" || log_warn "Library update failed (using existing)"
+    else
+        git clone -q \
+            https://github.com/netbox-community/devicetype-library.git \
+            "$dtl_dir" >> "$LOG_FILE" 2>&1 \
+            && log_ok "Library cloned" || { log_error "Clone failed"; pause; return 1; }
+    fi
+
+    # 2. Install Device-Type-Library-Import tool
+    log_info "Installing Device-Type-Library-Import..."
+    if [[ ! -d "$dtli_dir/.git" ]]; then
+        git clone -q \
+            https://github.com/netbox-community/Device-Type-Library-Import.git \
+            "$dtli_dir" >> "$LOG_FILE" 2>&1 || { log_error "DTLI clone failed"; pause; return 1; }
+    else
+        git -C "$dtli_dir" pull -q >> "$LOG_FILE" 2>&1 || true
+    fi
+    pip3 install --break-system-packages --quiet \
+        -r "$dtli_dir/requirements.txt" \
+        >> "$LOG_FILE" 2>&1 || true
+
+    # 3. Optional: filter to specific vendors
+    printf "\n  Import all vendors or specific ones?\n"
+    printf "  Examples: cisco juniper fortinet hp dell ubiquiti\n"
+    printf "  (blank = import all ~2000 device types)\n"
+    read -rp "  Vendors (space-separated, blank=all): " _vendors
+
+    # 4. Run import
+    log_info "Running Device-Type-Library-Import..."
+    local _dtli_args=(
+        "--url" "$NETBOX_API_URL"
+        "--token" "$NETBOX_API_TOKEN"
+        "--library" "$dtl_dir"
+    )
+    if [[ -n "${_vendors:-}" ]]; then
+        for _v in $_vendors; do
+            _dtli_args+=("--vendors" "$_v")
+        done
+    fi
+    cd "$dtli_dir" && python3 dtl_import.py "${_dtli_args[@]}" \
+        2>&1 | tee -a "$LOG_FILE" | tail -30
+    log_ok "Device Type Library import complete"
+    pause
 }
 
 # -----------------------------------------------------------------------------
