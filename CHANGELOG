@@ -1,3 +1,24 @@
+#  Changelog v2.2.4:
+#   - nmap: added ports 623 (IPMI), 830 (NETCONF), 8291 (MikroTik Winbox),
+#     8728-8729 (MikroTik API), 9100 (JetDirect/raw print), 10443 (mgmt HTTPS)
+#   - Classifier FW: added SRX, WatchGuard, Sophos, NetScaler, BIG-IP, F5
+#   - Classifier RT: added EdgeOS, EdgeRouter, USG, MikroTik, Cisco IOS;
+#     NETCONF (830) and Winbox (8291) also count as router signal
+#   - Classifier SW: added SG300/500, ICX, TP-Link, D-Link, generic managed
+#   - Classifier AP: added Aruba, Ruckus, Meraki MR, Ubiquiti, WAP, 802.11
+#   - Classifier PR: added Epson, Kyocera, Konica Minolta, Sharp, HP models,
+#     MFP; ports 9100 (JetDirect) and 631 (IPP) both trigger Printer role
+#   - Classifier CA: added Bosch, Pelco, Vivotek, Avigilon, NVR/DVR/CCTV
+#   - Classifier UP: added CyberPower, Tripp Lite, Liebert, Vertiv, PDU
+#   - Classifier: Windows Server -> Server; plain Windows -> Workstation
+#     (previously any "windows" in OS string triggered Server)
+#
+#  Changelog v2.2.3:
+#   - PS1 GENEOF: raw JSON null literal caused ValueError in Python
+#     f-string (the { was treated as a format specifier); replaced with
+#     PowerShell hashtable (@{{...}}|ConvertTo-Json) in both
+#     Assign-IPToNIC and Assign-HostIPToNIC clear steps
+#
 #  Changelog v2.2.2:
 #   - PS1 Assign-IPToNIC: clear-then-assign pattern fixes 400 Bad Request
 #     that occurs when NetBox rejects a direct dcim.interface ->
