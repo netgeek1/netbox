@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.4
+#  Version: 2.2.5
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.4"
+SCRIPT_VERSION="2.2.5"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1651,6 +1651,85 @@ os_str=(host['os'] or '').lower()
 open_ports={str(p.get('port','')) for p in host['ports']}
 http_ttl=' '.join(s.get('title','') for s in host['http_services']).lower()
 combined=' '.join([sys_descr,os_str,http_ttl])
+sys_oid=(snmp.get('sys_oid') or '').strip()
+
+# sysObjectID prefix table -- gives definitive vendor+role for SNMP devices
+# before any keyword matching runs. Enterprise OID prefix -> (role, manufacturer)
+# Checked in priority order; first match wins.
+OID_MAP=[
+    # Firewalls
+    ('1.3.6.1.4.1.12356.',  'Firewall',    'Fortinet'),    # Fortinet
+    ('1.3.6.1.4.1.2620.',   'Firewall',    'Check Point'), # Check Point
+    ('1.3.6.1.4.1.25461.',  'Firewall',    'Palo Alto'),   # Palo Alto
+    ('1.3.6.1.4.1.8741.',   'Firewall',    'SonicWall'),   # SonicWall
+    ('1.3.6.1.4.1.3417.',   'Firewall',    'Barracuda'),   # Barracuda
+    ('1.3.6.1.4.1.9.1.746', 'Firewall',    'Cisco'),       # Cisco ASA
+    ('1.3.6.1.4.1.9.1.745', 'Firewall',    'Cisco'),       # Cisco PIX
+    ('1.3.6.1.4.1.9.1.620', 'Firewall',    'Cisco'),       # Cisco FWSM
+    ('1.3.6.1.4.1.4874.1.1.100', 'Firewall','Juniper'),    # Juniper SRX
+    # Routers
+    ('1.3.6.1.4.1.9.1.',    'Router',      'Cisco'),       # Cisco IOS routers
+    ('1.3.6.1.4.1.2636.1.1.1.2.',  'Router','Juniper'),    # Juniper MX/EX routers
+    ('1.3.6.1.4.1.9694.',   'Router',      'MikroTik'),    # MikroTik
+    ('1.3.6.1.4.1.41112.',  'Router',      'Ubiquiti'),    # Ubiquiti EdgeRouter
+    ('1.3.6.1.4.1.4413.',   'Router',      'Broadcom'),    # Broadcom (EdgeRouter)
+    ('1.3.6.1.4.1.30065.',  'Router',      'Arista'),      # Arista
+    ('1.3.6.1.4.1.18060.',  'Router',      'OpenBSD'),     # OpenBSD/OpenVPN
+    # Switches
+    ('1.3.6.1.4.1.11.',     'Switch',      'HP'),          # HP ProCurve / HPE
+    ('1.3.6.1.4.1.25506.',  'Switch',      'H3C'),         # H3C
+    ('1.3.6.1.4.1.43.',     'Switch',      '3Com'),        # 3Com
+    ('1.3.6.1.4.1.6486.',   'Switch',      'Alcatel'),     # Alcatel-Lucent OmniSwitch
+    ('1.3.6.1.4.1.1916.',   'Switch',      'Extreme Networks'), # Extreme
+    ('1.3.6.1.4.1.1991.',   'Switch',      'Brocade'),     # Brocade / Ruckus ICX
+    ('1.3.6.1.4.1.2636.1.1.1.4.',  'Switch','Juniper'),    # Juniper EX switches
+    ('1.3.6.1.4.1.12356.106.','Switch',     'Fortinet'),   # FortiSwitch
+    # Wireless APs
+    ('1.3.6.1.4.1.14823.',  'Wireless AP', 'Aruba'),       # Aruba
+    ('1.3.6.1.4.1.41112.1.4.','Wireless AP','Ubiquiti'),   # Ubiquiti UniFi AP
+    ('1.3.6.1.4.1.388.',    'Wireless AP', 'Symbol'),      # Symbol/Zebra AP
+    ('1.3.6.1.4.1.25053.',  'Wireless AP', 'Ruckus'),      # Ruckus
+    ('1.3.6.1.4.1.9.1.525', 'Wireless AP', 'Cisco'),       # Cisco Aironet
+    ('1.3.6.1.4.1.14988.',  'Wireless AP', 'MikroTik'),    # MikroTik (also AP)
+    # UPS / Power
+    ('1.3.6.1.4.1.318.',    'UPS',         'APC'),         # APC / Schneider
+    ('1.3.6.1.4.1.534.',    'UPS',         'Eaton'),       # Eaton / Powerware
+    ('1.3.6.1.4.1.476.',    'UPS',         'Liebert'),     # Liebert / Vertiv
+    ('1.3.6.1.4.1.4779.',   'UPS',         'CyberPower'),  # CyberPower
+    ('1.3.6.1.4.1.850.',    'UPS',         'Tripp Lite'),  # Tripp Lite
+    # Printers
+    ('1.3.6.1.4.1.11.2.3.9.','Printer',    'HP'),          # HP JetDirect
+    ('1.3.6.1.4.1.1347.',   'Printer',     'Kyocera'),     # Kyocera
+    ('1.3.6.1.4.1.253.',    'Printer',     'Xerox'),       # Xerox
+    ('1.3.6.1.4.1.2001.',   'Printer',     'Ricoh'),       # Ricoh
+    ('1.3.6.1.4.1.367.',    'Printer',     'Ricoh'),       # Ricoh (alternate)
+    ('1.3.6.1.4.1.1602.',   'Printer',     'Canon'),       # Canon
+    ('1.3.6.1.4.1.2435.',   'Printer',     'Brother'),     # Brother
+    ('1.3.6.1.4.1.1248.',   'Printer',     'Epson'),       # Epson
+    ('1.3.6.1.4.1.18334.',  'Printer',     'Konica Minolta'),# Konica Minolta
+    # Cameras / NVR
+    ('1.3.6.1.4.1.368.',    'IP Camera',   'Axis'),        # Axis
+    ('1.3.6.1.4.1.39165.',  'IP Camera',   'Hikvision'),   # Hikvision
+    ('1.3.6.1.4.1.36493.',  'IP Camera',   'Dahua'),       # Dahua
+    # Load Balancers
+    ('1.3.6.1.4.1.3375.',   'Server',      'F5'),          # F5 BIG-IP
+    ('1.3.6.1.4.1.5624.',   'Firewall',    'Ericom'),      # Ericom / NetScaler alt
+    ('1.3.6.1.4.1.5951.',   'Server',      'Citrix'),      # Citrix NetScaler
+    # NAS / Storage
+    ('1.3.6.1.4.1.6574.',   'Server',      'Synology'),    # Synology
+    ('1.3.6.1.4.1.24681.',  'Server',      'QNAP'),        # QNAP
+    # Generic Cisco (catch-all, must come after specific Cisco entries)
+    ('1.3.6.1.4.1.9.',      'Switch',      'Cisco'),       # Cisco (generic)
+    # Juniper (catch-all)
+    ('1.3.6.1.4.1.2636.',   'Router',      'Juniper'),     # Juniper (generic)
+]
+
+# Apply OID-prefix classification before keyword matching
+_oid_role=None; _oid_mfr=None
+if sys_oid:
+    for prefix,role,mfr in OID_MAP:
+        if sys_oid.startswith(prefix):
+            _oid_role=role; _oid_mfr=mfr; break
 
 FW=['firewall','fortigate','fortios','palo alto','checkpoint','asa','sonicwall',
     'opnsense','pfsense','netscreen','juniper srx','srx','watchguard','sophos','cisco asa',
@@ -1661,7 +1740,7 @@ SW=['switch','catalyst','nexus',' eos ','comware','procurve','arubaos',
     'ex series','qfx','powerconnect','1810g','1910','2530','2920','2960',
     '3750','3850','9300','netgear gs','sg300','sg500','sf ','icx ','fcs ',
     'flexfabric','hp 1910','hp 1810','tplink','tp-link','d-link','dgs-','des-',
-    'unmanaged switch','smart switch','managed switch']
+    'unmanaged switch','smart switch','managed switch','fortiswitch','fsl-']
 AP=['access point','aironet','unifi','airmax','lightweight ap',
     'aruba','instant ap','iap-','wap','wifi','wireless ap','802.11','ath0',
     'ubiquiti','ruijie ap','ruckus','meraki mr']
@@ -1678,7 +1757,11 @@ CA=['camera','axis comm','hikvision','dahua','hanwha',
     'bosch cam','pelco','vivotek','avigilon','genetec','milestone',
     'ip cam','ipcam','nvr','dvr','cctv']
 
-if   any(k in combined for k in FW):  host['device_role']='Firewall'
+# OID-prefix result overrides keyword classifier when SNMP is available
+if _oid_role:
+    host['device_role']=_oid_role
+    if _oid_mfr: host['manufacturer']=_oid_mfr
+elif any(k in combined for k in FW):  host['device_role']='Firewall'
 elif any(k in combined for k in RT) and (snmp_up or '161' in open_ports
      or '830' in open_ports or '8291' in open_ports):
     host['device_role']='Router'
@@ -1704,12 +1787,18 @@ else:
          'procurve':'HP','hp ':'HP','hewlett':'HP','dell':'Dell',
          'microsoft':'Microsoft','vmware':'VMware','apple':'Apple',
          'ubiquiti':'Ubiquiti','mikrotik':'MikroTik','fortigate':'Fortinet',
-         'fortinet':'Fortinet','palo alto':'Palo Alto',
+         'fortinet':'Fortinet','palo alto':'Palo Alto','sonicwall':'SonicWall',
          'checkpoint':'Check Point','apc':'APC','eaton':'Eaton',
          'netgear':'Netgear','axis':'Axis','hikvision':'Hikvision',
          'synology':'Synology','qnap':'QNAP','h3c':'H3C','huawei':'Huawei',
-         'meraki':'Cisco Meraki','brocade':'Brocade',
-         'extreme':'Extreme Networks'}
+         'meraki':'Cisco Meraki','brocade':'Brocade','ruckus':'Ruckus',
+         'aruba':'Aruba','watchguard':'WatchGuard','sophos':'Sophos',
+         'f5 ':'F5','bigip':'F5','netscaler':'Citrix','citrix':'Citrix',
+         'kyocera':'Kyocera','ricoh':'Ricoh','xerox':'Xerox','epson':'Epson',
+         'brother':'Brother','canon':'Canon','konica':'Konica Minolta',
+         'dahua':'Dahua','hanwha':'Hanwha','pelco':'Pelco',
+         'cyberpower':'CyberPower','liebert':'Liebert','vertiv':'Vertiv',
+         'extreme':'Extreme Networks','alcatel':'Alcatel-Lucent'}
     for k,v in MFR.items():
         if k in combined: host['manufacturer']=v; break
 
