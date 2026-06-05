@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.10
+#  Version: 2.2.11
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.10"
+SCRIPT_VERSION="2.2.11"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1194,8 +1194,10 @@ probe_nmap() {
         local rs_raw rs_ports
         # Merge stderr+stdout: Docker routes the "Open IP:PORT" lines to
         # stderr alongside the banner. --accessible strips ANSI color codes.
+        # --no-nmap removed in v2.1.1; "-- -sn" passes ping-only flag to
+        # nmap so it exits fast; RustScan Open IP:PORT lines appear first
         rs_raw=$(rustscan --addresses "$ip" --ulimit 5000 \
-            --range 1-65535 --no-nmap --accessible 2>&1) || true
+            --range 1-65535 --accessible -- -sn 2>&1) || true
         rs_ports=$(printf "%s\n" "$rs_raw" \
             | grep -oP "Open [^:]+:\K[0-9]+" \
             | sort -un | tr "\n" "," | sed "s/,$//" ) || true
@@ -1900,8 +1902,13 @@ else:
          'dahua':'Dahua','hanwha':'Hanwha','pelco':'Pelco',
          'cyberpower':'CyberPower','liebert':'Liebert','vertiv':'Vertiv',
          'extreme':'Extreme Networks','alcatel':'Alcatel-Lucent'}
-    for k,v in MFR.items():
-        if k in combined: host['manufacturer']=v; break
+    # Skip keyword MFR lookup when OID already identified the vendor;
+    # prevents script text from overriding a definitive OID match
+    if not _oid_mfr:
+        for k,v in MFR.items():
+            if k in combined: host['manufacturer']=v; break
+    else:
+        host['manufacturer']=_oid_mfr
 
 sd=snmp.get('sys_descr','') or ''
 if sd: host['model']=sd[:120].strip()
@@ -2281,7 +2288,7 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
         # Populate custom fields: open ports + discovery methods
         local _ports_cf _dmethods_cf
         _ports_cf=$(echo "$host" | jq -r \
-            '[.ports[] | .port + "/" + (.service // "unknown")] | join(", ")' \
+            '[.ports[] | .port + "/" + (.service // .proto // "tcp")] | join(", ")' \
             2>/dev/null || echo "")
         _dmethods_cf=$(echo "$host" | jq -r \
             '.discovery_methods | join(", ")' 2>/dev/null || echo "")
