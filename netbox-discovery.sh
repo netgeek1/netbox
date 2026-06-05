@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.9
+#  Version: 2.2.10
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.9"
+SCRIPT_VERSION="2.2.10"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1191,14 +1191,18 @@ probe_nmap() {
     # Use RustScan when available: scans all 65535 ports fast, hands
     # found ports to nmap for service/version detection
     if cmd_exists rustscan; then
-        local rs_ports
-        # v2.1.1 syntax: --addresses, --range, --no-nmap
-        rs_ports=$(rustscan --addresses "$ip" --ulimit 5000 \
-            --range 1-65535 --no-nmap 2>/dev/null \
-            | grep -oP "Open [^:]+:\K\d+" \
+        local rs_raw rs_ports
+        # Merge stderr+stdout: Docker routes the "Open IP:PORT" lines to
+        # stderr alongside the banner. --accessible strips ANSI color codes.
+        rs_raw=$(rustscan --addresses "$ip" --ulimit 5000 \
+            --range 1-65535 --no-nmap --accessible 2>&1) || true
+        rs_ports=$(printf "%s\n" "$rs_raw" \
+            | grep -oP "Open [^:]+:\K[0-9]+" \
             | sort -un | tr "\n" "," | sed "s/,$//" ) || true
         [[ -n "$rs_ports" ]] && nmap_ports="$rs_ports"
         log_info "RustScan found ports: ${rs_ports:-none}"
+        # Log raw output at trace level for diagnosis
+        echo "[TRACE] rustscan raw: $rs_raw" >> "$LOG_FILE" 2>/dev/null || true
     fi
 
     nmap -sV -O --osscan-guess \
