@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.8
+#  Version: 2.2.9
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.8"
+SCRIPT_VERSION="2.2.9"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -321,20 +321,38 @@ $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
 
     printf "  ${W}RustScan${NC} (fast port scanner) ... "
     if ! cmd_exists rustscan; then
-        local _rs_ver
-        _rs_ver=$(curl -sf \
-            https://api.github.com/repos/RustScan/RustScan/releases/latest \
-            | jq -r '.tag_name // "v2.3.0"' 2>/dev/null || echo "v2.3.0")
-        local _rs_deb="rustscan_${_rs_ver#v}_amd64.deb"
-        if curl -sfL \
-            "https://github.com/RustScan/RustScan/releases/download/${_rs_ver}/${_rs_deb}" \
-            -o /tmp/rustscan.deb 2>/dev/null \
-            && dpkg -i /tmp/rustscan.deb >> "$LOG_FILE" 2>&1; then
-            printf "${G}OK${NC}\n"
-        else
-            printf "${Y}skipped (optional)${NC}\n"
+        # Primary: Docker image (officially recommended; Docker already present
+        # for NetBox). Creates a /usr/local/bin/rustscan wrapper that runs the
+        # container with --network host so it sees the same interfaces as nmap.
+        local _rs_ok=0
+        if cmd_exists docker; then
+            if docker pull rustscan/rustscan:2.1.1 >> "$LOG_FILE" 2>&1; then
+                cat > /usr/local/bin/rustscan <<'RSWRAP'
+#!/bin/bash
+exec docker run --rm --network host rustscan/rustscan:2.1.1 "$@"
+RSWRAP
+                chmod +x /usr/local/bin/rustscan
+                _rs_ok=1
+                printf "${G}OK (Docker)${NC}\n"
+            fi
         fi
-        rm -f /tmp/rustscan.deb
+        # Fallback: .deb from bee-san/RustScan releases
+        if [[ $_rs_ok -eq 0 ]]; then
+            local _rs_ver
+            _rs_ver=$(curl -sf \
+                "https://api.github.com/repos/bee-san/RustScan/releases/latest" \
+                | jq -r '.tag_name // "2.1.1"' 2>/dev/null || echo "2.1.1")
+            local _rs_deb="rustscan_${_rs_ver}_amd64.deb"
+            if curl -sfL \
+                "https://github.com/bee-san/RustScan/releases/download/${_rs_ver}/${_rs_deb}" \
+                -o /tmp/rustscan.deb 2>/dev/null \
+                && dpkg -i /tmp/rustscan.deb >> "$LOG_FILE" 2>&1; then
+                printf "${G}OK (.deb)${NC}\n"
+            else
+                printf "${Y}skipped (optional)${NC}\n"
+            fi
+            rm -f /tmp/rustscan.deb
+        fi
     else printf "${G}already installed${NC}\n"; fi
 
     ensure_docker_group
@@ -1174,11 +1192,13 @@ probe_nmap() {
     # found ports to nmap for service/version detection
     if cmd_exists rustscan; then
         local rs_ports
-        rs_ports=$(rustscan -a "$ip" --ulimit 5000 --range 1-65535 \
-            --no-nmap 2>/dev/null \
-            | grep -oP "(?<=:)\d+" | sort -un | tr "\n" "," | sed "s/,$//") \
-            || true
+        # v2.1.1 syntax: --addresses, --range, --no-nmap
+        rs_ports=$(rustscan --addresses "$ip" --ulimit 5000 \
+            --range 1-65535 --no-nmap 2>/dev/null \
+            | grep -oP "Open [^:]+:\K\d+" \
+            | sort -un | tr "\n" "," | sed "s/,$//" ) || true
         [[ -n "$rs_ports" ]] && nmap_ports="$rs_ports"
+        log_info "RustScan found ports: ${rs_ports:-none}"
     fi
 
     nmap -sV -O --osscan-guess \
