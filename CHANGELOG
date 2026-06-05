@@ -1,3 +1,13 @@
+#  Changelog v2.2.11:
+#   - probe_nmap() RustScan: --no-nmap removed in v2.1.1; replaced with
+#     "-- -sn" so nmap does ping-only (fast); RustScan still emits
+#     "Open IP:PORT" lines before handing off to nmap
+#   - sync_to_netbox(): discovered_ports jq now falls back to .proto ("tcp")
+#     instead of "unknown" when nmap service detection returns null
+#   - merge_host_data(): OID-resolved manufacturer is now authoritative --
+#     keyword MFR loop skipped when OID already identified the vendor,
+#     preventing later script keywords from overriding a definitive OID match
+#
 #  Changelog v2.2.10:
 #   - probe_nmap() RustScan: fixed "found ports: none" -- RustScan Docker
 #     routes all output including Open lines to stderr; changed 2>/dev/null
