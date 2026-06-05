@@ -3,6 +3,8 @@
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
 #  Version: 2.2.14
 # =============================================================================
+#
+# ******** BROKE DETECTION ********
 
 set -uo pipefail
 
