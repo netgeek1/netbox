@@ -1,3 +1,12 @@
+#  Changelog v2.2.9:
+#   - install_deps() RustScan: fixed org (bee-san/RustScan not RustScan/
+#     RustScan); Docker is now primary install method (officially recommended,
+#     already present for NetBox) -- pulls rustscan/rustscan:2.1.1 and writes
+#     /usr/local/bin/rustscan wrapper with --network host; .deb from
+#     bee-san/RustScan releases used as fallback
+#   - probe_nmap() RustScan wrapper: updated for Docker-based rustscan
+#     (passes --addresses / --range flags correctly for v2.1.1)
+#
 #  Changelog v2.2.8:
 #   - FortiGate fix: sys_oid normalised from iso. to 1. prefix so OID-prefix
 #     table matches correctly; sys_descr/chassis_ser cleared when they contain
