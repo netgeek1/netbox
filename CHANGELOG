@@ -1,3 +1,14 @@
+#  Changelog v2.2.13:
+#   - merge_host_data PYEOF: added "import re" (missing; caused NameError
+#     on re.match in entity model extraction, crashing merge and producing
+#     empty results files)
+#   - import_device_type_library(): fixed script name (nb-dt-import.py not
+#     dtl_import.py); uses .env file for NETBOX_URL/NETBOX_TOKEN; vendors
+#     arg is now comma-separated (--vendors cisco,fortinet); DTLI clones the
+#     device type library itself so separate library clone removed
+#   - probe_nmap(): added UDP top-1000 port scan as second nmap pass;
+#     UDP results merged into host ports list with proto="udp"
+#
 #  Changelog v2.2.12:
 #   - probe_snmp(): entity MIB walk (1.3.6.1.2.1.47.1.1.1.1) added;
 #     entity_inventory now populated with desc/name/model/serial/sw_rev
