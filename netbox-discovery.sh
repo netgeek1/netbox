@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.11
+#  Version: 2.2.12
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.11"
+SCRIPT_VERSION="2.2.12"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1299,6 +1299,7 @@ probe_snmp() {
     fi
 
     _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.2.2         > "$tmp/snmp_ifaces.txt"
+    _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.47.1.1.1.1  > "$tmp/snmp_entity.txt"
     _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.17.4.3.1    > "$tmp/snmp_mac.txt"
     _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.17.1.4.1.2  > "$tmp/snmp_bport.txt"
     _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.4.22.1       > "$tmp/snmp_arp.txt"
@@ -1338,6 +1339,7 @@ bport_raw=rf('snmp_bport.txt');   arp_table_raw=rf('snmp_arp.txt')
 ip_table_raw=rf('snmp_iptable.txt'); pvid_raw=rf('snmp_pvid.txt')
 vlan_name_raw=rf('snmp_vlannames.txt')
 cdp_raw=rf('snmp_cdp.txt'); lldp_raw=rf('snmp_lldp.txt')
+entity_raw=rf('snmp_entity.txt')
 
 ifaces={}
 for line in ifaces_raw.split('\n'):
@@ -1409,6 +1411,20 @@ for line in cdp_raw.split('\n'):
             cdp_devs.setdefault(key,{})[fld]=m.group(3).strip().strip('"')
 cdp_neighbors=list(cdp_devs.values())
 
+# Parse entity MIB walk: col 2=desc 7=name 10=sw_rev 11=serial 13=model
+_ent={}
+for _line in entity_raw.split('\n'):
+    _m=re.search(r'47\.1\.1\.1\.1\.(\d+)\.(\d+)\s*=\s*(?:STRING|OID):\s*(.*)',_line)
+    if not _m: continue
+    _col,_idx,_val=_m.group(1),_m.group(2),_m.group(3).strip().strip('"').strip("'")
+    if _is_raw_oid(_val): _val=''
+    _ent.setdefault(_idx,{})
+    {'2':'desc','7':'name','10':'sw_rev','11':'serial','13':'model'}.get(_col) and \
+        _ent[_idx].__setitem__({'2':'desc','7':'name','10':'sw_rev','11':'serial','13':'model'}[_col],_val)
+entity_inventory=[{'desc':v.get('desc',''),'name':v.get('name',''),
+    'model':v.get('model',''),'serial':v.get('serial',''),
+    'sw_rev':v.get('sw_rev','')} for v in _ent.values() if any(v.values())]
+
 lldp_sys={}
 for line in lldp_raw.split('\n'):
     m=re.match(r'.*\.(\d+)\.(\d+)\.(\d+)\s*=\s*STRING:\s*(.*)',line)
@@ -1427,7 +1443,7 @@ print(json.dumps({'available':True,'community':working_token,
     'chassis_serial':chassis_ser,'interfaces':interfaces,'ip_table':ip_table,
     'mac_port_map':mac_port_map,'vlan_pvid':vlan_pvid,'vlan_names':vlan_names,
     'arp_entries':arp_entries,'cdp_neighbors':cdp_neighbors,
-    'lldp_neighbors':lldp_neighbors}))
+    'lldp_neighbors':lldp_neighbors,'entity_inventory':entity_inventory}))
 PYEOF
 }
 
@@ -1915,7 +1931,20 @@ if sd: host['model']=sd[:120].strip()
 elif ssh.get('net_device_info'):
     lns=[l for l in ssh['net_device_info'].split('\n') if l.strip()]
     host['model']=lns[0][:120].strip() if lns else 'Unknown'
-else: host['model']=(host['os'] or 'Unknown')[:80]
+else:
+    # Try entity inventory: sw_rev often has 'ProductName v1.2.3' format;
+    # take first word which is typically the model name (e.g. FortiGate-61E)
+    _ent_model=''
+    for _e in snmp.get('entity_inventory',[]):
+        _sw=(_e.get('sw_rev') or '').strip()
+        _m =(_e.get('model')  or '').strip()
+        if _sw and not _sw.startswith('iso.'):
+            _cand=_sw.split()[0].rstrip(',')
+            if re.match(r'[A-Za-z].*[0-9]',_cand):   # looks like a model
+                _ent_model=_cand[:80]; break
+        if _m and not _m.startswith('iso.'):
+            _ent_model=_m[:80]; break
+    host['model']=_ent_model or (host['os'] or 'Unknown')[:80]
 
 print(json.dumps(host))
 PYEOF
