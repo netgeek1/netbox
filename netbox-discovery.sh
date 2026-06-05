@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.12
+#  Version: 2.2.13
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.12"
+SCRIPT_VERSION="2.2.13"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1216,11 +1216,18 @@ ms-sql-info,mysql-info,mongodb-info,\
 rdp-enum-encryption,vnc-info" \
         -T4 --host-timeout 90s --max-retries 2 \
         -oX "$xml" "$ip" >> "$LOG_FILE" 2>&1 || true
-    python3 /dev/stdin "$xml" <<'PYEOF' > "$tmp/nmap.json" 2>/dev/null
-import xml.etree.ElementTree as ET, json, sys
+    # UDP top-1000 scan (requires root; graceful no-op if not available)
+    local udp_xml="$tmp/nmap_udp.xml"
+    nmap -sU --top-ports 1000 \
+        --script "snmp-info,dns-service-discovery" \
+        -T4 --host-timeout 120s --max-retries 1 \
+        -oX "$udp_xml" "$ip" >> "$LOG_FILE" 2>&1 || true
+    python3 /dev/stdin "$xml" "$udp_xml" <<'PYEOF' > "$tmp/nmap.json" 2>/dev/null
+import xml.etree.ElementTree as ET, json, sys, os
 def parse(f):
     r = {"ports":[],"os":None,"os_accuracy":None,
          "mac":None,"vendor":None,"hostname":None,"scripts":{}}
+    if not f or not os.path.exists(f): return r
     try: tree = ET.parse(f)
     except: return r
     for host in tree.findall('host'):
@@ -1251,7 +1258,15 @@ def parse(f):
         for sc in host.findall('hostscript/script'):
             r['scripts'][sc.get('id','')] = (sc.get('output','') or '')[:300]
     return r
-print(json.dumps(parse(sys.argv[1])))
+# Merge TCP result with UDP result (dedup by port+proto)
+tcp = parse(sys.argv[1])
+udp = parse(sys.argv[2]) if len(sys.argv) > 2 else {"ports":[]}
+seen = {(p["port"],p["proto"]) for p in tcp["ports"]}
+for p in udp["ports"]:
+    if (p["port"],p["proto"]) not in seen:
+        tcp["ports"].append(p)
+        seen.add((p["port"],p["proto"]))
+print(json.dumps(tcp))
 PYEOF
 }
 
@@ -1670,7 +1685,7 @@ PYEOF
 merge_host_data() {
     local ip="$1" tmp="$2"
     python3 /dev/stdin "$ip" "$tmp" <<'PYEOF'
-import json, os, sys
+import json, os, sys, re
 ip=sys.argv[1]; tmp=sys.argv[2]
 def load(f):
     p=os.path.join(tmp,f+'.json')
@@ -3788,51 +3803,57 @@ import_device_type_library() {
     local dtl_dir="$BASE_DIR/devicetype-library"
     local dtli_dir="$BASE_DIR/Device-Type-Library-Import"
 
-    # 1. Clone / update community device type library
-    log_info "Syncing NetBox device type library..."
-    if [[ -d "$dtl_dir/.git" ]]; then
-        git -C "$dtl_dir" pull -q >> "$LOG_FILE" 2>&1 \
-            && log_ok "Library updated" || log_warn "Library update failed (using existing)"
-    else
-        git clone -q \
-            https://github.com/netbox-community/devicetype-library.git \
-            "$dtl_dir" >> "$LOG_FILE" 2>&1 \
-            && log_ok "Library cloned" || { log_error "Clone failed"; pause; return 1; }
-    fi
-
-    # 2. Install Device-Type-Library-Import tool
+    # 1. Clone / update Device-Type-Library-Import tool
+    # Note: DTLI clones the device type library itself into ./repo/
     log_info "Installing Device-Type-Library-Import..."
     if [[ ! -d "$dtli_dir/.git" ]]; then
         git clone -q \
             https://github.com/netbox-community/Device-Type-Library-Import.git \
             "$dtli_dir" >> "$LOG_FILE" 2>&1 || { log_error "DTLI clone failed"; pause; return 1; }
+        log_ok "DTLI cloned"
     else
-        git -C "$dtli_dir" pull -q >> "$LOG_FILE" 2>&1 || true
+        git -C "$dtli_dir" pull -q >> "$LOG_FILE" 2>&1 \
+            && log_ok "DTLI updated" || log_warn "DTLI update skipped (using existing)"
     fi
-    pip3 install --break-system-packages --quiet \
-        -r "$dtli_dir/requirements.txt" \
-        >> "$LOG_FILE" 2>&1 || true
+    # Install requirements into a venv to avoid system package conflicts
+    if [[ ! -d "$dtli_dir/venv" ]]; then
+        python3 -m venv "$dtli_dir/venv" >> "$LOG_FILE" 2>&1 || true
+    fi
+    "$dtli_dir/venv/bin/pip" install --quiet \
+        -r "$dtli_dir/requirements.txt" >> "$LOG_FILE" 2>&1 || true
 
-    # 3. Optional: filter to specific vendors
+    # 2. Write .env config (DTLI reads NETBOX_URL + NETBOX_TOKEN from .env)
+    cat > "$dtli_dir/.env" <<ENVEOF
+NETBOX_URL=${NETBOX_API_URL}
+NETBOX_TOKEN=${NETBOX_API_TOKEN}
+ENVEOF
+
+    # 3. Optional vendor filter
     printf "\n  Import all vendors or specific ones?\n"
     printf "  Examples: cisco juniper fortinet hp dell ubiquiti\n"
     printf "  (blank = import all ~2000 device types)\n"
-    read -rp "  Vendors (space-separated, blank=all): " _vendors
-
-    # 4. Run import
-    log_info "Running Device-Type-Library-Import..."
-    local _dtli_args=(
-        "--url" "$NETBOX_API_URL"
-        "--token" "$NETBOX_API_TOKEN"
-        "--library" "$dtl_dir"
-    )
+    read -rp "  Vendors (comma or space-separated, blank=all): " _vendors
+    # normalise to comma-separated for --vendors arg
+    local _vendor_arg=""
     if [[ -n "${_vendors:-}" ]]; then
-        for _v in $_vendors; do
-            _dtli_args+=("--vendors" "$_v")
-        done
+        _vendor_arg=$(echo "$_vendors" | tr " " ",")
     fi
-    cd "$dtli_dir" && python3 dtl_import.py "${_dtli_args[@]}" \
-        2>&1 | tee -a "$LOG_FILE" | tail -30
+
+    # 4. Run import -- script is nb-dt-import.py
+    log_info "Running Device-Type-Library-Import..."
+    local _script="$dtli_dir/nb-dt-import.py"
+    if [[ ! -f "$_script" ]]; then
+        # Try common alternate names
+        _script=$(find "$dtli_dir" -maxdepth 1 -name "*.py" \
+            ! -name "setup.py" | head -1)
+    fi
+    if [[ -z "$_script" ]]; then
+        log_error "Cannot find DTLI Python script in $dtli_dir"
+        pause; return 1
+    fi
+    local _cmd=("$dtli_dir/venv/bin/python3" "$_script")
+    [[ -n "$_vendor_arg" ]] && _cmd+=("--vendors" "$_vendor_arg")
+    cd "$dtli_dir" && "${_cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | tail -50
     log_ok "Device Type Library import complete"
     pause
 }
