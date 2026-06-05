@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.13
+#  Version: 2.2.14
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.13"
+SCRIPT_VERSION="2.2.14"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1307,6 +1307,9 @@ probe_snmp() {
     sys_uptime=$(  _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.3.0)
     sys_oid=$(     _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.2.0)
     chassis_ser=$( _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.47.1.1.1.1.11.1)
+    ip_fwd=$(      _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.4.1.0)
+    prt_mib=$(     _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.43.5.1.1.1.1)
+    hr_devtype=$(  _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.25.3.2.1.2.1)
     # Clear SNMP error strings from serial (v2.0.9)
     if [[ "$chassis_ser" == *"No Such"* || "$chassis_ser" == iso.* \
           || "$chassis_ser" == *"not available"* ]]; then
@@ -1328,7 +1331,7 @@ probe_snmp() {
         "$tmp" "$tok" \
         "${sys_descr:-}" "${sys_name:-}" "${sys_loc:-}" \
         "${sys_contact:-}" "${sys_uptime:-}" "${sys_oid:-}" \
-        "${chassis_ser:-}" \
+        "${chassis_ser:-}" "${ip_fwd:-}" "${prt_mib:-}" "${hr_devtype:-}" \
         <<'PYEOF' > "$tmp/snmp.json" 2>/dev/null
 import re, json, sys, os
 tmp=sys.argv[1]; working_token=sys.argv[2]
@@ -1336,6 +1339,9 @@ sys_descr=sys.argv[3].strip().strip('"'); sys_name=sys.argv[4].strip().strip('"'
 sys_loc=sys.argv[5].strip().strip('"');   sys_contact=sys.argv[6].strip().strip('"')
 sys_uptime=sys.argv[7].strip();           sys_oid=sys.argv[8].strip()
 chassis_ser=sys.argv[9].strip().strip('"')
+ip_fwd    =sys.argv[10].strip() if len(sys.argv)>10 else ""
+prt_mib   =sys.argv[11].strip() if len(sys.argv)>11 else ""
+hr_devtype=sys.argv[12].strip() if len(sys.argv)>12 else ""
 # Normalize sys_oid: snmpget may return 'iso.3.6.1.4.1.X' instead of '1.3.6.1.4.1.X'
 if sys_oid.startswith('iso.'): sys_oid='1.'+sys_oid[4:]
 # Clear fields that contain raw snmpget OID lines rather than actual values
@@ -1344,6 +1350,11 @@ def _is_raw_oid(v): return v.startswith('iso.') or (v.startswith('1.3.6.') and '
 if _is_raw_oid(sys_descr):    sys_descr=''
 if _is_raw_oid(chassis_ser):  chassis_ser=''
 if _is_raw_oid(sys_name):     sys_name=''
+ip_forwarding=(ip_fwd.strip('"').strip()=='1')
+is_printer_mib=(bool(prt_mib) and not _is_raw_oid(prt_mib)
+    and 'No Such' not in prt_mib and 'noSuchObject' not in prt_mib
+    and 'error' not in prt_mib.lower())
+hr_is_printer=('25.3.1.5' in hr_devtype or 'hrDevicePrinter' in hr_devtype)
 
 def rf(n):
     p=os.path.join(tmp,n)
@@ -1458,7 +1469,9 @@ print(json.dumps({'available':True,'community':working_token,
     'chassis_serial':chassis_ser,'interfaces':interfaces,'ip_table':ip_table,
     'mac_port_map':mac_port_map,'vlan_pvid':vlan_pvid,'vlan_names':vlan_names,
     'arp_entries':arp_entries,'cdp_neighbors':cdp_neighbors,
-    'lldp_neighbors':lldp_neighbors,'entity_inventory':entity_inventory}))
+    'lldp_neighbors':lldp_neighbors,'entity_inventory':entity_inventory,
+    'ip_forwarding':ip_forwarding,
+    'is_printer_mib':is_printer_mib,'hr_is_printer':hr_is_printer}))
 PYEOF
 }
 
@@ -1855,6 +1868,10 @@ OID_MAP=[
     ('1.3.6.1.4.1.2636.',   'Router',      'Juniper'),     # Juniper (generic)
 ]
 
+ip_forwarding=bool(snmp.get('ip_forwarding',False))
+is_printer_mib=bool(snmp.get('is_printer_mib',False))
+hr_is_printer=bool(snmp.get('hr_is_printer',False))
+
 # Apply OID-prefix classification before keyword matching
 _oid_role=None; _oid_mfr=None
 if sys_oid:
@@ -1891,10 +1908,13 @@ CA=['camera','axis comm','hikvision','dahua','hanwha',
     'bosch cam','pelco','vivotek','avigilon','genetec','milestone',
     'ip cam','ipcam','nvr','dvr','cctv']
 
-# OID-prefix result overrides keyword classifier when SNMP is available
-if _oid_role:
+if is_printer_mib or hr_is_printer:
+    host['device_role']='Printer'
+elif _oid_role:
     host['device_role']=_oid_role
     if _oid_mfr: host['manufacturer']=_oid_mfr
+    if _oid_role=='Router' and snmp_up and not ip_forwarding:
+        host['device_role']='Switch'
 elif any(k in combined for k in FW):  host['device_role']='Firewall'
 elif any(k in combined for k in RT) and (snmp_up or '161' in open_ports
      or '830' in open_ports or '8291' in open_ports):
@@ -1913,6 +1933,7 @@ elif any(k in combined for k in SV):  host['device_role']='Server'
 elif 'windows' in os_str:  host['device_role']='Workstation'
 elif '5060' in open_ports or 'sip' in combined: host['device_role']='IP Phone'
 elif '445' in open_ports or nb.get('available'): host['device_role']='Workstation'
+elif ip_forwarding and snmp_up: host['device_role']='Router'
 
 vendor=host.get('vendor','') or ''
 if vendor not in ('','null','None'): host['manufacturer']=vendor
