@@ -1,3 +1,9 @@
+#  Changelog v2.2.14 (improvements from KaSaNaa/SNMP-Network-Discovery):
+#   - probe_snmp(): ipForwarding/Printer MIB/hrDeviceType OIDs added;
+#     Printer MIB/hrDeviceType = Tier-0 definitive printer classification;
+#     Router OID + ip_forwarding=False demoted to Switch; ip_forwarding=True
+#     as final Router fallback before Endpoint
+#
 #  Changelog v2.2.13:
 #   - merge_host_data PYEOF: added "import re" (missing; caused NameError
 #     on re.match in entity model extraction, crashing merge and producing
