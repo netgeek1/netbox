@@ -1,3 +1,9 @@
+#  Changelog v2.2.10:
+#   - probe_nmap() RustScan: fixed "found ports: none" -- RustScan Docker
+#     routes all output including Open lines to stderr; changed 2>/dev/null
+#     to 2>&1 to capture both streams; added --accessible to strip ANSI
+#     color codes that break the grep; log raw output on debug for diagnosis
+#
 #  Changelog v2.2.9:
 #   - install_deps() RustScan: fixed org (bee-san/RustScan not RustScan/
 #     RustScan); Docker is now primary install method (officially recommended,
