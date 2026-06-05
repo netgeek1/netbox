@@ -1,3 +1,13 @@
+#  Changelog v2.2.12:
+#   - probe_snmp(): entity MIB walk (1.3.6.1.2.1.47.1.1.1.1) added;
+#     entity_inventory now populated with desc/name/model/serial/sw_rev
+#     per physical component; was always empty so entity_text in combined
+#     was always blank and model fell through to "Unknown"
+#   - merge_host_data(): model extraction now tries entity_inventory;
+#     prefers sw_rev first word (e.g. "FortiGate-61E" from
+#     "FortiGate-61E v7.2.13,...") then model field (e.g. "FGT_61E")
+#     when sys_descr is empty and SSH has no device info
+#
 #  Changelog v2.2.11:
 #   - probe_nmap() RustScan: --no-nmap removed in v2.1.1; replaced with
 #     "-- -sn" so nmap does ping-only (fast); RustScan still emits
