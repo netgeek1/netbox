@@ -1,3 +1,15 @@
+#  Changelog v2.2.15 (soften ipForwarding hard rules -- regression fix):
+#   - merge_host_data(): REMOVED the Router->Switch demotion that fired when
+#     an OID-classified Router did not expose ipForwarding. Many routers and
+#     firewalls (e.g. FortiGate) do not return ipForwarding or the SNMP get
+#     times out, which was demoting correct OID matches to Switch. The OID
+#     prefix match is now authoritative; ipForwarding is a hint only.
+#   - merge_host_data(): the last-resort ipForwarding=True Router fallback
+#     now also requires NO host-OS indicators (no SV keywords, no "linux",
+#     no "windows" in OS) so Linux boxes, Docker hosts, and hypervisors that
+#     enable IP forwarding are not mislabeled as routers.
+#   - Printer MIB / hrDeviceType Tier-0 check retained (safe, definitive).
+#
 #  Changelog v2.2.14 (improvements from KaSaNaa/SNMP-Network-Discovery):
 #   - probe_snmp(): ipForwarding/Printer MIB/hrDeviceType OIDs added;
 #     Printer MIB/hrDeviceType = Tier-0 definitive printer classification;
