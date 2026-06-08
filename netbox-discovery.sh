@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.3.3
+#  Version: 2.3.4
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.3.3"
+SCRIPT_VERSION="2.3.4"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2041,28 +2041,35 @@ if host.get('manufacturer','Unknown') in ('','Unknown') and k_mfr \
         and k_mfr not in ('Unknown','Unknown (Net-SNMP)'):
     host['manufacturer']=k_mfr
 
+# Model extraction priority:
+#   1. KaSaNaa container's Model Number (clean ENTITY-MIB model, e.g.
+#      "FortiSwitch-224E") -- preferred over the freeform sysDescr text
+#   2. entity_inventory sw_rev first word / model
+#   3. sysDescr text
+#   4. SSH device info / OS string
+_ent_model=''
+for _e in snmp.get('entity_inventory',[]):
+    _sw=(_e.get('sw_rev') or '').strip()
+    _m =(_e.get('model')  or '').strip()
+    if _sw and not _sw.startswith('iso.'):
+        _cand=_sw.split()[0].rstrip(',')
+        if re.match(r'[A-Za-z].*[0-9]',_cand):   # looks like a model
+            _ent_model=_cand[:80]; break
+    if _m and not _m.startswith('iso.'):
+        _ent_model=_m[:80]; break
+
 sd=snmp.get('sys_descr','') or ''
-if sd: host['model']=sd[:120].strip()
+if k_model and k_model not in ('Unknown',):
+    host['model']=k_model[:80]
+elif _ent_model:
+    host['model']=_ent_model
+elif sd:
+    host['model']=sd[:120].strip()
 elif ssh.get('net_device_info'):
     lns=[l for l in ssh['net_device_info'].split('\n') if l.strip()]
     host['model']=lns[0][:120].strip() if lns else 'Unknown'
 else:
-    # Try entity inventory: sw_rev often has 'ProductName v1.2.3' format;
-    # take first word which is typically the model name (e.g. FortiGate-61E)
-    _ent_model=''
-    for _e in snmp.get('entity_inventory',[]):
-        _sw=(_e.get('sw_rev') or '').strip()
-        _m =(_e.get('model')  or '').strip()
-        if _sw and not _sw.startswith('iso.'):
-            _cand=_sw.split()[0].rstrip(',')
-            if re.match(r'[A-Za-z].*[0-9]',_cand):   # looks like a model
-                _ent_model=_cand[:80]; break
-        if _m and not _m.startswith('iso.'):
-            _ent_model=_m[:80]; break
-    host['model']=_ent_model or k_model or (host['os'] or 'Unknown')[:80]
-# If model still unresolved but KaSaNaa parsed one, use it
-if host.get('model','Unknown') in ('','Unknown') and k_model:
-    host['model']=k_model[:80]
+    host['model']=(host['os'] or 'Unknown')[:80]
 
 print(json.dumps(host))
 PYEOF
