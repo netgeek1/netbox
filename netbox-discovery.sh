@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.3.4
+#  Version: 2.3.5
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.3.4"
+SCRIPT_VERSION="2.3.5"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1207,20 +1207,23 @@ probe_nmap() {
         echo "[TRACE] rustscan raw: $rs_raw" >> "$LOG_FILE" 2>/dev/null || true
     fi
 
-    nmap -sV -O --osscan-guess \
+    # -Pn: skip nmap's own host-discovery. Phase 1 already confirmed the host
+    # is live; many Windows hosts block ICMP, so without -Pn nmap declares them
+    # "down" and skips port/OS scanning entirely (empty result -> Endpoint).
+    nmap -Pn -sV -O --osscan-guess \
         -p "$nmap_ports" \
         --script "banner,ssh-hostkey,snmp-info,\
 http-title,http-server-header,ssl-cert,\
 nbstat,smb-security-mode,dns-service-discovery,\
 ms-sql-info,mysql-info,mongodb-info,\
-rdp-enum-encryption,vnc-info" \
+rdp-enum-encryption,rdp-ntlm-info,vnc-info" \
         -T4 --host-timeout 90s --max-retries 2 \
         -oX "$xml" "$ip" >> "$LOG_FILE" 2>&1 || true
     # UDP top-1000 scan (requires root; graceful no-op if not available)
     local udp_xml="$tmp/nmap_udp.xml"
     # UDP scan: top-200 ports, short host-timeout. UDP is slow by nature
     # (no RST on closed ports), so we cap it hard to avoid 90-120s stalls.
-    nmap -sU --top-ports 200 \
+    nmap -Pn -sU --top-ports 200 \
         --script "snmp-info" \
         -T4 --host-timeout 30s --max-retries 0 \
         -oX "$udp_xml" "$ip" >> "$LOG_FILE" 2>&1 || true
@@ -1994,11 +1997,18 @@ elif any(k in combined for k in UP):  host['device_role']='UPS'
 elif any(k in combined for k in CA):  host['device_role']='IP Camera'
 elif 'windows server' in os_str or 'windows server' in combined:
     host['device_role']='Server'
-elif '3389' in open_ports: host['device_role']='Server'
+elif 'windows' in os_str or 'windows' in combined:
+    # Plain Windows (10/11/etc.) is a Workstation. Checked BEFORE the RDP
+    # port rule because Win10/11 workstations commonly have 3389 open --
+    # RDP being enabled does not make a desktop a server.
+    host['device_role']='Workstation'
 elif any(k in combined for k in SV):  host['device_role']='Server'
-elif 'windows' in os_str:  host['device_role']='Workstation'
+elif '3389' in open_ports and not open_ports.intersection({'135','139','445'}):
+    # RDP open with no Windows/SMB context: treat as a server-ish remote host
+    host['device_role']='Server'
 elif '5060' in open_ports or 'sip' in combined: host['device_role']='IP Phone'
-elif '445' in open_ports or nb.get('available'): host['device_role']='Workstation'
+elif '445' in open_ports or '135' in open_ports or nb.get('available'):
+    host['device_role']='Workstation'
 elif k_role in ('Router','Switch','Firewall') and snmp_up:
     # KaSaNaa container classified it via SNMP but our OID/keyword tables
     # did not match -- trust the container's L3/L2 determination.
