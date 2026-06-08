@@ -1,3 +1,11 @@
+#  Changelog v2.3.1 (SNMP container permission fix):
+#   - Dockerfile: KaSaNaa's snmp_manager.py logs to ./logs/snmp_errors.log
+#     (relative to /app); the non-root user could not create it, crashing
+#     every run with FileNotFoundError. Now create /app/logs owned by the
+#     scanner user at build time.
+#   - Image tag bumped latest -> 1.1 so the fixed image rebuilds
+#     automatically (ensure_image skips rebuild when the tag already exists).
+#
 #  Changelog v2.3.0 (SNMP probe -> ephemeral detection container):
 #   - probe_snmp() REWRITTEN: the local snmpget/snmpwalk + Python heredoc
 #     probe is replaced by an ephemeral Docker container built from
