@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.3.0
+#  Version: 2.3.1
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1275,7 +1275,7 @@ PYEOF
 # KaSaNaa/SNMP-Network-Discovery project instead of local snmpget/snmpwalk.
 # This gives proper SNMPv1/v2c/v3 (USM authPriv) support and structured JSON,
 # which is then mapped into the host-record SNMP contract used downstream.
-SNMP_DISCO_IMAGE="${SNMP_DISCO_IMAGE:-netbox-disco/snmp-detect:latest}"
+SNMP_DISCO_IMAGE="${SNMP_DISCO_IMAGE:-netbox-disco/snmp-detect:1.1}"
 SNMP_DISCO_REPO_REF="${SNMP_DISCO_REPO_REF:-main}"
 
 # Build the detection image once (cached). Returns non-zero if docker is
@@ -1309,7 +1309,10 @@ RUN printf '%s\n' \
     'from .snmp_manager import SNMPManager' \
     'from .network_utils import NetworkUtils' \
     > core/__init__.py
-RUN useradd --create-home --uid 10001 scanner
+# snmp_manager.py logs to ./logs/snmp_errors.log (relative to /app); the
+# non-root user cannot create it at runtime, so make it writable at build time.
+RUN mkdir -p /app/logs && useradd --create-home --uid 10001 scanner \
+    && chown -R scanner:scanner /app/logs
 USER scanner
 ENTRYPOINT ["python", "main.py"]
 CMD ["--help"]
