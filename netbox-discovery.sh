@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.14
+#  Version: 2.2.15
 # =============================================================================
-#
-# ******** BROKE DETECTION ********
 
 set -uo pipefail
 
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.14"
+SCRIPT_VERSION="2.2.15"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1913,10 +1911,11 @@ CA=['camera','axis comm','hikvision','dahua','hanwha',
 if is_printer_mib or hr_is_printer:
     host['device_role']='Printer'
 elif _oid_role:
+    # OID-prefix match is authoritative. ipForwarding is a hint, NOT an
+    # override -- many routers/firewalls do not expose ipForwarding via SNMP
+    # (or the get times out), so it must never demote a definitive OID match.
     host['device_role']=_oid_role
     if _oid_mfr: host['manufacturer']=_oid_mfr
-    if _oid_role=='Router' and snmp_up and not ip_forwarding:
-        host['device_role']='Switch'
 elif any(k in combined for k in FW):  host['device_role']='Firewall'
 elif any(k in combined for k in RT) and (snmp_up or '161' in open_ports
      or '830' in open_ports or '8291' in open_ports):
@@ -1935,7 +1934,12 @@ elif any(k in combined for k in SV):  host['device_role']='Server'
 elif 'windows' in os_str:  host['device_role']='Workstation'
 elif '5060' in open_ports or 'sip' in combined: host['device_role']='IP Phone'
 elif '445' in open_ports or nb.get('available'): host['device_role']='Workstation'
-elif ip_forwarding and snmp_up: host['device_role']='Router'
+elif ip_forwarding and snmp_up and not any(k in combined for k in SV) \
+     and 'linux' not in combined and 'windows' not in os_str:
+    # Last-resort only: device forwards IP and answers SNMP but matched no
+    # OID/keyword/port signal AND shows no host-OS indicators (Linux/Windows
+    # boxes and hypervisors routinely enable forwarding without being routers).
+    host['device_role']='Router'
 
 vendor=host.get('vendor','') or ''
 if vendor not in ('','null','None'): host['manufacturer']=vendor
