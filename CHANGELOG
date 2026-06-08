@@ -1,3 +1,16 @@
+#  Changelog v2.3.3 (CRITICAL: container data was being discarded):
+#   - probe_snmp() mapper: FIXED a stdin conflict that silently threw away
+#     ALL container SNMP data. The mapper read the KaSaNaa JSON from stdin
+#     while the python program itself was also fed on stdin via the heredoc;
+#     the heredoc won, json.load(sys.stdin) got an empty stream, and every
+#     device came back available:false (hence Endpoint, empty sys_oid, and
+#     no 'snmp' in discovery_methods even when the probe logged SUCCESS).
+#     The raw JSON is now written to a temp file and passed as argv[1].
+#   - merge_host_data(): OID-prefix classification now uses LONGEST matching
+#     prefix with a component boundary, instead of first-match-wins. Fixes
+#     FortiSwitch (1.3.6.1.4.1.12356.106 -> Switch) being mis-hit by the
+#     generic Fortinet prefix (1.3.6.1.4.1.12356 -> Firewall) listed first.
+#
 #  Changelog v2.3.2 (SNMP detection diagnostics + UDP scan taming):
 #   - probe_snmp(): now logs every credential attempt and the raw container
 #     output on failure to the discovery log as [TRACE] snmp-disco lines,
