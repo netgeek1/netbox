@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.3.5
+#  Version: 2.3.6
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.3.5"
+SCRIPT_VERSION="2.3.6"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1190,6 +1190,7 @@ probe_nmap() {
 
     # Use RustScan when available: scans all 65535 ports fast, hands
     # found ports to nmap for service/version detection
+    local found_ports=""
     if cmd_exists rustscan; then
         local rs_raw rs_ports
         # Merge stderr+stdout: Docker routes the "Open IP:PORT" lines to
@@ -1201,17 +1202,34 @@ probe_nmap() {
         rs_ports=$(printf "%s\n" "$rs_raw" \
             | grep -oP "Open [^:]+:\K[0-9]+" \
             | sort -un | tr "\n" "," | sed "s/,$//" ) || true
-        [[ -n "$rs_ports" ]] && nmap_ports="$rs_ports"
+        [[ -n "$rs_ports" ]] && found_ports="$rs_ports"
         log_info "RustScan found ports: ${rs_ports:-none}"
-        # Log raw output at trace level for diagnosis
         echo "[TRACE] rustscan raw: $rs_raw" >> "$LOG_FILE" 2>/dev/null || true
     fi
 
+    # Fast nmap discovery pass when RustScan found nothing. This is what makes
+    # heavily-filtered Windows hosts work: a plain -Pn SYN scan (no -sV, no NSE
+    # scripts, no -O) finds open ports in seconds, whereas running -sV + scripts
+    # against ~40 filtered ports stalls and blows --host-timeout (host aborted,
+    # empty result). Mirrors a manual "nmap -Pn <ip>" which completes in <10s.
+    if [[ -z "$found_ports" ]]; then
+        local disc_xml="$tmp/nmap_disc.xml"
+        nmap -Pn -T4 --host-timeout 30s --max-retries 1 \
+            -p "$nmap_ports" -oX "$disc_xml" "$ip" >> "$LOG_FILE" 2>&1 || true
+        found_ports=$(grep -oP 'portid="\K[0-9]+' "$disc_xml" 2>/dev/null \
+            | sort -un | tr "\n" "," | sed "s/,$//") || true
+        echo "[TRACE] nmap fast-discovery $ip found: ${found_ports:-none}" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+
+    # Deep scan: -sV/-O/scripts only against the confirmed-open ports (fast,
+    # since there are few). If discovery found nothing, fall back to probing the
+    # critical Windows/mgmt ports so OS/script detection still gets a chance.
+    local scan_ports="${found_ports:-135,139,443,445,3389,5985,5986}"
     # -Pn: skip nmap's own host-discovery. Phase 1 already confirmed the host
     # is live; many Windows hosts block ICMP, so without -Pn nmap declares them
     # "down" and skips port/OS scanning entirely (empty result -> Endpoint).
     nmap -Pn -sV -O --osscan-guess \
-        -p "$nmap_ports" \
+        -p "$scan_ports" \
         --script "banner,ssh-hostkey,snmp-info,\
 http-title,http-server-header,ssl-cert,\
 nbstat,smb-security-mode,dns-service-discovery,\
@@ -1835,6 +1853,15 @@ snmp_up=bool(snmp.get('available'))
 sys_descr=(snmp.get('sys_descr') or '').lower()
 os_str=(host['os'] or '').lower()
 open_ports={str(p.get('port','')) for p in host['ports']}
+# nmap frequently mis-fingerprints heavily-filtered Windows hosts as
+# "Linux 2.6.x". Use only Windows-EXCLUSIVE ports here -- msrpc(135), RDP(3389),
+# WinRM(5985/6), vmrdp(2179), MSMQ(1801,2103-2107), WSD(5357). NetBIOS/SMB
+# (137-139,445) are deliberately excluded because Samba serves them on Linux.
+_win_ports={'135','3389','5985','5986','2179',
+            '1801','2103','2105','2107','5357'}
+if 'linux' in os_str and (open_ports & _win_ports):
+    host['os']='Microsoft Windows'; host['os_accuracy']=None
+    os_str='microsoft windows'
 http_ttl=' '.join(s.get('title','') for s in host['http_services']).lower()
 # Include entity MIB descriptions + model names so devices whose sysDescr
 # is sparse (e.g. 'FortiGate-61E') still get classified from entity strings
