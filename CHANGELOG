@@ -1,3 +1,15 @@
+#  Changelog v2.3.7 (capture RustScan ports; broaden OS-misfingerprint guard):
+#   - probe_nmap() parser: RustScan/discovery-found TCP ports are now UNIONED
+#     into host['ports'], passed as argv[3]. RustScan reliably finds open
+#     ports via fast SYN scan, but the -sV/-O/script deep scan still stalls
+#     and aborts on host-firewalled boxes, so those ports were being fed to
+#     nmap's -p and then LOST (empty open_ports -> Endpoint, despite the log
+#     showing 'RustScan found ports: 135,3389,...'). Now they always land in
+#     the record; nmap only enriches them with service/version when it can.
+#   - merge_host_data(): Windows-exclusive-port OS override no longer gates
+#     on 'linux' -- it now overrides ANY non-Windows guess (also seen:
+#     'Allen Bradley MicroLogix 1100 PLC') to 'Microsoft Windows'.
+# 
 #  Changelog v2.3.6 (filtered Windows hosts: reliable port discovery +
 #  OS-misfingerprint guard):
 #   - probe_nmap(): added a FAST nmap discovery pass (-Pn, no -sV/scripts/-O,
