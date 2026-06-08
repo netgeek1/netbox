@@ -1,3 +1,19 @@
+#  Changelog v2.3.6 (filtered Windows hosts: reliable port discovery +
+#  OS-misfingerprint guard):
+#   - probe_nmap(): added a FAST nmap discovery pass (-Pn, no -sV/scripts/-O,
+#     30s timeout) used when RustScan finds nothing. The deep -sV/-O/script
+#     scan then runs ONLY against confirmed-open ports. Previously, running
+#     -sV + 14 NSE scripts against ~40 ports on a host-firewalled Windows box
+#     stalled past --host-timeout 90s and nmap aborted the host, yielding an
+#     empty result (Endpoint). Mirrors a manual 'nmap -Pn <ip>' (<10s).
+#   - merge_host_data(): nmap commonly mis-fingerprints filtered Windows
+#     hosts as 'Linux 2.6.x'. When a Windows-EXCLUSIVE port is open
+#     (msrpc 135, RDP 3389, WinRM 5985/6, vmrdp 2179, MSMQ 1801/2103-2107,
+#     WSD 5357) the Linux guess is overridden to 'Microsoft Windows', fixing
+#     role (Workstation/Server) and manufacturer (Microsoft). NetBIOS/SMB
+#     (137-139,445) are excluded from this set since Samba serves them on
+#     Linux -- real Linux/Samba hosts stay Linux/Server.
+# 
 #  Changelog v2.3.5 (Windows hosts: -Pn + RDP/Workstation classification):
 #   - probe_nmap(): added -Pn to both TCP and UDP nmap scans. Phase 1 has
 #     already confirmed the host is live; many Windows hosts block ICMP, so
