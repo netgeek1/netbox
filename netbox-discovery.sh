@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.3.6
+#  Version: 2.3.7
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.3.6"
+SCRIPT_VERSION="2.3.7"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1245,7 +1245,7 @@ rdp-enum-encryption,rdp-ntlm-info,vnc-info" \
         --script "snmp-info" \
         -T4 --host-timeout 30s --max-retries 0 \
         -oX "$udp_xml" "$ip" >> "$LOG_FILE" 2>&1 || true
-    python3 /dev/stdin "$xml" "$udp_xml" <<'PYEOF' > "$tmp/nmap.json" 2>/dev/null
+    python3 /dev/stdin "$xml" "$udp_xml" "${found_ports:-}" <<'PYEOF' > "$tmp/nmap.json" 2>/dev/null
 import xml.etree.ElementTree as ET, json, sys, os
 def parse(f):
     r = {"ports":[],"os":None,"os_accuracy":None,
@@ -1289,6 +1289,18 @@ for p in udp["ports"]:
     if (p["port"],p["proto"]) not in seen:
         tcp["ports"].append(p)
         seen.add((p["port"],p["proto"]))
+# Union RustScan/discovery-found TCP ports. RustScan reliably finds open ports
+# via fast SYN scan even on host-firewalled boxes where the -sV/-O/script deep
+# scan stalls and reports nothing. Without this, RustScan's ports were fed only
+# to nmap's -p and then lost when the deep scan aborted -- leaving open_ports
+# empty so the classifier could not see the Windows ports.
+disc = sys.argv[3] if len(sys.argv) > 3 else ""
+for tok in disc.split(","):
+    tok = tok.strip()
+    if tok.isdigit() and (tok, "tcp") not in seen:
+        tcp["ports"].append({"port":tok,"proto":"tcp","service":None,
+                             "version":None,"banner":None,"scripts":{}})
+        seen.add((tok, "tcp"))
 print(json.dumps(tcp))
 PYEOF
 }
@@ -1853,13 +1865,15 @@ snmp_up=bool(snmp.get('available'))
 sys_descr=(snmp.get('sys_descr') or '').lower()
 os_str=(host['os'] or '').lower()
 open_ports={str(p.get('port','')) for p in host['ports']}
-# nmap frequently mis-fingerprints heavily-filtered Windows hosts as
-# "Linux 2.6.x". Use only Windows-EXCLUSIVE ports here -- msrpc(135), RDP(3389),
-# WinRM(5985/6), vmrdp(2179), MSMQ(1801,2103-2107), WSD(5357). NetBIOS/SMB
-# (137-139,445) are deliberately excluded because Samba serves them on Linux.
+# nmap mis-fingerprints filtered Windows hosts badly (seen: "Linux 2.6.18",
+# "Allen Bradley MicroLogix 1100 PLC"). Windows-EXCLUSIVE ports are decisive:
+# msrpc(135), RDP(3389), WinRM(5985/6), vmrdp(2179), MSMQ(1801,2103-2107),
+# WSD(5357). When any are open and the OS guess isn't already Windows, assert
+# "Microsoft Windows" -- fixes role (Workstation/Server) and mfr (Microsoft).
+# NetBIOS/SMB (137-139,445) are excluded since Samba serves them on Linux.
 _win_ports={'135','3389','5985','5986','2179',
             '1801','2103','2105','2107','5357'}
-if 'linux' in os_str and (open_ports & _win_ports):
+if (open_ports & _win_ports) and 'windows' not in os_str:
     host['os']='Microsoft Windows'; host['os_accuracy']=None
     os_str='microsoft windows'
 http_ttl=' '.join(s.get('title','') for s in host['http_services']).lower()
