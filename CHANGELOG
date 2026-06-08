@@ -1,3 +1,24 @@
+#  Changelog v2.3.0 (SNMP probe -> ephemeral detection container):
+#   - probe_snmp() REWRITTEN: the local snmpget/snmpwalk + Python heredoc
+#     probe is replaced by an ephemeral Docker container built from
+#     KaSaNaa/SNMP-Network-Discovery. Proper SNMPv1/v2c/v3 (USM authPriv)
+#     support -- fixes detection of the SNMPv3-only FortiGate.
+#   - snmp_disco_ensure_image(): builds netbox-disco/snmp-detect:latest once
+#     (multi-stage, pysnmp-only, non-root); Dockerfile embedded in-script.
+#     Override image/ref via SNMP_DISCO_IMAGE / SNMP_DISCO_REPO_REF.
+#   - snmp_disco_run(): runs --rm --network host container per host; v2c
+#     communities tried first, then SNMPv3 USM creds from the store.
+#   - KaSaNaa JSON mapped into the existing snmp.json contract (sys_descr,
+#     sys_oid, chassis_serial, interfaces, ip_table, lldp/cdp neighbors,
+#     entity_inventory). Container's Device Type / Manufacturer / Model
+#     carried as kasanaa_role/_manufacturer/_model and used in
+#     merge_host_data() as fallbacks AFTER the OID/keyword classifier.
+#   - Graceful fallback: if docker is absent or the build fails, probe_snmp
+#     marks SNMP unavailable and the scan proceeds on nmap/ssh/winrm tiers.
+#   - NOTE: ipForwarding / Printer-MIB / hrDeviceType OIDs are not collected
+#     by the container, so those signals are False under SNMP now; OID-table
+#     and keyword classification (which identify the FortiGate) are intact.
+#
 #  Changelog v2.2.15 (soften ipForwarding hard rules -- regression fix):
 #   - merge_host_data(): REMOVED the Router->Switch demotion that fired when
 #     an OID-classified Router did not expose ipForwarding. Many routers and
