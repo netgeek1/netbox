@@ -1,3 +1,16 @@
+#  Changelog v2.3.2 (SNMP detection diagnostics + UDP scan taming):
+#   - probe_snmp(): now logs every credential attempt and the raw container
+#     output on failure to the discovery log as [TRACE] snmp-disco lines,
+#     so a silent 'Endpoint' result can be traced to wrong community / bad
+#     v3 digest / unreachable / timeout. Grep: TRACE.*snmp-disco
+#   - probe_snmp(): SNMPv3 now falls back to authNoPriv when a stored cred
+#     has no privacy key (KaSaNaa otherwise errors, requiring all 5 params).
+#   - snmp_disco_run(): PYTHONWARNINGS=ignore silences the pysnmp AES CFB
+#     CryptographyDeprecationWarning that was spamming the log.
+#   - probe_nmap(): UDP scan reduced from top-1000/120s to top-200/30s with
+#     --max-retries 0 -- the 1000-port UDP pass was burning 90-120s per host
+#     and hitting host-timeout on every device.
+# 
 #  Changelog v2.3.1 (SNMP container permission fix):
 #   - Dockerfile: KaSaNaa's snmp_manager.py logs to ./logs/snmp_errors.log
 #     (relative to /app); the non-root user could not create it, crashing
