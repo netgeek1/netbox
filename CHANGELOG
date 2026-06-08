@@ -1,3 +1,9 @@
+#  Changelog v2.3.4 (model field: prefer container Model Number):
+#   - merge_host_data(): model extraction reordered to prefer KaSaNaa's
+#     ENTITY-MIB Model Number (e.g. 'FortiSwitch-224E') over the freeform
+#     sysDescr text (e.g. 'FortiSwitch SNMPv3'). New priority: container
+#     Model Number -> entity sw_rev/model -> sysDescr -> SSH info -> OS.
+# 
 #  Changelog v2.3.3 (CRITICAL: container data was being discarded):
 #   - probe_snmp() mapper: FIXED a stdin conflict that silently threw away
 #     ALL container SNMP data. The mapper read the KaSaNaa JSON from stdin
