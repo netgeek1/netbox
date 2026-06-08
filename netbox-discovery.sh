@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.2.15
+#  Version: 2.3.0
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.2.15"
+SCRIPT_VERSION="2.3.0"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1270,208 +1270,236 @@ print(json.dumps(tcp))
 PYEOF
 }
 
+# ?? SNMP detection container (KaSaNaa/SNMP-Network-Discovery) ?????????????????
+# The SNMP probe now runs an ephemeral Docker container built from the
+# KaSaNaa/SNMP-Network-Discovery project instead of local snmpget/snmpwalk.
+# This gives proper SNMPv1/v2c/v3 (USM authPriv) support and structured JSON,
+# which is then mapped into the host-record SNMP contract used downstream.
+SNMP_DISCO_IMAGE="${SNMP_DISCO_IMAGE:-netbox-disco/snmp-detect:latest}"
+SNMP_DISCO_REPO_REF="${SNMP_DISCO_REPO_REF:-main}"
+
+# Build the detection image once (cached). Returns non-zero if docker is
+# unavailable or the build fails, so probe_snmp can fall back gracefully.
+snmp_disco_ensure_image() {
+    command -v docker &>/dev/null || {
+        log_warn "docker not found -- SNMP detection container unavailable"
+        return 1; }
+    if docker image inspect "$SNMP_DISCO_IMAGE" &>/dev/null; then
+        return 0
+    fi
+    log_info "Building SNMP detection container ($SNMP_DISCO_IMAGE) ..."
+    local bd; bd=$(mktemp -d)
+    cat > "$bd/Dockerfile" <<'DOCKEREOF'
+FROM python:3.12-slim AS build
+ARG REPO_REF=main
+ARG REPO_URL=https://github.com/KaSaNaa/SNMP-Network-Discovery.git
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt
+RUN git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" app \
+    || git clone "${REPO_URL}" app
+
+FROM python:3.12-slim
+RUN pip install --no-cache-dir "pysnmp==7.1.22" "pyasn1==0.6.1" "cryptography>=40.0.0"
+WORKDIR /app
+COPY --from=build /opt/app/main.py ./main.py
+COPY --from=build /opt/app/core    ./core
+# Neutralise eager DB/graph imports so detection needs only the pysnmp stack.
+RUN printf '%s\n' \
+    'from .snmp_manager import SNMPManager' \
+    'from .network_utils import NetworkUtils' \
+    > core/__init__.py
+RUN useradd --create-home --uid 10001 scanner
+USER scanner
+ENTRYPOINT ["python", "main.py"]
+CMD ["--help"]
+DOCKEREOF
+    if docker build --build-arg REPO_REF="$SNMP_DISCO_REPO_REF" \
+            -t "$SNMP_DISCO_IMAGE" "$bd" >>"$LOG_FILE" 2>&1; then
+        log_ok "SNMP detection container built"
+        rm -rf "$bd"; return 0
+    fi
+    log_error "SNMP detection container build failed (see $LOG_FILE)"
+    rm -rf "$bd"; return 1
+}
+
+# Run the ephemeral container against one IP. Args after the IP are passed
+# straight through to main.py (SNMP version + credentials). Prints JSON.
+snmp_disco_run() {
+    local ip="$1"; shift
+    timeout "$((SNMP_TIMEOUT * 8 + 20))" \
+        docker run --rm --network host --security-opt no-new-privileges \
+        "$SNMP_DISCO_IMAGE" "$ip" "$@" 2>>"$LOG_FILE"
+}
+
+# True if the JSON response indicates the device answered SNMP (no error key).
+snmp_disco_ok() {
+    [[ -n "$1" ]] && echo "$1" | jq -e 'has("error")|not' &>/dev/null
+}
+
 # ?? Probe: SNMP ???????????????????????????????????????????????????????????????
 probe_snmp() {
     local ip="$1" tmp="$2"
     echo '{"available":false}' > "$tmp/snmp.json"
+
+    snmp_disco_ensure_image || return
+
+    local raw="" label=""
+
+    # 1. Try v2c communities
     local communities; communities=$(get_communities_for "$ip")
-    local tok="" comm
+    local comm
     while IFS= read -r comm; do
-        snmpget -v2c -c "$comm" -t "$SNMP_TIMEOUT" -r 1 \
-            "$ip" 1.3.6.1.2.1.1.1.0 &>/dev/null && { tok="$comm"; break; }
+        [[ -z "$comm" ]] && continue
+        raw=$(snmp_disco_run "$ip" --version 2 --community "$comm")
+        if snmp_disco_ok "$raw"; then label="v2c:${comm}"; break; fi
     done <<< "$communities"
-    if [[ -z "$tok" ]]; then
+
+    # 2. Try SNMPv3 USM credentials from the store
+    if [[ -z "$label" ]]; then
         local creds; creds=$(read_creds)
         local v3c
         while IFS= read -r v3c; do
+            [[ -z "$v3c" ]] && continue
             local v3u v3ap v3ap2 v3pp v3pp2
-            v3u=$(echo "$v3c"    | jq -r '.username')
-            v3ap=$(echo "$v3c"   | jq -r '.auth_proto // "SHA"')
-            v3ap2=$(echo "$v3c"  | jq -r '.auth_pass')
-            v3pp=$(echo "$v3c"   | jq -r '.priv_proto // "AES"')
-            v3pp2=$(echo "$v3c"  | jq -r '.priv_pass')
-            snmpget -v3 -u "$v3u" -l authPriv \
-                -a "$v3ap" -A "$v3ap2" -x "$v3pp" -X "$v3pp2" \
-                -t "$SNMP_TIMEOUT" -r 1 "$ip" 1.3.6.1.2.1.1.1.0 &>/dev/null \
-                && { tok="v3:${v3u}:${v3ap}:${v3ap2}:${v3pp}:${v3pp2}"; break; }
+            v3u=$(echo "$v3c"   | jq -r '.username')
+            v3ap=$(echo "$v3c"  | jq -r '.auth_proto // "SHA"')
+            v3ap2=$(echo "$v3c" | jq -r '.auth_pass')
+            v3pp=$(echo "$v3c"  | jq -r '.priv_proto // "AES"')
+            v3pp2=$(echo "$v3c" | jq -r '.priv_pass')
+            raw=$(snmp_disco_run "$ip" --version 3 --user "$v3u" \
+                --auth_key "$v3ap2" --auth_proto "$v3ap" \
+                --priv_key "$v3pp2" --priv_proto "$v3pp")
+            if snmp_disco_ok "$raw"; then label="v3:${v3u}"; break; fi
         done < <(echo "$creds" | jq -c '.snmp_v3[]' 2>/dev/null || true)
     fi
-    [[ -z "$tok" ]] && return
 
-    local t="$tok" ts="$SNMP_TIMEOUT"
-    local sys_descr sys_name sys_loc sys_contact sys_uptime sys_oid chassis_ser
-    sys_descr=$(   _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.1.0)
-    sys_name=$(    _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.5.0)
-    sys_loc=$(     _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.6.0)
-    sys_contact=$( _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.4.0)
-    sys_uptime=$(  _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.3.0)
-    sys_oid=$(     _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.1.2.0)
-    chassis_ser=$( _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.47.1.1.1.1.11.1)
-    ip_fwd=$(      _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.4.1.0)
-    prt_mib=$(     _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.43.5.1.1.1.1)
-    hr_devtype=$(  _snmp_get "$ip" "$t" "$ts" 1.3.6.1.2.1.25.3.2.1.2.1)
-    # Clear SNMP error strings from serial (v2.0.9)
-    if [[ "$chassis_ser" == *"No Such"* || "$chassis_ser" == iso.* \
-          || "$chassis_ser" == *"not available"* ]]; then
-        chassis_ser=""
-    fi
+    [[ -z "$label" ]] && return
 
-    _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.2.2         > "$tmp/snmp_ifaces.txt"
-    _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.47.1.1.1.1  > "$tmp/snmp_entity.txt"
-    _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.17.4.3.1    > "$tmp/snmp_mac.txt"
-    _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.17.1.4.1.2  > "$tmp/snmp_bport.txt"
-    _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.4.22.1       > "$tmp/snmp_arp.txt"
-    _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.4.20.1       > "$tmp/snmp_iptable.txt"
-    _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.2.1.17.7.1.4.5.1.1 > "$tmp/snmp_pvid.txt"
-    _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.4.1.9.9.46.1.3.1.1.2 > "$tmp/snmp_vlannames.txt"
-    _snmp_walk "$ip" "$t" "$ts" 1.3.6.1.4.1.9.9.23.1.2.1.1 > "$tmp/snmp_cdp.txt"
-    _snmp_walk "$ip" "$t" "$ts" 1.0.8802.1.1.2.1.4       > "$tmp/snmp_lldp.txt"
+    # 3. Map KaSaNaa JSON -> host-record SNMP contract
+    echo "$raw" | SNMP_LABEL="$label" python3 /dev/stdin > "$tmp/snmp.json" 2>>"$LOG_FILE" <<'PYEOF'
+import json, os, re, sys
 
-    python3 /dev/stdin \
-        "$tmp" "$tok" \
-        "${sys_descr:-}" "${sys_name:-}" "${sys_loc:-}" \
-        "${sys_contact:-}" "${sys_uptime:-}" "${sys_oid:-}" \
-        "${chassis_ser:-}" "${ip_fwd:-}" "${prt_mib:-}" "${hr_devtype:-}" \
-        <<'PYEOF' > "$tmp/snmp.json" 2>/dev/null
-import re, json, sys, os
-tmp=sys.argv[1]; working_token=sys.argv[2]
-sys_descr=sys.argv[3].strip().strip('"'); sys_name=sys.argv[4].strip().strip('"')
-sys_loc=sys.argv[5].strip().strip('"');   sys_contact=sys.argv[6].strip().strip('"')
-sys_uptime=sys.argv[7].strip();           sys_oid=sys.argv[8].strip()
-chassis_ser=sys.argv[9].strip().strip('"')
-ip_fwd    =sys.argv[10].strip() if len(sys.argv)>10 else ""
-prt_mib   =sys.argv[11].strip() if len(sys.argv)>11 else ""
-hr_devtype=sys.argv[12].strip() if len(sys.argv)>12 else ""
-# Normalize sys_oid: snmpget may return 'iso.3.6.1.4.1.X' instead of '1.3.6.1.4.1.X'
-if sys_oid.startswith('iso.'): sys_oid='1.'+sys_oid[4:]
-# Clear fields that contain raw snmpget OID lines rather than actual values
-# (happens when device returns empty/no value, e.g. FortiGate empty sysDescr)
-def _is_raw_oid(v): return v.startswith('iso.') or (v.startswith('1.3.6.') and '=' in v)
-if _is_raw_oid(sys_descr):    sys_descr=''
-if _is_raw_oid(chassis_ser):  chassis_ser=''
-if _is_raw_oid(sys_name):     sys_name=''
-ip_forwarding=(ip_fwd.strip('"').strip()=='1')
-is_printer_mib=(bool(prt_mib) and not _is_raw_oid(prt_mib)
-    and 'No Such' not in prt_mib and 'noSuchObject' not in prt_mib
-    and 'error' not in prt_mib.lower())
-hr_is_printer=('25.3.1.5' in hr_devtype or 'hrDevicePrinter' in hr_devtype)
+try:
+    k = json.load(sys.stdin)
+except Exception:
+    print('{"available":false}'); sys.exit(0)
+if not isinstance(k, dict) or 'error' in k:
+    print('{"available":false}'); sys.exit(0)
 
-def rf(n):
-    p=os.path.join(tmp,n)
-    return open(p).read() if os.path.exists(p) else ''
+label = os.environ.get('SNMP_LABEL', '')
 
-ifaces_raw=rf('snmp_ifaces.txt'); mac_table_raw=rf('snmp_mac.txt')
-bport_raw=rf('snmp_bport.txt');   arp_table_raw=rf('snmp_arp.txt')
-ip_table_raw=rf('snmp_iptable.txt'); pvid_raw=rf('snmp_pvid.txt')
-vlan_name_raw=rf('snmp_vlannames.txt')
-cdp_raw=rf('snmp_cdp.txt'); lldp_raw=rf('snmp_lldp.txt')
-entity_raw=rf('snmp_entity.txt')
+def _dehex(s):
+    # Decode SNMP hex strings like '0x436973...' or '43 69 73 ...' to text
+    t = s.strip()
+    if t.lower().startswith('0x'):
+        t = t[2:]
+    compact = t.replace(' ', '')
+    if len(compact) >= 4 and len(compact) % 2 == 0 \
+            and re.fullmatch(r'[0-9A-Fa-f]+', compact):
+        try:
+            dec = bytes.fromhex(compact).decode('utf-8', 'replace')
+            # keep only if it produced mostly printable text
+            printable = sum(c.isprintable() or c in '\r\n\t' for c in dec)
+            if dec and printable / len(dec) > 0.8:
+                return dec.strip()
+        except Exception:
+            pass
+    return s
 
-ifaces={}
-for line in ifaces_raw.split('\n'):
-    idx_m=re.search(r'(\d+)\s*=',line)
-    if not idx_m: continue
-    idx=idx_m.group(1)
-    v=re.search(r'=\s*(?:STRING|INTEGER|Gauge32|Counter32|PhysAddress):\s*(.*)',line)
-    if not v: continue
-    val=v.group(1).strip().strip('"')
-    if idx not in ifaces: ifaces[idx]={}
-    if '2.2.1.2.'  in line: ifaces[idx]['name']        =val
-    elif '2.2.1.3.' in line: ifaces[idx]['type']       =val
-    elif '2.2.1.6.' in line: ifaces[idx]['mac']        =val
-    elif '2.2.1.7.' in line: ifaces[idx]['admin_status']=val
-    elif '2.2.1.8.' in line: ifaces[idx]['oper_status'] =val
-    elif '2.2.1.5.' in line: ifaces[idx]['speed']       =val
-interfaces=[{'index':k,**v} for k,v in ifaces.items() if 'name' in v]
+def clean(v):
+    if v is None: return ''
+    s = str(v).strip()
+    if s in ('Unknown', 'N/A', 'Unknown (Parsed from sysDescr)'): return ''
+    if s.startswith('Unknown ('): return ''
+    return _dehex(s)
 
-port_to_if={}
-for line in bport_raw.split('\n'):
-    m=re.match(r'.*\.(\d+)\s*=\s*INTEGER:\s*(\d+)',line)
-    if m: port_to_if[m.group(1)]=m.group(2)
+sys_descr = clean(k.get('Description'))
+sys_name  = clean(k.get('Device Name'))
+sys_oid   = clean(k.get('System OID'))
+if sys_oid.startswith('iso.'): sys_oid = '1.' + sys_oid[4:]
+serial    = clean(k.get('Serial Number'))
+model     = clean(k.get('Model Number'))
+mfr       = clean(k.get('Manufacturer'))
+krole     = clean(k.get('Device Type'))   # Router / Switch / Firewall / ''
 
-mac_port_map=[]
-for line in mac_table_raw.split('\n'):
-    m=re.match(r'.*17\.4\.3\.1\.2\.(\d+\.\d+\.\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',line)
-    if m:
-        mac=':'.join('{:02x}'.format(int(o)) for o in m.group(1).split('.'))
-        bp=m.group(2); ii=port_to_if.get(bp,bp)
-        mac_port_map.append({'mac':mac,'port_index':bp,'if_index':ii,
-            'if_name':ifaces.get(ii,{}).get('name','Port-'+ii)})
+details = k.get('Details', {}) or {}
 
-arp_entries=[]
-for line in arp_table_raw.split('\n'):
-    m=re.match(r'.*4\.22\.1\.2\.\d+\.(\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',line)
-    if m: arp_entries.append({'ip':m.group(1),'if_index':m.group(2)})
+# Interfaces from Ports: {name, mac, index, type}
+interfaces = []
+name_to_idx = {}
+for p in details.get('Ports', []) or []:
+    nm  = clean(p.get('Interface Name')) or clean(p.get('Interface Number'))
+    idx = clean(p.get('Interface Number'))
+    mac = clean(p.get('MAC Address'))
+    if mac in ('0', '00:00:00:00:00:00'): mac = ''
+    interfaces.append({'name': nm or 'if', 'mac': mac,
+                       'index': idx or nm, 'type': 'other'})
+    if nm: name_to_idx[nm] = idx or nm
 
-ip_if_map={}; ip_mask_map={}
-for line in ip_table_raw.split('\n'):
-    m=re.match(r'.*4\.20\.1\.2\.(\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',line)
-    if m: ip_if_map[m.group(1)]=m.group(2)
-    m=re.match(r'.*4\.20\.1\.3\.(\d+\.\d+\.\d+\.\d+)\s*=\s*IpAddress:\s*(\S+)',line)
-    if m: ip_mask_map[m.group(1)]=m.group(2)
-ip_table=[{'ip':ip,'if_index':idx,'mask':ip_mask_map.get(ip,'255.255.255.0')}
-          for ip,idx in ip_if_map.items()]
+# IP table from Network Adapters: {ip, if_index, mask}
+ip_table = []
+for a in details.get('Network Adapters', []) or []:
+    ipa = clean(a.get('IP Address'))
+    if not ipa or not re.match(r'^\d+\.\d+\.\d+\.\d+$', ipa): continue
+    nm  = clean(a.get('Name'))
+    msk = clean(a.get('Netmask')) or '255.255.255.0'
+    idx = name_to_idx.get(nm)
+    if idx is None:
+        # adapter has no matching physical port -> add a logical interface
+        idx = nm or ipa
+        mac = clean(a.get('MAC Address'))
+        if mac in ('0', '00:00:00:00:00:00'): mac = ''
+        interfaces.append({'name': nm or ipa, 'mac': mac,
+                           'index': idx, 'type': 'other'})
+    ip_table.append({'ip': ipa, 'if_index': idx, 'mask': msk})
 
-vlan_pvid={}
-for line in pvid_raw.split('\n'):
-    m=re.match(r'.*\.(\d+)\s*=\s*(?:Gauge32|INTEGER|Unsigned32):\s*(\d+)',line)
-    if m: vlan_pvid[m.group(1)]=m.group(2)
+# Neighbors -> lldp_neighbors / cdp_neighbors
+lldp, cdp = [], []
+for n in details.get('Neighbors', []) or []:
+    proto = (n.get('Protocol') or '').upper()
+    nm    = clean(n.get('Neighbor Name'))
+    rport = clean(n.get('Remote Port'))
+    oif   = clean(n.get('Origin Interface'))
+    if proto == 'CDP':
+        cdp.append({'device_id': nm, 'remote_port': oif or rport})
+    else:
+        lldp.append({'sys_name': nm, 'port_id': rport, 'port_desc': rport})
 
-vlan_names={}
-for line in vlan_name_raw.split('\n'):
-    m=re.match(r'.*\.(\d+)\s*=\s*STRING:\s*(.+)',line)
-    if m: vlan_names[m.group(1)]=m.group(2).strip().strip('"')
+# Entity inventory (one synthesised root component for model/serial extraction)
+entity_inventory = []
+if model or serial or sys_descr:
+    entity_inventory.append({'desc': sys_descr, 'name': sys_name,
+                             'model': model, 'serial': serial, 'sw_rev': ''})
 
-for entry in mac_port_map:
-    bp=entry['port_index']; ii=entry['if_index']
-    entry['vlan']=vlan_pvid.get(bp,vlan_pvid.get(ii,''))
-    entry['vlan_name']=vlan_names.get(entry['vlan'],'')
-    entry['remote_ip']=next((a['ip'] for a in arp_entries if a['if_index']==ii),'')
-
-cdp_devs={}
-for line in cdp_raw.split('\n'):
-    for sfx,fld in [('.6.','device_id'),('.8.','platform'),('.7.','remote_port')]:
-        m=re.match(r'.*'+re.escape(sfx)+r'(\d+)\.(\d+)\s*=\s*STRING:\s*(.*)',line)
-        if m:
-            key='{}_{}'.format(m.group(1),m.group(2))
-            cdp_devs.setdefault(key,{})[fld]=m.group(3).strip().strip('"')
-cdp_neighbors=list(cdp_devs.values())
-
-# Parse entity MIB walk: col 2=desc 7=name 10=sw_rev 11=serial 13=model
-_ent={}
-for _line in entity_raw.split('\n'):
-    _m=re.search(r'47\.1\.1\.1\.1\.(\d+)\.(\d+)\s*=\s*(?:STRING|OID):\s*(.*)',_line)
-    if not _m: continue
-    _col,_idx,_val=_m.group(1),_m.group(2),_m.group(3).strip().strip('"').strip("'")
-    if _is_raw_oid(_val): _val=''
-    _ent.setdefault(_idx,{})
-    {'2':'desc','7':'name','10':'sw_rev','11':'serial','13':'model'}.get(_col) and \
-        _ent[_idx].__setitem__({'2':'desc','7':'name','10':'sw_rev','11':'serial','13':'model'}[_col],_val)
-entity_inventory=[{'desc':v.get('desc',''),'name':v.get('name',''),
-    'model':v.get('model',''),'serial':v.get('serial',''),
-    'sw_rev':v.get('sw_rev','')} for v in _ent.values() if any(v.values())]
-
-lldp_sys={}
-for line in lldp_raw.split('\n'):
-    m=re.match(r'.*\.(\d+)\.(\d+)\.(\d+)\s*=\s*STRING:\s*(.*)',line)
-    if not m: continue
-    lp,ri,val=m.group(2),m.group(3),m.group(4).strip().strip('"')
-    key='{}_{}'.format(lp,ri); lldp_sys.setdefault(key,{})
-    if '4.1.1.9'  in line: lldp_sys[key]['sys_name'] =val
-    if '4.1.1.10' in line: lldp_sys[key]['sys_desc'] =val[:100]
-    if '4.1.1.7'  in line: lldp_sys[key]['port_id']  =val
-    if '4.1.1.8'  in line: lldp_sys[key]['port_desc']=val
-lldp_neighbors=list(lldp_sys.values())
-
-print(json.dumps({'available':True,'community':working_token,
-    'sys_descr':sys_descr,'sys_name':sys_name,'sys_location':sys_loc,
-    'sys_contact':sys_contact,'sys_uptime':sys_uptime,'sys_oid':sys_oid,
-    'chassis_serial':chassis_ser,'interfaces':interfaces,'ip_table':ip_table,
-    'mac_port_map':mac_port_map,'vlan_pvid':vlan_pvid,'vlan_names':vlan_names,
-    'arp_entries':arp_entries,'cdp_neighbors':cdp_neighbors,
-    'lldp_neighbors':lldp_neighbors,'entity_inventory':entity_inventory,
-    'ip_forwarding':ip_forwarding,
-    'is_printer_mib':is_printer_mib,'hr_is_printer':hr_is_printer}))
+out = {
+    'available': True,
+    'community': label,
+    'sys_descr': sys_descr,
+    'sys_name': sys_name,
+    'sys_location': '',
+    'sys_contact': '',
+    'sys_uptime': '',
+    'sys_oid': sys_oid,
+    'chassis_serial': serial,
+    'interfaces': interfaces,
+    'ip_table': ip_table,
+    'mac_port_map': [],
+    'vlan_pvid': {},
+    'vlan_names': {},
+    'arp_entries': [],
+    'cdp_neighbors': cdp,
+    'lldp_neighbors': lldp,
+    'entity_inventory': entity_inventory,
+    'ip_forwarding': False,
+    'is_printer_mib': False,
+    'hr_is_printer': False,
+    # KaSaNaa direct classifications (used as hints in merge_host_data)
+    'kasanaa_manufacturer': mfr,
+    'kasanaa_model': model,
+    'kasanaa_role': krole,
+}
+print(json.dumps(out))
 PYEOF
 }
 
@@ -1871,6 +1899,10 @@ OID_MAP=[
 ip_forwarding=bool(snmp.get('ip_forwarding',False))
 is_printer_mib=bool(snmp.get('is_printer_mib',False))
 hr_is_printer=bool(snmp.get('hr_is_printer',False))
+# KaSaNaa container direct classifications (used as hints/fallbacks)
+k_role=(snmp.get('kasanaa_role') or '').strip()
+k_mfr=(snmp.get('kasanaa_manufacturer') or '').strip()
+k_model=(snmp.get('kasanaa_model') or '').strip()
 
 # Apply OID-prefix classification before keyword matching
 _oid_role=None; _oid_mfr=None
@@ -1934,6 +1966,10 @@ elif any(k in combined for k in SV):  host['device_role']='Server'
 elif 'windows' in os_str:  host['device_role']='Workstation'
 elif '5060' in open_ports or 'sip' in combined: host['device_role']='IP Phone'
 elif '445' in open_ports or nb.get('available'): host['device_role']='Workstation'
+elif k_role in ('Router','Switch','Firewall') and snmp_up:
+    # KaSaNaa container classified it via SNMP but our OID/keyword tables
+    # did not match -- trust the container's L3/L2 determination.
+    host['device_role']=k_role
 elif ip_forwarding and snmp_up and not any(k in combined for k in SV) \
      and 'linux' not in combined and 'windows' not in os_str:
     # Last-resort only: device forwards IP and answers SNMP but matched no
@@ -1967,6 +2003,10 @@ else:
             if k in combined: host['manufacturer']=v; break
     else:
         host['manufacturer']=_oid_mfr
+# KaSaNaa manufacturer as a fallback when nothing else resolved a vendor
+if host.get('manufacturer','Unknown') in ('','Unknown') and k_mfr \
+        and k_mfr not in ('Unknown','Unknown (Net-SNMP)'):
+    host['manufacturer']=k_mfr
 
 sd=snmp.get('sys_descr','') or ''
 if sd: host['model']=sd[:120].strip()
@@ -1986,7 +2026,10 @@ else:
                 _ent_model=_cand[:80]; break
         if _m and not _m.startswith('iso.'):
             _ent_model=_m[:80]; break
-    host['model']=_ent_model or (host['os'] or 'Unknown')[:80]
+    host['model']=_ent_model or k_model or (host['os'] or 'Unknown')[:80]
+# If model still unresolved but KaSaNaa parsed one, use it
+if host.get('model','Unknown') in ('','Unknown') and k_model:
+    host['model']=k_model[:80]
 
 print(json.dumps(host))
 PYEOF
