@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.3.1
+#  Version: 2.3.2
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.3.1"
+SCRIPT_VERSION="2.3.2"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1218,9 +1218,11 @@ rdp-enum-encryption,vnc-info" \
         -oX "$xml" "$ip" >> "$LOG_FILE" 2>&1 || true
     # UDP top-1000 scan (requires root; graceful no-op if not available)
     local udp_xml="$tmp/nmap_udp.xml"
-    nmap -sU --top-ports 1000 \
-        --script "snmp-info,dns-service-discovery" \
-        -T4 --host-timeout 120s --max-retries 1 \
+    # UDP scan: top-200 ports, short host-timeout. UDP is slow by nature
+    # (no RST on closed ports), so we cap it hard to avoid 90-120s stalls.
+    nmap -sU --top-ports 200 \
+        --script "snmp-info" \
+        -T4 --host-timeout 30s --max-retries 0 \
         -oX "$udp_xml" "$ip" >> "$LOG_FILE" 2>&1 || true
     python3 /dev/stdin "$xml" "$udp_xml" <<'PYEOF' > "$tmp/nmap.json" 2>/dev/null
 import xml.etree.ElementTree as ET, json, sys, os
@@ -1332,6 +1334,7 @@ snmp_disco_run() {
     local ip="$1"; shift
     timeout "$((SNMP_TIMEOUT * 8 + 20))" \
         docker run --rm --network host --security-opt no-new-privileges \
+        -e PYTHONWARNINGS=ignore \
         "$SNMP_DISCO_IMAGE" "$ip" "$@" 2>>"$LOG_FILE"
 }
 
@@ -1354,8 +1357,10 @@ probe_snmp() {
     local comm
     while IFS= read -r comm; do
         [[ -z "$comm" ]] && continue
+        echo "[TRACE] snmp-disco $ip: trying v2c community '$comm'" >> "$LOG_FILE" 2>/dev/null || true
         raw=$(snmp_disco_run "$ip" --version 2 --community "$comm")
         if snmp_disco_ok "$raw"; then label="v2c:${comm}"; break; fi
+        echo "[TRACE] snmp-disco $ip: v2c '$comm' -> ${raw:-<empty>}" >> "$LOG_FILE" 2>/dev/null || true
     done <<< "$communities"
 
     # 2. Try SNMPv3 USM credentials from the store
@@ -1370,14 +1375,26 @@ probe_snmp() {
             v3ap2=$(echo "$v3c" | jq -r '.auth_pass')
             v3pp=$(echo "$v3c"  | jq -r '.priv_proto // "AES"')
             v3pp2=$(echo "$v3c" | jq -r '.priv_pass')
-            raw=$(snmp_disco_run "$ip" --version 3 --user "$v3u" \
-                --auth_key "$v3ap2" --auth_proto "$v3ap" \
-                --priv_key "$v3pp2" --priv_proto "$v3pp")
+            echo "[TRACE] snmp-disco $ip: trying v3 user '$v3u' ${v3ap}/${v3pp}" >> "$LOG_FILE" 2>/dev/null || true
+            # authPriv (auth + priv) when a priv key is present, else authNoPriv
+            if [[ -n "$v3pp2" && "$v3pp2" != "null" ]]; then
+                raw=$(snmp_disco_run "$ip" --version 3 --user "$v3u" \
+                    --auth_key "$v3ap2" --auth_proto "$v3ap" \
+                    --priv_key "$v3pp2" --priv_proto "$v3pp")
+            else
+                raw=$(snmp_disco_run "$ip" --version 3 --user "$v3u" \
+                    --auth_key "$v3ap2" --auth_proto "$v3ap")
+            fi
             if snmp_disco_ok "$raw"; then label="v3:${v3u}"; break; fi
+            echo "[TRACE] snmp-disco $ip: v3 '$v3u' -> ${raw:-<empty>}" >> "$LOG_FILE" 2>/dev/null || true
         done < <(echo "$creds" | jq -c '.snmp_v3[]' 2>/dev/null || true)
     fi
 
-    [[ -z "$label" ]] && return
+    if [[ -z "$label" ]]; then
+        echo "[TRACE] snmp-disco $ip: no SNMP credential succeeded" >> "$LOG_FILE" 2>/dev/null || true
+        return
+    fi
+    echo "[TRACE] snmp-disco $ip: SUCCESS via $label" >> "$LOG_FILE" 2>/dev/null || true
 
     # 3. Map KaSaNaa JSON -> host-record SNMP contract
     echo "$raw" | SNMP_LABEL="$label" python3 /dev/stdin > "$tmp/snmp.json" 2>>"$LOG_FILE" <<'PYEOF'
