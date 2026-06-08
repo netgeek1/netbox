@@ -1,3 +1,14 @@
+#  Changelog v2.3.5 (Windows hosts: -Pn + RDP/Workstation classification):
+#   - probe_nmap(): added -Pn to both TCP and UDP nmap scans. Phase 1 has
+#     already confirmed the host is live; many Windows hosts block ICMP, so
+#     without -Pn nmap declared them down and skipped port/OS scanning,
+#     producing empty results classified as Endpoint. Added rdp-ntlm-info
+#     script (yields Windows Product_Version).
+#   - merge_host_data(): plain 'windows' in OS/scripts now classifies as
+#     Workstation BEFORE the RDP-port rule. Win10/11 desktops commonly have
+#     3389 open; RDP alone no longer forces Server. Bare 3389 with no
+#     Windows/SMB context still -> Server; 135/445/NetBIOS -> Workstation.
+# 
 #  Changelog v2.3.4 (model field: prefer container Model Number):
 #   - merge_host_data(): model extraction reordered to prefer KaSaNaa's
 #     ENTITY-MIB Model Number (e.g. 'FortiSwitch-224E') over the freeform
