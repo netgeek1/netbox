@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.3.2
+#  Version: 2.3.3
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.3.2"
+SCRIPT_VERSION="2.3.3"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1396,12 +1396,18 @@ probe_snmp() {
     fi
     echo "[TRACE] snmp-disco $ip: SUCCESS via $label" >> "$LOG_FILE" 2>/dev/null || true
 
-    # 3. Map KaSaNaa JSON -> host-record SNMP contract
-    echo "$raw" | SNMP_LABEL="$label" python3 /dev/stdin > "$tmp/snmp.json" 2>>"$LOG_FILE" <<'PYEOF'
+    # 3. Map KaSaNaa JSON -> host-record SNMP contract.
+    # NB: the raw JSON is passed via a FILE arg, not piped to stdin -- the
+    # python program itself is read from stdin (the heredoc), so reading the
+    # JSON from stdin too would conflict (the heredoc wins and json.load gets
+    # an empty stream). This was silently discarding all SNMP data.
+    printf '%s' "$raw" > "$tmp/kasanaa_raw.json"
+    SNMP_LABEL="$label" python3 /dev/stdin "$tmp/kasanaa_raw.json" > "$tmp/snmp.json" 2>>"$LOG_FILE" <<'PYEOF'
 import json, os, re, sys
 
 try:
-    k = json.load(sys.stdin)
+    with open(sys.argv[1]) as _f:
+        k = json.load(_f)
 except Exception:
     print('{"available":false}'); sys.exit(0)
 if not isinstance(k, dict) or 'error' in k:
@@ -1924,12 +1930,19 @@ k_role=(snmp.get('kasanaa_role') or '').strip()
 k_mfr=(snmp.get('kasanaa_manufacturer') or '').strip()
 k_model=(snmp.get('kasanaa_model') or '').strip()
 
-# Apply OID-prefix classification before keyword matching
+# Apply OID-prefix classification before keyword matching.
+# Use LONGEST matching prefix (not first match) so a specific entry like
+# 1.3.6.1.4.1.12356.106 (FortiSwitch->Switch) wins over the generic
+# 1.3.6.1.4.1.12356 (Fortinet->Firewall). Also require a component boundary
+# so 1.3.6.1.4.1.9 (Cisco) does not match 1.3.6.1.4.1.99999.
 _oid_role=None; _oid_mfr=None
 if sys_oid:
+    _best_len=-1
     for prefix,role,mfr in OID_MAP:
-        if sys_oid.startswith(prefix):
-            _oid_role=role; _oid_mfr=mfr; break
+        _p=prefix.rstrip('.')
+        if sys_oid==_p or sys_oid.startswith(_p+'.'):
+            if len(_p)>_best_len:
+                _best_len=len(_p); _oid_role=role; _oid_mfr=mfr
 
 FW=['firewall','fortigate','fortios','palo alto','checkpoint','asa','sonicwall',
     'opnsense','pfsense','netscreen','juniper srx','srx','watchguard','sophos','cisco asa',
