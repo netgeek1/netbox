@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.3.7
+#  Version: 2.3.8
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.3.7"
+SCRIPT_VERSION="2.3.8"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -35,6 +35,10 @@ SNMP_TIMEOUT=3
 SSH_TIMEOUT=10
 MAX_THREADS=20
 DEBUG_MODE=0
+# RAW_CAPTURE=1 archives every probe's raw output (nmap XML, RustScan raw,
+# container JSON, per-probe *.json, OS fingerprints) per host instead of
+# discarding the temp dir. Lets the full discovery evidence be reviewed.
+RAW_CAPTURE=1
 
 LOG_FILE="$LOG_DIR/discovery-$(date +%Y%m%d).log"
 
@@ -165,6 +169,7 @@ SNMP_TIMEOUT=${SNMP_TIMEOUT}
 SSH_TIMEOUT=${SSH_TIMEOUT}
 MAX_THREADS=${MAX_THREADS}
 DEBUG_MODE=${DEBUG_MODE}
+RAW_CAPTURE=${RAW_CAPTURE}
 CONF
     chmod 600 "$CONFIG_FILE"
 }
@@ -1147,6 +1152,11 @@ discover_live_hosts() {
 scan_all_hosts() {
     local total; total=$(wc -l < "$LIVE_HOSTS_FILE")
     log_step "Phase 2 -- Deep Scanning $total Hosts"
+    # Start a raw-capture session aligned with this run (one folder per scan).
+    if [[ "${RAW_CAPTURE:-0}" == "1" ]]; then
+        RAW_CAPTURE_SESSION="$(date +%Y%m%d_%H%M%S)_$$"
+        log_info "Raw capture: $DISCOVERY_DIR/raw/$RAW_CAPTURE_SESSION/"
+    fi
     local idx=0 ip
     while IFS= read -r ip <&3; do
         (( idx++ )) || true
@@ -1154,6 +1164,72 @@ scan_all_hosts() {
         scan_single_host "$ip"
     done 3< "$LIVE_HOSTS_FILE"
     log_ok "Phase 2 complete"
+    if [[ "${RAW_CAPTURE:-0}" == "1" && -n "$RAW_CAPTURE_SESSION" ]]; then
+        local rawdir="$DISCOVERY_DIR/raw/$RAW_CAPTURE_SESSION"
+        local bundle="$DISCOVERY_DIR/raw_${RAW_CAPTURE_SESSION}.tar.gz"
+        tar -czf "$bundle" -C "$DISCOVERY_DIR/raw" "$RAW_CAPTURE_SESSION" 2>/dev/null \
+            && log_info "Raw capture bundled: $bundle" \
+            || log_info "Raw capture saved: $rawdir/"
+        printf "  ${D}Share everything discovered:  sudo cat %s | (or attach the .tar.gz)${NC}\n" "$bundle"
+    fi
+}
+
+# Archive every probe's raw output for one host into a reviewable folder.
+# Layout:  $DISCOVERY_DIR/raw/<session>/<ip>/
+#   nmap.xml nmap_udp.xml nmap_disc.xml   (nmap raw XML, all passes)
+#   nmap.json snmp.json ssh.json http.json netbios.json dns.json
+#   banner.json mdns.json winrm.json      (per-probe parsed JSON)
+#   kasanaa_raw.json                      (raw SNMP container output)
+#   merged.json                           (final merged host record)
+#   nmap.txt nmap_udp.txt                 (human-readable nmap, if nmap present)
+#   MANIFEST.txt                          (index + quick classification summary)
+RAW_CAPTURE_SESSION=""
+archive_raw_capture() {
+    local ip="$1" tmp="$2" host_json="$3"
+    # One session dir per scan run (timestamp set on first host of the run)
+    [[ -z "$RAW_CAPTURE_SESSION" ]] && \
+        RAW_CAPTURE_SESSION="$(date +%Y%m%d_%H%M%S)_$$"
+    local dst="$DISCOVERY_DIR/raw/$RAW_CAPTURE_SESSION/${ip//[^0-9A-Za-z._-]/_}"
+    mkdir -p "$dst" 2>/dev/null || { log_warn "raw-capture: cannot create $dst"; return; }
+
+    # Copy every file the probes left in the temp dir (json, xml, txt, etc.)
+    cp -a "$tmp"/. "$dst"/ 2>/dev/null || true
+    # The final merged record
+    printf '%s\n' "$host_json" > "$dst/merged.json" 2>/dev/null || true
+
+    # Human-readable nmap renderings of each XML pass (best-effort)
+    if cmd_exists xsltproc; then
+        for x in nmap nmap_udp nmap_disc; do
+            [[ -f "$dst/$x.xml" ]] && xsltproc "$dst/$x.xml" \
+                > "$dst/$x.txt" 2>/dev/null || true
+        done
+    fi
+
+    # Manifest: file index + a quick summary of the classification-relevant bits
+    {
+        echo "# Raw discovery capture"
+        echo "host:        $ip"
+        echo "session:     $RAW_CAPTURE_SESSION"
+        echo "captured:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "script_ver:  $SCRIPT_VERSION"
+        echo
+        echo "## Files"
+        (cd "$dst" && ls -la) 2>/dev/null
+        echo
+        echo "## Classification summary (from merged.json)"
+        echo "$host_json" | jq -r '
+            "device_role:   \(.device_role)",
+            "manufacturer:  \(.manufacturer)",
+            "model:         \(.model)",
+            "os:            \(.os)",
+            "serial:        \(.serial)",
+            "scan_tier:     \(.scan_tier)",
+            "discovery:     \(.discovery_methods | join(", "))",
+            "open_ports:    \([.ports[]? | "\(.port)/\(.proto)"] | join(", "))",
+            "snmp_sys_oid:  \(.snmp_details.sys_oid // "")",
+            "snmp_descr:    \(.snmp_details.sys_descr // "")"
+        ' 2>/dev/null || echo "(merged.json parse failed)"
+    } > "$dst/MANIFEST.txt" 2>/dev/null || true
 }
 
 scan_single_host() {
@@ -1177,6 +1253,11 @@ scan_single_host() {
     role=$(echo "$host_json" | jq -r '.device_role // "?"')
     os=$(echo "$host_json"   | jq -r '.os // ""')
     printf "    ${G}OK${NC}  %-16s  %-28s  %-16s  %s\n" "$ip" "$hn" "$role" "$os"
+    # Archive ALL raw probe output for this host before cleanup so the
+    # full discovery evidence can be reviewed when identification is wrong.
+    if [[ "${RAW_CAPTURE:-0}" == "1" ]]; then
+        archive_raw_capture "$ip" "$tmp" "$host_json"
+    fi
     rm -rf "$tmp"
 }
 
