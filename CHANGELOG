@@ -1,3 +1,15 @@
+#  Changelog v2.3.8 (raw discovery capture -- full evidence logging):
+#   - NEW RAW_CAPTURE=1 (default on): scan_single_host() now archives EVERY
+#     probe's raw output per host before deleting the temp dir, instead of
+#     discarding everything but the merged record. Saved under
+#     $DISCOVERY_DIR/raw/<session>/<ip>/ : nmap.xml/nmap_udp.xml/nmap_disc.xml
+#     (all nmap passes), every per-probe *.json, kasanaa_raw.json (raw SNMP
+#     container output), merged.json, human-readable nmap *.txt (if xsltproc),
+#     and MANIFEST.txt (file index + classification summary).
+#   - scan_all_hosts(): starts one capture session per run and, at the end,
+#     bundles it to $DISCOVERY_DIR/raw_<session>.tar.gz for easy sharing.
+#   - RAW_CAPTURE persisted in config.conf; set RAW_CAPTURE=0 to disable.
+# 
 #  Changelog v2.3.7 (capture RustScan ports; broaden OS-misfingerprint guard):
 #   - probe_nmap() parser: RustScan/discovery-found TCP ports are now UNIONED
 #     into host['ports'], passed as argv[3]. RustScan reliably finds open
