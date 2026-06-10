@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.4.3
+#  Version: 2.5.0
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.4.3"
+SCRIPT_VERSION="2.5.0"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2503,6 +2503,153 @@ if not port_entries:
 PYEOF
 }
 
+
+# -----------------------------------------------------------------------------
+# PHASE B: RECONCILIATION (collect -> reconcile -> sync)
+# -----------------------------------------------------------------------------
+# Collapses cross-host duplicates in a results_*.json into a canonical
+# device/VM model BEFORE syncing. Pure data transform, no NetBox calls.
+# Passes (union-find, transitive): (1) SNMP ip_table ownership folds a secondary
+# IP into its owner (192.168.0.2 -> .253); (2) shared interface MAC;
+# (3) normalized short hostname (FQDN<->NetBIOS<->dual-homed), excluding generic
+# default names so two "iPhone" devices stay separate. Richest record wins
+# identity; losers become secondary_ips + sync_as=skip. VM tagging: a Hyper-V
+# OUI 00:15:5d interface MAC on a non-hypervisor -> sync_as=vm (OPNsense/pfSense
+# /FortiManager/FortiAnalyzer). Writes <results>.reconciled.json.
+#
+# reconcile_results <results_file> [--preview]
+reconcile_results() {
+    local results_file="${1:-}"
+    [[ -z "$results_file" ]] \
+        && results_file=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
+            | grep -v reconciled | head -1)
+    if [[ ! -f "$results_file" ]]; then
+        log_error "No results file to reconcile"; return 1
+    fi
+    local pyf; pyf=$(mktemp --suffix=.py)
+    cat > "$pyf" <<'PYEOF'
+import json, sys
+HYPERV_OUI="00:15:5d"
+GENERIC_NAMES={"localhost","iphone","ipad","ipod","android","android-2",
+ "raspberrypi","ubuntu","debian","kali","openwrt","pfsense","esp32","esp8266",
+ "espressif","chromecast","googlehome","echo","amazon","fire","roku","shield",
+ "switch","printer","scanner","nas","router","gateway","ap","camera","unknown",
+ "new-host","user-pc","desktop","laptop","windows","macbook","imac"}
+def is_auto_name(n):
+    if not n: return True
+    return n.lower().startswith("device-") and n.replace("device-","").replace("-","").isdigit()
+def short_name(n):
+    if not n or is_auto_name(n): return ""
+    s=n.split(".")[0].strip().lower()
+    return "" if s in GENERIC_NAMES else s
+def host_macs(h):
+    out=set()
+    for i in h.get("interfaces",[]) or []:
+        m=(i.get("mac") or "").strip().lower()
+        if m and len(m)==17: out.add(m)
+    return out
+def ip_table_ips(h):
+    r=[]
+    for e in h.get("ip_table",[]) or []:
+        ip=(e.get("ip") or "").strip()
+        if not ip or ip.startswith("127.") or ip=="0.0.0.0": continue
+        r.append(e)
+    return r
+def richness(h):
+    s=(5-h.get("scan_tier",4))*100
+    if h.get("snmp_details",{}).get("sys_oid"): s+=50
+    if h.get("winrm_nics"): s+=40
+    if not is_auto_name(h.get("hostname")): s+=30
+    s+=len(h.get("interfaces",[]) or [])+len(h.get("ports",[]) or [])
+    return s
+class UF:
+    def __init__(self,it): self.p={x:x for x in it}
+    def find(self,x):
+        while self.p[x]!=x: self.p[x]=self.p[self.p[x]]; x=self.p[x]
+        return x
+    def union(self,a,b):
+        ra,rb=self.find(a),self.find(b)
+        if ra!=rb: self.p[ra]=rb
+def reconcile(data):
+    hosts=data.get("hosts",[]); by_ip={h["ip"]:h for h in hosts}; ips=list(by_ip)
+    uf=UF(ips); reasons={}
+    owner={}
+    for h in hosts:
+        for e in ip_table_ips(h):
+            if e["ip"]!=h["ip"]: owner.setdefault(e["ip"],h["ip"])
+    for ip in ips:
+        o=owner.get(ip)
+        if o and o in by_ip and o!=ip:
+            uf.union(ip,o); reasons[ip]="secondary IP in %s SNMP ip_table"%o
+    mac2={}
+    for h in hosts:
+        for m in host_macs(h):
+            if m in mac2 and mac2[m]!=h["ip"]:
+                uf.union(h["ip"],mac2[m]); reasons.setdefault(h["ip"],"shares MAC %s with %s"%(m,mac2[m]))
+            else: mac2[m]=h["ip"]
+    nm2={}
+    for h in hosts:
+        s=short_name(h.get("hostname"))
+        if not s: continue
+        if s in nm2 and nm2[s]!=h["ip"]:
+            uf.union(h["ip"],nm2[s]); reasons.setdefault(h["ip"],"same short-name '%s' as %s"%(s,nm2[s]))
+        else: nm2[s]=h["ip"]
+    groups={}
+    for ip in ips: groups.setdefault(uf.find(ip),[]).append(ip)
+    for h in hosts:
+        h["sync_as"]="device"; h["canonical"]=True; h["merged_from"]=[]; h.setdefault("secondary_ips",[])
+    for members in groups.values():
+        recs=sorted((by_ip[i] for i in members),key=richness,reverse=True)
+        w=recs[0]
+        for l in recs[1:]:
+            w["merged_from"].append(l["ip"])
+            absorbed=[{"ip":l["ip"],"mask":"255.255.255.0","if_index":None,"from":l["ip"]}]
+            for e in ip_table_ips(l):
+                if e["ip"]!=w["ip"]:
+                    absorbed.append({"ip":e["ip"],"mask":e.get("mask","255.255.255.0"),"if_index":e.get("if_index"),"from":l["ip"]})
+            w["secondary_ips"].extend(absorbed)
+            seen={(p.get("port"),p.get("proto")) for p in w.get("ports",[])}
+            for p in l.get("ports",[]):
+                k=(p.get("port"),p.get("proto"))
+                if k not in seen: w.setdefault("ports",[]).append(p); seen.add(k)
+            l["sync_as"]="skip"; l["canonical"]=False; l["merged_into"]=w["ip"]; l["merge_reason"]=reasons.get(l["ip"],"merged")
+    for h in hosts:
+        if h.get("sync_as")=="skip" or h.get("is_hyperv"): continue
+        vm=next((m for m in host_macs(h) if m.startswith(HYPERV_OUI)),None)
+        if vm: h["sync_as"]="vm"; h["vm_reason"]="Hyper-V MAC %s"%vm
+    data["hosts"]=hosts; return data
+def preview(data):
+    hosts=data["hosts"]
+    dev=[h for h in hosts if h.get("sync_as")=="device"]
+    vms=[h for h in hosts if h.get("sync_as")=="vm"]
+    sk=[h for h in hosts if h.get("sync_as")=="skip"]
+    out=[]
+    def ipkey(h): return [int(o) for o in h["ip"].split(".")]
+    for h in sorted([x for x in hosts if x.get("sync_as")!="skip"],key=ipkey):
+        tag="VM    " if h["sync_as"]=="vm" else "KEEP  "
+        ex=("  <- merges "+", ".join(h["merged_from"])) if h.get("merged_from") else ""
+        if h["sync_as"]=="vm": ex+="  [%s]"%h.get("vm_reason","")
+        out.append("%s%-15s %-11s %-34s%s"%(tag,h["ip"],h.get("device_role",""),(h.get("hostname","") or "")[:34],ex))
+    for h in sorted(sk,key=ipkey):
+        out.append("MERGE %-15s -> %-15s (%s)"%(h["ip"],h.get("merged_into","?"),h.get("merge_reason","")))
+    out.append("\n%d input hosts -> %d devices, %d VMs, %d merges"%(len(hosts),len(dev),len(vms),len(sk)))
+    return "\n".join(out)
+mode=sys.argv[1]; data=reconcile(json.load(open(sys.argv[2])))
+if mode=="preview": print(preview(data))
+else:
+    o=sys.argv[3]; json.dump(data,open(o,"w"),indent=2); print(o)
+PYEOF
+    if [[ "${2:-}" == "--preview" ]]; then
+        python3 "$pyf" preview "$results_file"; rm -f "$pyf"; return 0
+    fi
+    local out="${results_file%.json}.reconciled.json"
+    python3 "$pyf" reconcile "$results_file" "$out" >/dev/null \
+        && log_ok "Reconciled model: $out"
+    python3 "$pyf" preview "$results_file" >&2
+    rm -f "$pyf"
+    echo "$out"
+}
+
 # -----------------------------------------------------------------------------
 # SYNC TO NETBOX
 # -----------------------------------------------------------------------------
@@ -4662,6 +4809,7 @@ menu_discovery() {
         echo "  5) View Latest Results"
         echo "  6) Sync Last Results to NetBox"
         echo "  7) Full Auto: Discover + Sync"
+        echo "  8) Preview Reconciliation (dry-run, no NetBox writes)"
         echo "  0) Back"
         read -rp $'\nChoice: ' c
         local input sip hf swip latest cnt
@@ -4736,6 +4884,16 @@ menu_discovery() {
                         "$i" "${h:0:27}" "${r:0:15}" "${m:0:15}" "${o:0:26}"
                   done | head -80 ;;
         6)  sync_to_netbox ;;
+        8)  latest=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
+                | grep -v reconciled | head -1)
+            if [[ -z "$latest" ]]; then
+                printf "${Y}  No discovery results -- run a scan first${NC}\n"
+            else
+                printf "\n${C}Reconciliation plan for $(basename "$latest"):${NC}\n\n"
+                reconcile_results "$latest" --preview
+                printf "\n${D}  (dry-run only -- nothing written to NetBox)${NC}\n"
+            fi
+            pause ;;
         7)  printf "  Enter target(s) (CIDR, comma-separated, or file):\n"
             read -rp "  > " input
             if [[ -z "$input" ]]; then
