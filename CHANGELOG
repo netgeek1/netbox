@@ -1,3 +1,21 @@
+#  Changelog v2.5.1 (Phase B -- Hyper-V VM inventory in reconciliation):
+#   - probe_winrm(): the WinRM discovery PS now enumerates VMs READ-ONLY on
+#     Hyper-V hosts (Get-VM + Get-VMNetworkAdapter): per-VM name/state/vCPU/
+#     memory and per-adapter MAC/IPs/switch, returned as HyperVVMs[] in the
+#     existing JSON. No NetBox calls; nothing installed on the host.
+#   - merge_host_data(): HyperVVMs copied onto the host record as hyperv_vms.
+#   - reconcile_results(): now builds a global VM inventory from every
+#     Hyper-V host and (a) MATCHES discovered devices to a VM by MAC (then
+#     IP/name) -> sync_as=vm with vm_host/vm_cluster so a VM that is also
+#     discovered resolves to a single VM ON ITS HOST; (b) SYNTHESIZES records
+#     for VMs that were not independently IP-scanned so every VM is captured;
+#     (c) keeps the 00:15:5d OUI heuristic as a fallback. A hardware SNMP OID
+#     (not the generic Net-SNMP 8072 tree) blocks IP/name VM-matching so a
+#     physical switch/printer/AP can't be mislabeled a VM by a reused IP.
+#   - Reason: the discovery probe previously only detected IsHyperV and never
+#     enumerated VMs, so reconciliation saw only VMs that were both IP-scanned
+#     and exposed a Hyper-V MAC -- missing most VMs and all VM<->host links.
+# 
 #  Changelog v2.5.0 (Phase B step 1 -- reconciler core + dry-run preview):
 #   - NEW reconcile_results(): collapses cross-host duplicates in a
 #     results_*.json into a canonical device/VM model BEFORE syncing. Pure
