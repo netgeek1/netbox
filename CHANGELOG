@@ -1,3 +1,21 @@
+#  Changelog v2.4.2 (Phase A -- classification polish):
+#   - OS from SSH banner: an OpenSSH banner distro token (Debian/Ubuntu/
+#     FreeBSD/CentOS/RHEL-elN/Alpine/Amazon/Raspbian) is now used for the OS
+#     (os_accuracy='banner') ahead of nmap's -O guess, which mis-fingerprints
+#     filtered hosts (192.168.0.5 'pihole' was 3Com router -> Debian Linux;
+#     192.168.0.190 'docker' Linux 2.6.18 -> Debian Linux).
+#   - Model from HTTP page title: web-managed devices expose their model in
+#     the title (192.168.0.41 -> 'HP Color LaserJet MFP M277dw', 192.168.0.40
+#     -> 'Brother HL-L2460DW'). HTML entities cleaned, trailing IP stripped,
+#     and web-server default/landing-page titles rejected.
+#   - Untrusted nmap OS guesses now blanked for OID-typed devices AND any
+#     non-Server/Workstation role (e.g. IPMI/BMC Endpoint nmap-guessed as
+#     'Cisco Unified Communications' -> blank). SNMP/banner/ssh OS preserved.
+#   - Port-only Windows hosts stabilized: with no WinRM/SNMP, nmap's edition
+#     guess flip-flopped Server/Workstation between runs. Now normalized to
+#     plain 'Microsoft Windows' -> deterministically Workstation; real
+#     servers are typed via WinRM IsServer or a device override.
+# 
 #  Changelog v2.4.1 (classification polish + IP-400 robustness + secondary IPs):
 #   - merge_host_data(): ALL appliance-role keyword branches (RT/SW/AP/PR/UP/
 #     CA) now use class_txt, which excludes the raw nmap -O OS guess (as FW
