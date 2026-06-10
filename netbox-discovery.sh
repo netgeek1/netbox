@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.3.8
+#  Version: 2.4.0
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.3.8"
+SCRIPT_VERSION="2.4.0"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -737,6 +737,26 @@ nb_upsert_device() {
         local enc; enc=$(nb_urlencode "$name")
         local existing; existing=$(nb_get "dcim/devices/?name=${enc}")
         dev_id=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
+    fi
+    # ------ Normalized short-name dedup (FQDN <-> NetBIOS) ----------------------------------------------------------------------------------------------------------
+    # Match by short hostname, case-insensitive, so "server01.certifiedgeeks.net"
+    # and "SERVER01" resolve to the same device instead of duplicating.
+    if [[ -z "$dev_id" || ! "$dev_id" =~ ^[0-9]+$ ]]; then
+        local _short; _short=$(echo "$name" | cut -d. -f1 | tr 'A-Z' 'a-z')
+        if [[ -n "$_short" ]]; then
+            local _se; _se=$(nb_urlencode "$_short")
+            local _cand; _cand=$(nb_get "dcim/devices/?name__ic=${_se}&limit=50")
+            dev_id=$(echo "$_cand" | jq -r --arg s "$_short" \
+                '[.results[] | select((.name|split(".")[0]|ascii_downcase)==$s)][0].id // empty' \
+                2>/dev/null)
+            if [[ -n "$dev_id" && "$dev_id" =~ ^[0-9]+$ ]]; then
+                local _en; _en=$(nb_get "dcim/devices/${dev_id}/" | jq -r '.name // empty' 2>/dev/null)
+                log_info "Merged by short-name: '$name' -> existing '$_en' (ID: $dev_id)"
+                # Keep the existing richer name unless it is an auto-gen placeholder
+                local _ap="^device-[0-9]+-[0-9]+-[0-9]+-[0-9]+$"
+                if [[ -n "$_en" && ! "$_en" =~ $_ap ]]; then name="$_en"; fi
+            fi
+        fi
     fi
 
     local payload
@@ -1905,8 +1925,18 @@ if not host['hostname']:
     host['hostname']='device-'+ip.replace('.', '-')
 
 host['mac']=nmap.get('mac'); host['vendor']=nmap.get('vendor','')
-host['os']=nmap.get('os') or ssh.get('os') or ''
-host['os_accuracy']=nmap.get('os_accuracy')
+# OS string priority: SNMP sysDescr is authoritative when present (it is the
+# device's own self-report, e.g. "FreeBSD OPNsense 14.3", "pfSense 2.4.5",
+# "Ubiquiti UniFi UCG-Fiber", "U6-Pro 6.8.2"). nmap's -O guess is frequently
+# wrong for network appliances (seen: OPNsense->"Avaya G350", IPMI->"Cisco ASA",
+# printer->"3M CT-30 thermostat"), so it is only a fallback.
+_snmp_descr=(snmp.get('sys_descr') or '').strip()
+if _snmp_descr and not _snmp_descr.startswith('iso.'):
+    host['os']=_snmp_descr[:120]
+    host['os_accuracy']='snmp'
+else:
+    host['os']=nmap.get('os') or ssh.get('os') or ''
+    host['os_accuracy']=nmap.get('os_accuracy')
 host['serial']=snmp.get('chassis_serial','')
 
 # WinRM enrichment overrides weaker sources
@@ -1954,7 +1984,11 @@ open_ports={str(p.get('port','')) for p in host['ports']}
 # NetBIOS/SMB (137-139,445) are excluded since Samba serves them on Linux.
 _win_ports={'135','3389','5985','5986','2179',
             '1801','2103','2105','2107','5357'}
-if (open_ports & _win_ports) and 'windows' not in os_str:
+# Only override when we do NOT have an authoritative SNMP sysDescr. A device
+# that answers SNMP with a real OS string (e.g. TrueNAS, which exposes WSD/5357)
+# must not be relabeled Windows by a port heuristic.
+if (open_ports & _win_ports) and 'windows' not in os_str \
+        and not (snmp_up and sys_descr):
     host['os']='Microsoft Windows'; host['os_accuracy']=None
     os_str='microsoft windows'
 http_ttl=' '.join(s.get('title','') for s in host['http_services']).lower()
@@ -1970,7 +2004,28 @@ nmap_scripts=' '.join(
     str(v) for p in host.get('ports',[]) for v in (p.get('scripts') or {}).values()
     if isinstance(v,str)
 ).lower()
-combined=' '.join([sys_descr,os_str,http_ttl,entity_text,nmap_scripts])
+# Service banners (SSH/HTTP/raw) carry strong OS hints, e.g. an SSH banner of
+# "SSH-2.0-OpenSSH_8.4p1 Debian-5" identifies a Debian/Linux host even when nmap
+# could not fingerprint the OS and there is no SNMP. Fold them into the text.
+banner_txt=' '.join([
+    str(ssh.get('banner','') or ''),
+    str(ssh.get('kernel','') or ''),
+    ' '.join(str(b.get('banner','') or '') for b in host.get('banners',[])
+             if isinstance(b,dict)),
+    ' '.join(str(s.get('server','') or '') for s in host.get('http_services',[])
+             if isinstance(s,dict)),
+]).lower()
+combined=' '.join([sys_descr,os_str,http_ttl,entity_text,nmap_scripts,banner_txt])
+# 'trusted_txt' excludes the nmap -O OS guess (often wrong for appliances:
+# OPNsense->Avaya, IPMI->Cisco ASA). Appliance-role keyword matches use this
+# unless SNMP is up, so a bare nmap guess can't force Firewall/Router/Switch.
+trusted_txt=' '.join([sys_descr,http_ttl,entity_text,nmap_scripts,banner_txt])
+# Vendor-detection text: include the OS string only when it is trustworthy
+# (SNMP sysDescr = 'snmp', or asserted e.g. "Microsoft Windows" = None), NOT a
+# raw nmap -O guess (numeric accuracy), so a bogus "Cisco ASA" guess on an IPMI
+# BMC does not leak a "Cisco" manufacturer.
+_os_acc=host.get('os_accuracy')
+mfr_txt=trusted_txt + ((' '+os_str) if _os_acc in (None,'snmp') else '')
 sys_oid=(snmp.get('sys_oid') or '').strip()
 if sys_oid.startswith('iso.'): sys_oid='1.'+sys_oid[4:]
 
@@ -2008,6 +2063,7 @@ OID_MAP=[
     ('1.3.6.1.4.1.1991.',   'Switch',      'Brocade'),     # Brocade / Ruckus ICX
     ('1.3.6.1.4.1.2636.1.1.1.4.',  'Switch','Juniper'),    # Juniper EX switches
     ('1.3.6.1.4.1.12356.106.','Switch',     'Fortinet'),   # FortiSwitch
+    ('1.3.6.1.4.1.12356.103.','Server',     'Fortinet'),   # FortiManager / FortiAnalyzer (mgmt appliances, not firewalls)
     # Wireless APs
     ('1.3.6.1.4.1.14823.',  'Wireless AP', 'Aruba'),       # Aruba
     ('1.3.6.1.4.1.388.',    'Wireless AP', 'Symbol'),      # Symbol/Zebra AP
@@ -2041,6 +2097,9 @@ OID_MAP=[
     # NAS / Storage
     ('1.3.6.1.4.1.6574.',   'Server',      'Synology'),    # Synology
     ('1.3.6.1.4.1.24681.',  'Server',      'QNAP'),        # QNAP
+    ('1.3.6.1.4.1.50536.',  'Server',      'iXsystems'),   # TrueNAS / iXsystems
+    # Switches (vendor-specific, added from field data)
+    ('1.3.6.1.4.1.4526.',   'Switch',      'Netgear'),     # Netgear managed switches (GS110TP etc.)
     # Generic Cisco (catch-all, must come after specific Cisco entries)
     ('1.3.6.1.4.1.9.',      'Switch',      'Cisco'),       # Cisco (generic)
     # Juniper (catch-all)
@@ -2068,6 +2127,15 @@ if sys_oid:
         if sys_oid==_p or sys_oid.startswith(_p+'.'):
             if len(_p)>_best_len:
                 _best_len=len(_p); _oid_role=role; _oid_mfr=mfr
+    # Ubiquiti reports a generic enterprise OID (41112) for UniFi APs that
+    # lack a product sub-tree, which the catch-all maps to Router. If the
+    # sysDescr names an access point model, correct the role to Wireless AP.
+    if _oid_mfr=='Ubiquiti' and _oid_role in ('Router','Firewall'):
+        _sd_l=(snmp.get('sys_descr') or '').lower()
+        if any(t in _sd_l for t in ('u6-','u7-','u6pro','uap-','uap ',
+                'unifi ap','access point','nanostation','litebeam',
+                'nanobeam','powerbeam','airmax')):
+            _oid_role='Wireless AP'
 
 FW=['firewall','fortigate','fortios','palo alto','checkpoint','asa','sonicwall',
     'opnsense','pfsense','netscreen','juniper srx','srx','watchguard','sophos','cisco asa',
@@ -2086,7 +2154,8 @@ AP=['access point','aironet','unifi','airmax','lightweight ap',
     'u6-','u6pro','u7-','uap-','uap-ac','u-lte','ulte','unifi6',
     'nanostation','litebeam','nanobeam','powerbeam','airfiber']
 SV=['linux','ubuntu','debian','centos','rhel','windows server','esxi',
-    'vmware','proxmox','freebsd']
+    'vmware','proxmox','freebsd','truenas','freenas','unraid','synology dsm',
+    'nas4free','xigmanas','openmediavault']
 PR=['printer','jetdirect','xerox','ricoh','canon','brother','lexmark',
     'epson','kyocera','konica','minolta','sharp','samsung clp','samsung ml',
     'hp laserjet','hp officejet','hp deskjet','hp color','pagewide',
@@ -2106,14 +2175,19 @@ elif _oid_role:
     # (or the get times out), so it must never demote a definitive OID match.
     host['device_role']=_oid_role
     if _oid_mfr: host['manufacturer']=_oid_mfr
-elif any(k in combined for k in FW):  host['device_role']='Firewall'
+elif any(k in trusted_txt for k in FW) or (snmp_up and any(k in combined for k in FW)):
+    host['device_role']='Firewall'
 elif any(k in combined for k in RT) and (snmp_up or '161' in open_ports
      or '830' in open_ports or '8291' in open_ports):
     host['device_role']='Router'
 elif any(k in combined for k in SW) and (snmp_up or '161' in open_ports):
     host['device_role']='Switch'
 elif any(k in combined for k in AP):  host['device_role']='Wireless AP'
-elif any(k in combined for k in PR) or '9100' in open_ports or '631' in open_ports:
+elif any(k in combined for k in PR) or \
+     (len(open_ports & {'9100','515','631'}) >= 2):
+    # Printer keyword, OR at least TWO classic printer ports together.
+    # 9100 alone is ambiguous (Prometheus node-exporter, custom apps,
+    # Docker hosts) so it no longer forces Printer on its own.
     host['device_role']='Printer'
 elif any(k in combined for k in UP):  host['device_role']='UPS'
 elif any(k in combined for k in CA):  host['device_role']='IP Camera'
@@ -2160,12 +2234,16 @@ else:
          'brother':'Brother','canon':'Canon','konica':'Konica Minolta',
          'dahua':'Dahua','hanwha':'Hanwha','pelco':'Pelco',
          'cyberpower':'CyberPower','liebert':'Liebert','vertiv':'Vertiv',
-         'extreme':'Extreme Networks','alcatel':'Alcatel-Lucent'}
+         'extreme':'Extreme Networks','alcatel':'Alcatel-Lucent',
+         'opnsense':'Deciso','pfsense':'Netgate','netgate':'Netgate',
+         'truenas':'iXsystems','ixsystems':'iXsystems','freenas':'iXsystems',
+         'unifi':'Ubiquiti','edgeos':'Ubiquiti','proxmox':'Proxmox',
+         'raspbian':'Raspberry Pi','raspberry':'Raspberry Pi'}
     # Skip keyword MFR lookup when OID already identified the vendor;
     # prevents script text from overriding a definitive OID match
     if not _oid_mfr:
         for k,v in MFR.items():
-            if k in combined: host['manufacturer']=v; break
+            if k in mfr_txt: host['manufacturer']=v; break
     else:
         host['manufacturer']=_oid_mfr
 # KaSaNaa manufacturer as a fallback when nothing else resolved a vendor
@@ -2541,6 +2619,36 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
                 (( _idx_ip++ )) || true
             done < <(echo "$winrm_nic" | jq -r '.ips[]?' 2>/dev/null || true)
         done < <(echo "$host" | jq -c '.winrm_nics[]?' 2>/dev/null || true)
+
+        # Guarantee the management IP is assigned SOMEWHERE on this device so
+        # IP-first dedup (bash + Hyper-V PS1) can find it on later runs. WinRM
+        # NIC data sometimes lacks per-NIC IPs (ips:[null]), which previously
+        # left the mgmt IP unassigned -- the root cause of the SERVER01 /
+        # server01.fqdn duplicate. If the IP is not already linked to this
+        # device, attach it to the first real interface (or a mgmt0 fallback).
+        local _mre _mat _mai
+        _mre=$(nb_get "ipam/ip-addresses/?address=$(nb_urlencode "${ip}/32")&limit=1")
+        [[ $(echo "$_mre" | jq '.count // 0' 2>/dev/null) == "0" ]] && \
+            _mre=$(nb_get "ipam/ip-addresses/?address=$(nb_urlencode "$ip")&limit=1")
+        _mat=$(echo "$_mre" | jq -r '.results[0].assigned_object_type // empty' 2>/dev/null)
+        _mai=$(echo "$_mre" | jq -r '.results[0].assigned_object_id  // empty' 2>/dev/null)
+        local _owner=""
+        if [[ "$_mat" == "dcim.interface" && "$_mai" =~ ^[0-9]+$ ]]; then
+            _owner=$(nb_get "dcim/interfaces/${_mai}/" | jq -r '.device.id // empty' 2>/dev/null)
+        fi
+        if [[ "$_owner" != "$dev_id" ]]; then
+            # find an existing interface on this device, else create mgmt0
+            local _tgt_if
+            _tgt_if=$(nb_get "dcim/interfaces/?device_id=${dev_id}&limit=1" \
+                | jq -r '.results[0].id // empty' 2>/dev/null)
+            if [[ -z "$_tgt_if" || ! "$_tgt_if" =~ ^[0-9]+$ ]]; then
+                _tgt_if=$(nb_add_interface "$dev_id" "mgmt0" "other" "" \
+                    "Management (auto)" 2>/dev/null)
+            fi
+            if [[ -n "$_tgt_if" && "$_tgt_if" =~ ^[0-9]+$ ]]; then
+                nb_add_ip "$ip" "$dev_id" "$_tgt_if" >/dev/null 2>&1 || true
+            fi
+        fi
 
         local nbr
         while IFS= read -r nbr; do
@@ -3152,6 +3260,24 @@ function Add-NetboxDevice {{
     return ($resp.Content | ConvertFrom-Json)
 }}
 
+function Find-DeviceByShortName {{
+    # Normalized-name dedup: match by short hostname, case-insensitive, so the
+    # Hyper-V FQDN (server01.certifiedgeeks.net) merges with a discovered
+    # NetBIOS name (SERVER01) instead of creating a duplicate device.
+    param([string]$Name)
+    if (-not $Name) {{ return $null }}
+    $short = ($Name -split '\.')[0].ToLower()
+    if (-not $short) {{ return $null }}
+    try {{
+        $enc = [uri]::EscapeDataString($short)
+        $r = ((Invoke-NB -Uri "$uri/dcim/devices/?name__ic=$enc&limit=50").Content | ConvertFrom-Json).results
+        foreach ($d in $r) {{
+            if ((($d.name -split '\.')[0].ToLower()) -eq $short) {{ return $d }}
+        }}
+    }} catch {{}}
+    return $null
+}}
+
 function Find-DeviceByHostIP {{
     # IP-first dedup: find an existing device that owns this host IP.
     # Prevents a second device being created when a device was previously
@@ -3175,12 +3301,21 @@ function Find-DeviceByHostIP {{
 function Set-NetboxDevice {{
     param([string]$Name,[int]$ClusterId,[int]$SiteId,[int]$DeviceTypeId,[int]$DeviceRoleId)
     $devId = $null
-    # Try IP-first: resolve the local host IP to find any pre-existing device
-    $localIP = (Get-NetIPAddress -AddressFamily IPv4 |
-                Where-Object {{ $_.IPAddress -notlike "169.254*" -and
-                                $_.IPAddress -ne "127.0.0.1" -and
-                                $_.IPAddress -ne "0.0.0.0" }} |
-                Select-Object -First 1).IPAddress
+    # IP-first dedup using the SAME management IP the bash discovery used
+    # ($hyperVHost). Get-NetIPAddress | Select -First 1 was unreliable on a
+    # Hyper-V host (it could return an internal vSwitch / mshome.net address),
+    # which made this fail to find the already-created discovered device and
+    # produced a duplicate (e.g. SERVER01 vs server01.fqdn). Prefer $hyperVHost,
+    # fall back to the first non-virtual local IPv4.
+    $localIP = $hyperVHost
+    if (-not $localIP) {{
+        $localIP = (Get-NetIPAddress -AddressFamily IPv4 |
+                    Where-Object {{ $_.IPAddress -notlike "169.254*" -and
+                                    $_.IPAddress -notlike "172.2*" -and
+                                    $_.IPAddress -ne "127.0.0.1" -and
+                                    $_.IPAddress -ne "0.0.0.0" }} |
+                    Select-Object -First 1).IPAddress
+    }}
     if ($localIP) {{ $devId = Find-DeviceByHostIP -HostIP $localIP }}
     if ($devId) {{
         Write-Host "  Found existing device by IP $localIP (ID $devId)"
@@ -3200,15 +3335,25 @@ function Set-NetboxDevice {{
         catch {{ Write-Host "  [WARN] Update device $Name : $($_.Exception.Message)" }}
         return $devId
     }}
-    # Fall back to name lookup
+    # Fall back to name lookup (exact, then normalized short-name)
     $dev = Get-NetboxDevice -Name $Name
+    if (-not $dev) {{ $dev = Find-DeviceByShortName -Name $Name }}
     if ($dev) {{
+        # Reuse the existing device (e.g. discovered "SERVER01") instead of
+        # creating a duplicate "server01.fqdn". Keep whichever name is richer:
+        # a non-auto-generated existing name is preserved over the FQDN so the
+        # discovered device (with its ports/interfaces) remains the canonical one.
+        $keepName = $dev.name
+        if ($dev.name -match "^device-\d+-\d+-\d+-\d+$" -and $Name -notmatch "^device-\d+-\d+-\d+-\d+$") {{
+            $keepName = $Name
+        }}
         $patch = @{{
-            cluster=$ClusterId; site=$SiteId
+            name=$keepName; cluster=$ClusterId; site=$SiteId
             device_type=$DeviceTypeId; role=$DeviceRoleId; status="active"
         }} | ConvertTo-Json
         try {{ Invoke-NB -Uri "$uri/dcim/devices/$($dev.id)/" -Method PATCH -Body $patch | Out-Null }}
-        catch {{ Write-Host "  [WARN] Failed to update device $Name : $($_.Exception.Message)" }}
+        catch {{ Write-Host "  [WARN] Failed to update device $keepName : $($_.Exception.Message)" }}
+        return [int]$dev.id
     }} else {{
         $dev = Add-NetboxDevice -Name $Name -ClusterId $ClusterId -SiteId $SiteId -DeviceTypeId $DeviceTypeId -DeviceRoleId $DeviceRoleId
     }}
