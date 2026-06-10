@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.1
+#  Version: 2.5.2
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.1"
+SCRIPT_VERSION="2.5.2"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1032,6 +1032,14 @@ PYEOF
 # -----------------------------------------------------------------------------
 DISC_RESULTS=""
 LIVE_HOSTS_FILE="$DISCOVERY_DIR/live_hosts.txt"
+ARP_MAP_FILE="$DISCOVERY_DIR/arp_map.txt"
+
+# arp_lookup <ip> -> prints the MAC (lowercase, colon-sep) seen for ip during
+# Phase 1 ARP discovery, or nothing. Last entry wins (cache may be fresher).
+arp_lookup() {
+    [[ -f "$ARP_MAP_FILE" ]] || return 0
+    awk -v ip="$1" '$1==ip{m=$2} END{if(m)print tolower(m)}' "$ARP_MAP_FILE"
+}
 
 init_scan_session() {
     DISC_RESULTS="$DISCOVERY_DIR/results_$(date +%Y%m%d_%H%M%S).json"
@@ -1076,13 +1084,19 @@ discover_targets() {
 _do_host_discovery() {
     local target="$1" out_file="$2"
     local tmp_all; tmp_all=$(mktemp)
+    # IP->MAC map captured during discovery. Phase 1 sees MACs via ARP that the
+    # deep scan (-Pn) and SSH/SNMP probes often miss; propagating them lets the
+    # reconciler match nmap-only hosts (no captured MAC) to Hyper-V VMs by MAC.
+    : > "$ARP_MAP_FILE"
 
     printf "  ${W}ARP scan${NC} .................. "
     if cmd_exists arp-scan; then
         arp-scan --localnet --quiet 2>/dev/null \
-            | awk '/^[0-9]/{print $1}' >> "$tmp_all"
+            | awk '/^[0-9]/{print $1; print $1, $2 > "'"$ARP_MAP_FILE"'"}' \
+            >> "$tmp_all"
         arp-scan "$target" --quiet 2>/dev/null \
-            | awk '/^[0-9]/{print $1}' >> "$tmp_all" 2>/dev/null || true
+            | awk '/^[0-9]/{print $1; print $1, $2 >> "'"$ARP_MAP_FILE"'"}' \
+            >> "$tmp_all" 2>/dev/null || true
         printf "${G}done${NC}\n"
     else printf "${Y}skipped${NC}\n"; fi
 
@@ -1133,9 +1147,17 @@ _do_host_discovery() {
     else printf "${Y}skipped${NC}\n"; fi
 
     printf "  ${W}ARP cache (passive)${NC} ....... "
-    ip neigh show 2>/dev/null | awk '/REACHABLE|STALE|DELAY/{print $1}' \
+    ip neigh show 2>/dev/null \
+        | awk '/REACHABLE|STALE|DELAY/{print $1;
+               if($5 ~ /:/) print $1, $5 > "'"$ARP_MAP_FILE"'.tmp"}' \
         >> "$tmp_all"
-    arp -n 2>/dev/null | awk 'NR>1&&$3!="(incomplete)"{print $1}' >> "$tmp_all"
+    arp -n 2>/dev/null \
+        | awk 'NR>1&&$3!="(incomplete)"{print $1;
+               if($3 ~ /:/) print $1, $3 > "'"$ARP_MAP_FILE"'.tmp"}' \
+        >> "$tmp_all"
+    # merge cache MACs into the map without clobbering arp-scan entries
+    [[ -f "$ARP_MAP_FILE.tmp" ]] && cat "$ARP_MAP_FILE.tmp" >> "$ARP_MAP_FILE" \
+        && rm -f "$ARP_MAP_FILE.tmp"
     printf "${G}done${NC}\n"
 
     # Filter to target CIDR + dedup + validate
@@ -1265,6 +1287,10 @@ scan_single_host() {
     probe_mdns    "$ip" "$tmp" </dev/null &
     probe_winrm   "$ip" "$tmp" </dev/null &
     wait
+    # Inject the Phase-1 ARP MAC so nmap-only hosts (which capture no MAC) still
+    # carry one -- lets the reconciler MAC-match them to Hyper-V VMs.
+    local _amac; _amac=$(arp_lookup "$ip")
+    [[ -n "$_amac" ]] && printf '{"mac":"%s"}' "$_amac" > "$tmp/arp.json"
     local host_json
     host_json=$(merge_host_data "$ip" "$tmp")
     append_host "$host_json"
@@ -1915,6 +1941,7 @@ def load(f):
 nmap=load('nmap'); snmp=load('snmp'); ssh=load('ssh')
 http=load('http'); nb=load('netbios'); dns=load('dns')
 bnr=load('banners'); mdns=load('mdns'); winrm=load('winrm')
+arp=load('arp')
 
 host={'ip':ip,'hostname':None,'mac':None,'vendor':None,
       'os':None,'os_accuracy':None,
@@ -1944,7 +1971,8 @@ for src in (snmp.get('sys_name'),ssh.get('hostname'),nmap.get('hostname'),
 if not host['hostname']:
     host['hostname']='device-'+ip.replace('.', '-')
 
-host['mac']=nmap.get('mac'); host['vendor']=nmap.get('vendor','')
+host['mac']=nmap.get('mac') or (arp.get('mac') if isinstance(arp,dict) else None)
+host['vendor']=nmap.get('vendor','')
 # OS string priority: SNMP sysDescr is authoritative when present (it is the
 # device's own self-report, e.g. "FreeBSD OPNsense 14.3", "pfSense 2.4.5",
 # "Ubiquiti UniFi UCG-Fiber", "U6-Pro 6.8.2"). nmap's -O guess is frequently
@@ -2552,7 +2580,7 @@ reconcile_results() {
     fi
     local pyf; pyf=$(mktemp --suffix=.py)
     cat > "$pyf" <<'PYEOF'
-import json, sys, ipaddress
+import json, sys, re
 
 HYPERV_OUI = "00:15:5d"
 
@@ -2592,6 +2620,9 @@ def host_macs(h):
         m = (i.get("mac") or "").strip().lower()
         if m and len(m) == 17:
             macs.add(m)
+    m = (h.get("mac") or "").strip().lower()    # top-level (ARP-captured) MAC
+    if m and len(m) == 17:
+        macs.add(m)
     return macs
 
 
@@ -2721,6 +2752,12 @@ def reconcile(data):
             loser["merge_reason"] = reasons.get(loser["ip"], "merged")
 
     # ---- VM resolution from Hyper-V inventory -------------------------------
+    # Every VM instance is its OWN VM (Hyper-V Replica copies are NOT collapsed):
+    # a primary and its replica become two separate NetBox VMs on their two
+    # hosts. The only subtlety is binding: a primary and its Off replica can
+    # share a MAC, so when a live discovered IP matches more than one instance we
+    # bind it to the RUNNING one (the replica is Off and isn't serving that IP);
+    # the replica still appears as its own VM record.
     vm_inv = []
     for h in hosts:
         if h.get("sync_as") == "skip":
@@ -2740,70 +2777,87 @@ def reconcile(data):
                 "name": vm.get("Name", ""), "host_ip": h["ip"],
                 "host_name": h.get("hostname", ""), "macs": macs, "ips": ips,
                 "cpu": vm.get("ProcessorCount"), "mem": vm.get("MemoryStartupBytes"),
-                "state": vm.get("State"), "vmid": vm.get("VMId"),
+                "state": (vm.get("State") or ""), "vmid": vm.get("VMId"),
             })
 
+    def inst_key(vm):
+        return vm.get("vmid") or (vm["host_ip"], vm["name"])
+
+    def is_running(vm):
+        return vm["state"].lower() == "running"
+
     def hardware_oid(h):
-        # A real hardware enterprise OID (Netgear/HP/Cisco/etc.) means a
-        # physical device. The generic Net-SNMP tree (1.3.6.1.4.1.8072) is used
-        # by software routers/firewalls (OPNsense/pfSense) and does NOT count.
         oid = (h.get("snmp_details", {}).get("sys_oid") or "").strip()
         return bool(oid) and not oid.startswith("1.3.6.1.4.1.8072")
+
+    def pick(cands):
+        # Prefer the Running instance when a discovered IP matches several
+        # instances that share a MAC/name (primary vs Off replica).
+        run = [c for c in cands if is_running(c)]
+        return (run or cands)[0]
 
     def vm_match(h):
         hm = host_macs(h)
         hips = {h["ip"]} | {e["ip"] for e in ip_table_ips(h)}
         hn = short_name(h.get("hostname"))
-        # MAC match is definitive (Hyper-V MACs are unique) -- always honored.
-        for vm in vm_inv:
-            if hm & vm["macs"]:
-                return vm, "MAC"
-        # IP / name match is weaker: never override a physical (hardware-OID)
-        # device, so a switch/printer/AP cannot be mislabeled a VM by a stale or
-        # reused inventory IP.
+        cands = [vm for vm in vm_inv if hm & vm["macs"]]
+        if cands:
+            return pick(cands), "MAC"
         if hardware_oid(h):
             return None, None
-        for vm in vm_inv:
-            if hips & vm["ips"]:
-                return vm, "IP"
-            if hn and hn == short_name(vm["name"]):
-                return vm, "name"
+        cands = [vm for vm in vm_inv if hips & vm["ips"]]
+        if cands:
+            return pick(cands), "IP"
+        if hn:
+            cands = [vm for vm in vm_inv if short_name(vm["name"]) == hn]
+            if cands:
+                return pick(cands), "name"
         return None, None
 
-    matched_vmids = set()
+    matched_keys = set()
     for h in hosts:
         if h.get("sync_as") == "skip" or h.get("is_hyperv"):
             continue
         vm, how = vm_match(h)
         if vm:
             h["sync_as"] = "vm"
+            h["vm_name"] = vm["name"]
             h["vm_host"] = vm["host_ip"]
             h["vm_cluster"] = vm["host_name"] or vm["host_ip"]
-            h["vm_reason"] = "Hyper-V VM '%s' on %s (by %s)" % (
-                vm["name"], vm["host_name"] or vm["host_ip"], how)
-            matched_vmids.add(vm.get("vmid"))
+            h["vm_state"] = vm["state"]
+            h["vm_reason"] = "Hyper-V VM '%s' on %s (%s, by %s)" % (
+                vm["name"], vm["host_name"] or vm["host_ip"], vm["state"], how)
+            matched_keys.add(inst_key(vm))
         else:
             vmac = next((m for m in host_macs(h) if m.startswith(HYPERV_OUI)), None)
             if vmac:
                 h["sync_as"] = "vm"
                 h["vm_reason"] = "Hyper-V MAC %s (host not WinRM-scanned)" % vmac
 
+    # Synthesize a record for every VM instance not bound to a discovered host.
+    # Replicas land here as their own VMs. Synthetic keys are made unique so two
+    # same-named VMs on different hosts (a VM and its replica) don't collide.
     discovered_ips = {h["ip"] for h in hosts}
+    used_keys = set()
     for vm in vm_inv:
-        if vm.get("vmid") in matched_vmids:
+        if inst_key(vm) in matched_keys:
             continue
         vm_ip = sorted(vm["ips"])[0] if vm["ips"] else None
         if vm_ip and vm_ip in discovered_ips:
             continue
+        key = vm_ip or ("vm:" + (vm["name"] or str(vm.get("vmid", "unknown"))))
+        if key in used_keys:
+            key = "vm:%s@%s" % (vm["name"], vm["host_name"] or vm["host_ip"])
+        used_keys.add(key)
         rec = {
-            "ip": vm_ip or ("vm:" + (vm["name"] or vm.get("vmid", "unknown"))),
-            "hostname": vm["name"], "device_role": "Server",
+            "ip": key, "hostname": vm["name"], "device_role": "Server",
             "manufacturer": "", "model": "", "os": "",
             "sync_as": "vm", "canonical": True, "merged_from": [],
             "secondary_ips": [], "source": "hyperv-inventory",
-            "vm_host": vm["host_ip"], "vm_cluster": vm["host_name"] or vm["host_ip"],
-            "vm_reason": "Hyper-V VM '%s' on %s (inventory; not IP-scanned)" % (
-                vm["name"], vm["host_name"] or vm["host_ip"]),
+            "vm_name": vm["name"], "vm_host": vm["host_ip"],
+            "vm_cluster": vm["host_name"] or vm["host_ip"],
+            "vm_reason": "Hyper-V VM '%s' on %s (%s; inventory)" % (
+                vm["name"], vm["host_name"] or vm["host_ip"], vm["state"]),
             "vm_cpu": vm["cpu"], "vm_mem_bytes": vm["mem"], "vm_state": vm["state"],
             "ports": [], "interfaces": [], "discovery_methods": ["hyperv-inventory"],
         }
