@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.4.1
+#  Version: 2.4.2
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.4.1"
+SCRIPT_VERSION="2.4.2"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1886,7 +1886,7 @@ PYEOF
 merge_host_data() {
     local ip="$1" tmp="$2"
     python3 /dev/stdin "$ip" "$tmp" <<'PYEOF'
-import json, os, sys, re
+import json, os, sys, re, html
 ip=sys.argv[1]; tmp=sys.argv[2]
 def load(f):
     p=os.path.join(tmp,f+'.json')
@@ -1931,11 +1931,28 @@ host['mac']=nmap.get('mac'); host['vendor']=nmap.get('vendor','')
 # wrong for network appliances (seen: OPNsense->"Avaya G350", IPMI->"Cisco ASA",
 # printer->"3M CT-30 thermostat"), so it is only a fallback.
 _snmp_descr=(snmp.get('sys_descr') or '').strip()
+# An SSH banner is the host's own self-report and is far more reliable than
+# nmap's -O guess (which mis-fingerprints filtered hosts, e.g. a Debian box as
+# "3Com OfficeConnect router"). Extract a distro from the OpenSSH banner.
+_ssh_banner=(ssh.get('banner') or '').lower()
+_ssh_distro=''
+for _tok,_name in [('raspbian','Raspbian'),('ubuntu','Ubuntu Linux'),
+                   ('debian','Debian Linux'),('freebsd','FreeBSD'),
+                   ('centos','CentOS Linux'),('.el7','RHEL/CentOS 7'),
+                   ('.el8','RHEL/CentOS 8'),('.el9','RHEL/CentOS 9'),
+                   ('amzn','Amazon Linux'),('alpine','Alpine Linux')]:
+    if _tok in _ssh_banner: _ssh_distro=_name; break
 if _snmp_descr and not _snmp_descr.startswith('iso.'):
     host['os']=_snmp_descr[:120]
     host['os_accuracy']='snmp'
+elif _ssh_distro:
+    host['os']=_ssh_distro
+    host['os_accuracy']='banner'
+elif ssh.get('os'):
+    host['os']=ssh['os']
+    host['os_accuracy']='ssh'
 else:
-    host['os']=nmap.get('os') or ssh.get('os') or ''
+    host['os']=nmap.get('os') or ''
     host['os_accuracy']=nmap.get('os_accuracy')
 host['serial']=snmp.get('chassis_serial','')
 
@@ -1991,6 +2008,17 @@ if (open_ports & _win_ports) and 'windows' not in os_str \
         and not (snmp_up and sys_descr):
     host['os']='Microsoft Windows'; host['os_accuracy']=None
     os_str='microsoft windows'
+# Stabilize port-only Windows hosts. Without WinRM/SNMP, nmap's edition guess
+# flip-flops between runs ("Windows Server 2008" one scan, generic the next),
+# which made the same host alternate Server/Workstation. When the only OS signal
+# is a raw nmap guess (numeric accuracy) and Windows-exclusive ports are open,
+# normalize to plain "Microsoft Windows" -> deterministically Workstation. Real
+# servers are typed via WinRM IsServer (handled earlier) or a device override.
+elif (open_ports & _win_ports) and not winrm.get('available') \
+        and not (snmp_up and sys_descr) \
+        and host.get('os_accuracy') not in ('snmp','banner','ssh',None):
+    host['os']='Microsoft Windows'; host['os_accuracy']=None
+    os_str='microsoft windows'
 http_ttl=' '.join(s.get('title','') for s in host['http_services']).lower()
 # Include entity MIB descriptions + model names so devices whose sysDescr
 # is sparse (e.g. 'FortiGate-61E') still get classified from entity strings
@@ -2025,7 +2053,7 @@ trusted_txt=' '.join([sys_descr,http_ttl,entity_text,nmap_scripts,banner_txt])
 # raw nmap -O guess (numeric accuracy), so a bogus "Cisco ASA" guess on an IPMI
 # BMC does not leak a "Cisco" manufacturer.
 _os_acc=host.get('os_accuracy')
-mfr_txt=trusted_txt + ((' '+os_str) if _os_acc in (None,'snmp') else '')
+mfr_txt=trusted_txt + ((' '+os_str) if _os_acc in (None,'snmp','banner','ssh') else '')
 # class_txt: text used for appliance-role keyword matching (RT/SW/AP/PR/UP/CA).
 # Like mfr_txt, it includes the OS string ONLY when trustworthy (SNMP sysDescr
 # or asserted), never a raw nmap -O guess -- so a bogus "APC Silicon DP320E UPS"
@@ -2232,10 +2260,13 @@ elif ip_forwarding and snmp_up and not any(k in combined for k in SV) \
 # "Tomato", a FortiAnalyzer showing "Aruba IAP-93 WAP", or a printer showing
 # "SGI IRIX64" are bad nmap fingerprints -- appliances don't run those OSes.
 # Keep SNMP sysDescr ('snmp') and asserted OS values (os_accuracy None).
-_appliance_roles={'Firewall','Router','Switch','Wireless AP','Printer',
-                  'UPS','IP Camera'}
-if (_oid_role or host['device_role'] in _appliance_roles) \
-        and host.get('os_accuracy') not in ('snmp', None):
+# Suppress an untrusted nmap OS guess (numeric accuracy) when it cannot be
+# trusted: OID-identified devices whose sysDescr was empty (FortiGate "Tomato",
+# FortiAnalyzer "Aruba IAP-93"), and any non-host role (appliances, plus an
+# IPMI/BMC Endpoint that nmap guessed as "Cisco Unified Communications"). Real
+# host OSes (Server/Workstation) and SNMP/banner/ssh-derived OS are preserved.
+if (_oid_role or host['device_role'] not in ('Server','Workstation')) \
+        and host.get('os_accuracy') not in ('snmp','banner','ssh', None):
     host['os']=''; host['os_accuracy']=None
 
 vendor=host.get('vendor','') or ''
@@ -2291,12 +2322,33 @@ for _e in snmp.get('entity_inventory',[]):
         _ent_model=_m[:80]; break
 
 sd=snmp.get('sys_descr','') or ''
+# Model from an HTTP management page title: web-managed devices (printers,
+# cameras, NAS, appliances) put the model there, e.g. a printer's title is
+# "HP Color LaserJet MFP M277dw   192.168.0.41". Clean HTML entities, strip a
+# trailing IP, and accept only model-like strings (letters + a digit), not a
+# generic page title (Login / Dashboard / etc.).
+_http_model=''
+for _s in host.get('http_services',[]):
+    _t=(_s.get('title') or '').strip()
+    if not _t: continue
+    _t=html.unescape(_t)
+    _t=re.sub(r'\s+',' ',_t).strip()
+    _t=re.sub(r'\s*\d{1,3}(?:\.\d{1,3}){3}\s*$','',_t).strip()  # trailing IP
+    if (re.search(r'[A-Za-z]',_t) and re.search(r'\d',_t) and 2<len(_t)<=80
+            and not re.search(r'\b(login|sign in|sign-in|dashboard|home|'
+                              r'index|welcome|error|forbidden|unauthorized|'
+                              r'not found|loading|please wait|apache|nginx|'
+                              r'iis|lighttpd|tomcat|default page|test page|'
+                              r'it works|web server|placeholder)\b',_t,re.I)):
+        _http_model=_t; break
 if k_model and k_model not in ('Unknown',):
     host['model']=k_model[:80]
 elif _ent_model:
     host['model']=_ent_model
 elif sd:
     host['model']=sd[:120].strip()
+elif _http_model:
+    host['model']=_http_model
 elif ssh.get('net_device_info'):
     lns=[l for l in ssh['net_device_info'].split('\n') if l.strip()]
     host['model']=lns[0][:120].strip() if lns else 'Unknown'
