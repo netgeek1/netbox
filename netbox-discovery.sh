@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.4.0
+#  Version: 2.4.1
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.4.1"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2026,6 +2026,12 @@ trusted_txt=' '.join([sys_descr,http_ttl,entity_text,nmap_scripts,banner_txt])
 # BMC does not leak a "Cisco" manufacturer.
 _os_acc=host.get('os_accuracy')
 mfr_txt=trusted_txt + ((' '+os_str) if _os_acc in (None,'snmp') else '')
+# class_txt: text used for appliance-role keyword matching (RT/SW/AP/PR/UP/CA).
+# Like mfr_txt, it includes the OS string ONLY when trustworthy (SNMP sysDescr
+# or asserted), never a raw nmap -O guess -- so a bogus "APC Silicon DP320E UPS"
+# guess on an IPMI BMC cannot make it a UPS, and "Avaya G350" can't make a
+# router. FW keeps its own stricter rule (trusted_txt) just above.
+class_txt=mfr_txt
 sys_oid=(snmp.get('sys_oid') or '').strip()
 if sys_oid.startswith('iso.'): sys_oid='1.'+sys_oid[4:]
 
@@ -2177,20 +2183,20 @@ elif _oid_role:
     if _oid_mfr: host['manufacturer']=_oid_mfr
 elif any(k in trusted_txt for k in FW) or (snmp_up and any(k in combined for k in FW)):
     host['device_role']='Firewall'
-elif any(k in combined for k in RT) and (snmp_up or '161' in open_ports
+elif any(k in class_txt for k in RT) and (snmp_up or '161' in open_ports
      or '830' in open_ports or '8291' in open_ports):
     host['device_role']='Router'
-elif any(k in combined for k in SW) and (snmp_up or '161' in open_ports):
+elif any(k in class_txt for k in SW) and (snmp_up or '161' in open_ports):
     host['device_role']='Switch'
-elif any(k in combined for k in AP):  host['device_role']='Wireless AP'
-elif any(k in combined for k in PR) or \
+elif any(k in class_txt for k in AP):  host['device_role']='Wireless AP'
+elif any(k in class_txt for k in PR) or \
      (len(open_ports & {'9100','515','631'}) >= 2):
     # Printer keyword, OR at least TWO classic printer ports together.
     # 9100 alone is ambiguous (Prometheus node-exporter, custom apps,
     # Docker hosts) so it no longer forces Printer on its own.
     host['device_role']='Printer'
-elif any(k in combined for k in UP):  host['device_role']='UPS'
-elif any(k in combined for k in CA):  host['device_role']='IP Camera'
+elif any(k in class_txt for k in UP):  host['device_role']='UPS'
+elif any(k in class_txt for k in CA):  host['device_role']='IP Camera'
 elif 'windows server' in os_str or 'windows server' in combined:
     host['device_role']='Server'
 elif 'windows' in os_str or 'windows' in combined:
@@ -2198,7 +2204,12 @@ elif 'windows' in os_str or 'windows' in combined:
     # port rule because Win10/11 workstations commonly have 3389 open --
     # RDP being enabled does not make a desktop a server.
     host['device_role']='Workstation'
-elif any(k in combined for k in SV):  host['device_role']='Server'
+elif any(k in class_txt for k in SV):  host['device_role']='Server'
+elif open_ports & {'2049','20048','111','21'}:
+    # NFS exports (2049 nfsd, 20048 mountd, 111 rpcbind) or FTP (21) indicate a
+    # file/server role even when nmap reported no OS. Checked before the SMB
+    # Workstation fallback so a Linux NFS+Samba box is a Server, not Workstation.
+    host['device_role']='Server'
 elif '3389' in open_ports and not open_ports.intersection({'135','139','445'}):
     # RDP open with no Windows/SMB context: treat as a server-ish remote host
     host['device_role']='Server'
@@ -2215,6 +2226,17 @@ elif ip_forwarding and snmp_up and not any(k in combined for k in SV) \
     # OID/keyword/port signal AND shows no host-OS indicators (Linux/Windows
     # boxes and hypervisors routinely enable forwarding without being routers).
     host['device_role']='Router'
+
+# Suppress an untrusted nmap OS guess for devices we have positively typed as
+# network appliances (or identified via SNMP OID). A FortiGate showing
+# "Tomato", a FortiAnalyzer showing "Aruba IAP-93 WAP", or a printer showing
+# "SGI IRIX64" are bad nmap fingerprints -- appliances don't run those OSes.
+# Keep SNMP sysDescr ('snmp') and asserted OS values (os_accuracy None).
+_appliance_roles={'Firewall','Router','Switch','Wireless AP','Printer',
+                  'UPS','IP Camera'}
+if (_oid_role or host['device_role'] in _appliance_roles) \
+        and host.get('os_accuracy') not in ('snmp', None):
+    host['os']=''; host['os_accuracy']=None
 
 vendor=host.get('vendor','') or ''
 if vendor not in ('','null','None'): host['manufacturer']=vendor
@@ -2560,25 +2582,25 @@ sync_to_netbox() {
                 "$if_mac" "${if_desc:0:200}" 2>/dev/null) || true
             [[ -z "$if_id" || ! "$if_id" =~ ^[0-9]+$ ]] && continue
 
-            # Assign IP from SNMP ip_table; skip unroutable addresses (v2.0.9)
-            local iface_ip iface_mask iface_prefix
-            iface_ip=$(echo "$ip_table_json" | jq -r \
-                "[.[] | select(.if_index==\"$if_idx\") | .ip][0] // empty" \
-                2>/dev/null || echo "")
-            if [[ -n "$iface_ip" \
-                  && "$iface_ip" != "0.0.0.0" \
-                  && "$iface_ip" != 127.* \
-                  && "$iface_ip" != 169.254.* ]]; then
-                iface_mask=$(echo "$ip_table_json" | jq -r \
-                    "[.[] | select(.ip==\"$iface_ip\") | .mask][0] \
-                     // \"255.255.255.0\"" 2>/dev/null || echo "255.255.255.0")
+            # Assign every SNMP ip_table IP bound to this interface index, not
+            # just the first -- an interface can hold multiple IPs (e.g. UCG
+            # if_index 44 carries both 192.168.0.253 and the secondary
+            # 192.168.0.2). Skip unroutable addresses.
+            local _iprow iface_ip iface_mask iface_prefix
+            while IFS= read -r _iprow; do
+                [[ -z "$_iprow" || "$_iprow" == "null" ]] && continue
+                iface_ip=$(echo "$_iprow"   | jq -r '.ip   // empty')
+                iface_mask=$(echo "$_iprow" | jq -r '.mask // "255.255.255.0"')
+                [[ -z "$iface_ip" || "$iface_ip" == "0.0.0.0" \
+                   || "$iface_ip" == 127.* || "$iface_ip" == 169.254.* ]] && continue
                 iface_prefix=$(python3 -c \
                     "import ipaddress; \
 print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
                     2>/dev/null || echo "24")
                 nb_add_ip "${iface_ip}/${iface_prefix}" "" "$if_id" \
                     >/dev/null 2>&1 || true
-            fi
+            done < <(echo "$ip_table_json" | jq -c \
+                "[.[] | select(.if_index==\"$if_idx\")][]" 2>/dev/null || true)
 
             local pvid vlan_nm vlan_id
             pvid=$(echo "$vlan_pvid_json" | jq -r \
@@ -3689,19 +3711,47 @@ function Ensure-IPShared {{
 
 function Assign-IPToNIC {{
     param([int]$IpId,[int]$NicId)
-    # Step 1: clear any existing assignment (NetBox 400s on direct
-    # cross-type reassignment, e.g. dcim.interface -> vminterface)
-    try {{
+    # Fetch the current IP object so we can no-op when it is already correct and
+    # preserve its address in the reassign payload (NetBox 4.x validates it).
+    $cur = $null
+    try {{ $cur = (Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/").Content | ConvertFrom-Json }}
+    catch {{ Write-Host "  [WARN] IP $IpId fetch failed: $($_.Exception.Message)"; return $false }}
+    if ($cur -and $cur.assigned_object_type -eq "virtualization.vminterface" `
+            -and [int]$cur.assigned_object_id -eq $NicId) {{
+        return $true   # already assigned to this VM NIC
+    }}
+    $addr = $cur.address   # keep the existing CIDR (e.g. 192.168.0.14/32)
+
+    # Step 1: clear any existing assignment. NetBox 400s on a direct cross-type
+    # reassignment (dcim.interface -> vminterface), so clear first and VERIFY.
+    if ($cur.assigned_object_id) {{
         $clearBody=(@{{assigned_object_type=$null;assigned_object_id=$null}}|ConvertTo-Json)
-        Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $clearBody|Out-Null
-    }} catch {{}}
-    # Step 2: assign to the VM NIC
-    $b=@{{assigned_object_type="virtualization.vminterface";assigned_object_id=$NicId}}|ConvertTo-Json
+        try {{ Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $clearBody|Out-Null }}
+        catch {{
+            $eb = Get-NBErrorBody $_.Exception
+            Write-Host "  [WARN] IP $IpId clear failed: $($_.Exception.Message) $eb"
+        }}
+        # verify the clear actually committed before reassigning
+        try {{
+            $chk = (Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/").Content | ConvertFrom-Json
+            if ($chk.assigned_object_id) {{
+                Write-Host "  [WARN] IP $IpId still assigned after clear (object $($chk.assigned_object_type)/$($chk.assigned_object_id)); skipping reassign to avoid 400"
+                return $false
+            }}
+        }} catch {{}}
+    }}
+
+    # Step 2: assign to the VM NIC, re-sending the address so validation passes.
+    $body=@{{assigned_object_type="virtualization.vminterface"
+            assigned_object_id=$NicId}}
+    if ($addr) {{ $body.address=$addr }}
+    $b=$body|ConvertTo-Json
     try {{
         Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $b|Out-Null
         return $true
     }} catch {{
-        Write-Host "  [WARN] IP $IpId assign to NIC $NicId failed: $($_.Exception.Message)"
+        $eb = Get-NBErrorBody $_.Exception
+        Write-Host "  [WARN] IP $IpId assign to NIC $NicId failed: $($_.Exception.Message) -- $eb"
         return $false
     }}
 }}
