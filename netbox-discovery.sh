@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.0
+#  Version: 2.5.1
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.5.1"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1850,13 +1850,33 @@ $nics = Get-NetAdapter -Physical 2>$null | Where-Object { $_.Status -eq "Up" } |
         }
 $isHyperV = $false
 try { $isHyperV = ($null -ne (Get-Command Get-VM -ErrorAction SilentlyContinue)) } catch {}
+$hvVMs = @()
+if ($isHyperV) {
+    try {
+        $hvVMs = Get-VM 2>$null | ForEach-Object {
+            $vm = $_
+            $ad = Get-VMNetworkAdapter -VM $vm 2>$null | ForEach-Object {
+                $m = ($_.MacAddress -replace "(..)(?=.)",'$1:').ToUpper()
+                [ordered]@{ Name=$_.Name; MacAddress=$m;
+                            SwitchName=$_.SwitchName;
+                            IPAddresses=@($_.IPAddresses) }
+            }
+            [ordered]@{ Name=$vm.Name; State="$($vm.State)";
+                        Generation=$vm.Generation;
+                        ProcessorCount=[int]$vm.ProcessorCount;
+                        MemoryStartupBytes=[int64]$vm.MemoryStartupBytes;
+                        VMId="$($vm.VMId)"; NetworkAdapters=@($ad) }
+        }
+    } catch {}
+}
 [ordered]@{ Hostname=$cs.Name; Domain=$cs.Domain; Manufacturer=$cs.Manufacturer;
             Model=$cs.Model; SerialNumber=$bios.SerialNumber; OS=$os.Caption;
             OSVersion=$os.Version; IsServer=($os.ProductType -ne 1);
             IsHyperV=$isHyperV;
             CPUName=$cpu.Name; CPUCores=[int]$cpu.NumberOfCores;
             MemoryGB=[math]::Round($cs.TotalPhysicalMemory/1GB,2);
-            NetworkAdapters=@($nics) } | ConvertTo-Json -Depth 4
+            NetworkAdapters=@($nics);
+            HyperVVMs=@($hvVMs) } | ConvertTo-Json -Depth 6
 """
 result = None
 for cred in creds:
@@ -1970,6 +1990,10 @@ if winrm.get('available'):
         'prefix_lens':n.get('PrefixLens',[]) or []}
         for n in (winrm.get('NetworkAdapters') or [])]
     host['is_hyperv']=bool(winrm.get('IsHyperV',False))
+    # Read-only Hyper-V VM inventory (name/state/cpu/mem + per-adapter MAC/IPs).
+    # Used by the reconciler to map discovered devices to VMs and to create VMs
+    # that were not independently IP-scanned. No NetBox writes happen here.
+    host['hyperv_vms']=winrm.get('HyperVVMs') or []
 
 if nmap.get('ports'):         host['discovery_methods'].append('nmap')
 if snmp.get('available'):     host['discovery_methods'].append('snmp')
@@ -2528,116 +2552,319 @@ reconcile_results() {
     fi
     local pyf; pyf=$(mktemp --suffix=.py)
     cat > "$pyf" <<'PYEOF'
-import json, sys
-HYPERV_OUI="00:15:5d"
-GENERIC_NAMES={"localhost","iphone","ipad","ipod","android","android-2",
- "raspberrypi","ubuntu","debian","kali","openwrt","pfsense","esp32","esp8266",
- "espressif","chromecast","googlehome","echo","amazon","fire","roku","shield",
- "switch","printer","scanner","nas","router","gateway","ap","camera","unknown",
- "new-host","user-pc","desktop","laptop","windows","macbook","imac"}
-def is_auto_name(n):
-    if not n: return True
-    return n.lower().startswith("device-") and n.replace("device-","").replace("-","").isdigit()
-def short_name(n):
-    if not n or is_auto_name(n): return ""
-    s=n.split(".")[0].strip().lower()
-    return "" if s in GENERIC_NAMES else s
-def host_macs(h):
-    out=set()
-    for i in h.get("interfaces",[]) or []:
-        m=(i.get("mac") or "").strip().lower()
-        if m and len(m)==17: out.add(m)
-    return out
-def ip_table_ips(h):
-    r=[]
-    for e in h.get("ip_table",[]) or []:
-        ip=(e.get("ip") or "").strip()
-        if not ip or ip.startswith("127.") or ip=="0.0.0.0": continue
-        r.append(e)
-    return r
-def richness(h):
-    s=(5-h.get("scan_tier",4))*100
-    if h.get("snmp_details",{}).get("sys_oid"): s+=50
-    if h.get("winrm_nics"): s+=40
-    if not is_auto_name(h.get("hostname")): s+=30
-    s+=len(h.get("interfaces",[]) or [])+len(h.get("ports",[]) or [])
+import json, sys, ipaddress
+
+HYPERV_OUI = "00:15:5d"
+
+# Default/generic hostnames shared by many distinct devices -- never a merge key.
+# (Two iPhones both mDNS-named "iPhone" are different phones, not one device;
+# real unique names like "server03" still merge dual-homed records correctly.)
+GENERIC_NAMES = {
+    "localhost", "iphone", "ipad", "ipod", "android", "android-2",
+    "raspberrypi", "ubuntu", "debian", "kali", "openwrt", "pfsense",
+    "esp32", "esp8266", "espressif", "chromecast", "googlehome", "echo",
+    "amazon", "fire", "roku", "shield", "switch", "printer", "scanner",
+    "nas", "router", "gateway", "ap", "camera", "unknown", "new-host",
+    "user-pc", "desktop", "laptop", "windows", "macbook", "imac",
+}
+
+
+def is_auto_name(name):
+    if not name:
+        return True
+    return name.lower().startswith("device-") and \
+        name.replace("device-", "").replace("-", "").isdigit()
+
+
+def short_name(name):
+    if not name or is_auto_name(name):
+        return ""
+    s = name.split(".")[0].strip().lower()
+    # generic default names are not unique enough to merge on
+    if s in GENERIC_NAMES:
+        return ""
     return s
+
+
+def host_macs(h):
+    macs = set()
+    for i in h.get("interfaces", []) or []:
+        m = (i.get("mac") or "").strip().lower()
+        if m and len(m) == 17:
+            macs.add(m)
+    return macs
+
+
+def ip_table_ips(h):
+    """All IPs this host reports owning via SNMP ip_table (skip loopback)."""
+    out = []
+    for e in h.get("ip_table", []) or []:
+        ip = (e.get("ip") or "").strip()
+        if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+            continue
+        out.append(e)
+    return out
+
+
+def richness(h):
+    """Higher = more authoritative; decides which record wins a merge group."""
+    score = 0
+    tier = h.get("scan_tier", 4)
+    score += (5 - tier) * 100            # winrm(1) > ssh(2) > snmp(3) > nmap(4)
+    if h.get("snmp_details", {}).get("sys_oid"):
+        score += 50
+    if h.get("winrm_nics"):
+        score += 40
+    if not is_auto_name(h.get("hostname")):
+        score += 30
+    score += len(h.get("interfaces", []) or [])
+    score += len(h.get("ports", []) or [])
+    return score
+
+
 class UF:
-    def __init__(self,it): self.p={x:x for x in it}
-    def find(self,x):
-        while self.p[x]!=x: self.p[x]=self.p[self.p[x]]; x=self.p[x]
+    def __init__(self, items):
+        self.p = {x: x for x in items}
+
+    def find(self, x):
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
         return x
-    def union(self,a,b):
-        ra,rb=self.find(a),self.find(b)
-        if ra!=rb: self.p[ra]=rb
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[ra] = rb
+
+
 def reconcile(data):
-    hosts=data.get("hosts",[]); by_ip={h["ip"]:h for h in hosts}; ips=list(by_ip)
-    uf=UF(ips); reasons={}
-    owner={}
+    hosts = data.get("hosts", [])
+    by_ip = {h["ip"]: h for h in hosts}
+    ips = list(by_ip.keys())
+    uf = UF(ips)
+    reasons = {}   # (loser_ip) -> reason string
+
+    # ---- Pass 1: SNMP ip_table ownership (folds secondary IPs like .2 -> .253)
+    # Map every secondary IP -> the host that reports it in its ip_table.
+    owner_of = {}
     for h in hosts:
         for e in ip_table_ips(h):
-            if e["ip"]!=h["ip"]: owner.setdefault(e["ip"],h["ip"])
+            ip = e["ip"]
+            if ip != h["ip"]:
+                owner_of.setdefault(ip, h["ip"])
     for ip in ips:
-        o=owner.get(ip)
-        if o and o in by_ip and o!=ip:
-            uf.union(ip,o); reasons[ip]="secondary IP in %s SNMP ip_table"%o
-    mac2={}
+        owner = owner_of.get(ip)
+        if owner and owner in by_ip and owner != ip:
+            uf.union(ip, owner)
+            reasons[ip] = f"secondary IP in {owner} SNMP ip_table"
+
+    # ---- Pass 2: shared interface MAC
+    mac_to_ip = {}
     for h in hosts:
         for m in host_macs(h):
-            if m in mac2 and mac2[m]!=h["ip"]:
-                uf.union(h["ip"],mac2[m]); reasons.setdefault(h["ip"],"shares MAC %s with %s"%(m,mac2[m]))
-            else: mac2[m]=h["ip"]
-    nm2={}
+            if m in mac_to_ip and mac_to_ip[m] != h["ip"]:
+                uf.union(h["ip"], mac_to_ip[m])
+                reasons.setdefault(h["ip"], f"shares MAC {m} with {mac_to_ip[m]}")
+            else:
+                mac_to_ip[m] = h["ip"]
+
+    # ---- Pass 3: normalized short hostname (real names only)
+    name_to_ip = {}
     for h in hosts:
-        s=short_name(h.get("hostname"))
-        if not s: continue
-        if s in nm2 and nm2[s]!=h["ip"]:
-            uf.union(h["ip"],nm2[s]); reasons.setdefault(h["ip"],"same short-name '%s' as %s"%(s,nm2[s]))
-        else: nm2[s]=h["ip"]
-    groups={}
-    for ip in ips: groups.setdefault(uf.find(ip),[]).append(ip)
+        s = short_name(h.get("hostname"))
+        if not s:
+            continue
+        if s in name_to_ip and name_to_ip[s] != h["ip"]:
+            uf.union(h["ip"], name_to_ip[s])
+            reasons.setdefault(h["ip"], f"same short-name '{s}' as {name_to_ip[s]}")
+        else:
+            name_to_ip[s] = h["ip"]
+
+    # ---- Group, pick canonical (richest), build merge output
+    groups = {}
+    for ip in ips:
+        groups.setdefault(uf.find(ip), []).append(ip)
+
     for h in hosts:
-        h["sync_as"]="device"; h["canonical"]=True; h["merged_from"]=[]; h.setdefault("secondary_ips",[])
-    for members in groups.values():
-        recs=sorted((by_ip[i] for i in members),key=richness,reverse=True)
-        w=recs[0]
-        for l in recs[1:]:
-            w["merged_from"].append(l["ip"])
-            absorbed=[{"ip":l["ip"],"mask":"255.255.255.0","if_index":None,"from":l["ip"]}]
-            for e in ip_table_ips(l):
-                if e["ip"]!=w["ip"]:
-                    absorbed.append({"ip":e["ip"],"mask":e.get("mask","255.255.255.0"),"if_index":e.get("if_index"),"from":l["ip"]})
-            w["secondary_ips"].extend(absorbed)
-            seen={(p.get("port"),p.get("proto")) for p in w.get("ports",[])}
-            for p in l.get("ports",[]):
-                k=(p.get("port"),p.get("proto"))
-                if k not in seen: w.setdefault("ports",[]).append(p); seen.add(k)
-            l["sync_as"]="skip"; l["canonical"]=False; l["merged_into"]=w["ip"]; l["merge_reason"]=reasons.get(l["ip"],"merged")
+        h["sync_as"] = "device"
+        h["canonical"] = True
+        h["merged_from"] = []
+        h.setdefault("secondary_ips", [])
+
+    for _, members in groups.items():
+        recs = sorted((by_ip[ip] for ip in members),
+                      key=richness, reverse=True)
+        winner = recs[0]
+        for loser in recs[1:]:
+            winner["merged_from"].append(loser["ip"])
+            # absorb loser's primary IP + its ip_table IPs as secondaries
+            absorbed = [{"ip": loser["ip"], "mask": "255.255.255.0",
+                         "if_index": None, "from": loser["ip"]}]
+            for e in ip_table_ips(loser):
+                if e["ip"] != winner["ip"]:
+                    absorbed.append({"ip": e["ip"],
+                                     "mask": e.get("mask", "255.255.255.0"),
+                                     "if_index": e.get("if_index"),
+                                     "from": loser["ip"]})
+            winner["secondary_ips"].extend(absorbed)
+            # union discovered ports onto the winner
+            seen = {(p.get("port"), p.get("proto")) for p in winner.get("ports", [])}
+            for p in loser.get("ports", []):
+                key = (p.get("port"), p.get("proto"))
+                if key not in seen:
+                    winner.setdefault("ports", []).append(p)
+                    seen.add(key)
+            loser["sync_as"] = "skip"
+            loser["canonical"] = False
+            loser["merged_into"] = winner["ip"]
+            loser["merge_reason"] = reasons.get(loser["ip"], "merged")
+
+    # ---- VM resolution from Hyper-V inventory -------------------------------
+    vm_inv = []
     for h in hosts:
-        if h.get("sync_as")=="skip" or h.get("is_hyperv"): continue
-        vm=next((m for m in host_macs(h) if m.startswith(HYPERV_OUI)),None)
-        if vm: h["sync_as"]="vm"; h["vm_reason"]="Hyper-V MAC %s"%vm
-    data["hosts"]=hosts; return data
+        if h.get("sync_as") == "skip":
+            continue
+        for vm in h.get("hyperv_vms", []) or []:
+            macs, ips = set(), set()
+            for a in vm.get("NetworkAdapters", []) or []:
+                m = (a.get("MacAddress") or "").strip().lower()
+                if m and len(m) == 17 and m != "00:00:00:00:00:00":
+                    macs.add(m)
+                for ip in a.get("IPAddresses", []) or []:
+                    ip = (ip or "").strip()
+                    if ip and ":" not in ip and not ip.startswith("169.254") \
+                            and not ip.startswith("127."):
+                        ips.add(ip)
+            vm_inv.append({
+                "name": vm.get("Name", ""), "host_ip": h["ip"],
+                "host_name": h.get("hostname", ""), "macs": macs, "ips": ips,
+                "cpu": vm.get("ProcessorCount"), "mem": vm.get("MemoryStartupBytes"),
+                "state": vm.get("State"), "vmid": vm.get("VMId"),
+            })
+
+    def hardware_oid(h):
+        # A real hardware enterprise OID (Netgear/HP/Cisco/etc.) means a
+        # physical device. The generic Net-SNMP tree (1.3.6.1.4.1.8072) is used
+        # by software routers/firewalls (OPNsense/pfSense) and does NOT count.
+        oid = (h.get("snmp_details", {}).get("sys_oid") or "").strip()
+        return bool(oid) and not oid.startswith("1.3.6.1.4.1.8072")
+
+    def vm_match(h):
+        hm = host_macs(h)
+        hips = {h["ip"]} | {e["ip"] for e in ip_table_ips(h)}
+        hn = short_name(h.get("hostname"))
+        # MAC match is definitive (Hyper-V MACs are unique) -- always honored.
+        for vm in vm_inv:
+            if hm & vm["macs"]:
+                return vm, "MAC"
+        # IP / name match is weaker: never override a physical (hardware-OID)
+        # device, so a switch/printer/AP cannot be mislabeled a VM by a stale or
+        # reused inventory IP.
+        if hardware_oid(h):
+            return None, None
+        for vm in vm_inv:
+            if hips & vm["ips"]:
+                return vm, "IP"
+            if hn and hn == short_name(vm["name"]):
+                return vm, "name"
+        return None, None
+
+    matched_vmids = set()
+    for h in hosts:
+        if h.get("sync_as") == "skip" or h.get("is_hyperv"):
+            continue
+        vm, how = vm_match(h)
+        if vm:
+            h["sync_as"] = "vm"
+            h["vm_host"] = vm["host_ip"]
+            h["vm_cluster"] = vm["host_name"] or vm["host_ip"]
+            h["vm_reason"] = "Hyper-V VM '%s' on %s (by %s)" % (
+                vm["name"], vm["host_name"] or vm["host_ip"], how)
+            matched_vmids.add(vm.get("vmid"))
+        else:
+            vmac = next((m for m in host_macs(h) if m.startswith(HYPERV_OUI)), None)
+            if vmac:
+                h["sync_as"] = "vm"
+                h["vm_reason"] = "Hyper-V MAC %s (host not WinRM-scanned)" % vmac
+
+    discovered_ips = {h["ip"] for h in hosts}
+    for vm in vm_inv:
+        if vm.get("vmid") in matched_vmids:
+            continue
+        vm_ip = sorted(vm["ips"])[0] if vm["ips"] else None
+        if vm_ip and vm_ip in discovered_ips:
+            continue
+        rec = {
+            "ip": vm_ip or ("vm:" + (vm["name"] or vm.get("vmid", "unknown"))),
+            "hostname": vm["name"], "device_role": "Server",
+            "manufacturer": "", "model": "", "os": "",
+            "sync_as": "vm", "canonical": True, "merged_from": [],
+            "secondary_ips": [], "source": "hyperv-inventory",
+            "vm_host": vm["host_ip"], "vm_cluster": vm["host_name"] or vm["host_ip"],
+            "vm_reason": "Hyper-V VM '%s' on %s (inventory; not IP-scanned)" % (
+                vm["name"], vm["host_name"] or vm["host_ip"]),
+            "vm_cpu": vm["cpu"], "vm_mem_bytes": vm["mem"], "vm_state": vm["state"],
+            "ports": [], "interfaces": [], "discovery_methods": ["hyperv-inventory"],
+        }
+        if vm_ip:
+            discovered_ips.add(vm_ip)
+        hosts.append(rec)
+
+    data["hosts"] = hosts
+    return data
+
+
 def preview(data):
-    hosts=data["hosts"]
-    dev=[h for h in hosts if h.get("sync_as")=="device"]
-    vms=[h for h in hosts if h.get("sync_as")=="vm"]
-    sk=[h for h in hosts if h.get("sync_as")=="skip"]
-    out=[]
-    def ipkey(h): return [int(o) for o in h["ip"].split(".")]
-    for h in sorted([x for x in hosts if x.get("sync_as")!="skip"],key=ipkey):
-        tag="VM    " if h["sync_as"]=="vm" else "KEEP  "
-        ex=("  <- merges "+", ".join(h["merged_from"])) if h.get("merged_from") else ""
-        if h["sync_as"]=="vm": ex+="  [%s]"%h.get("vm_reason","")
-        out.append("%s%-15s %-11s %-34s%s"%(tag,h["ip"],h.get("device_role",""),(h.get("hostname","") or "")[:34],ex))
-    for h in sorted(sk,key=ipkey):
-        out.append("MERGE %-15s -> %-15s (%s)"%(h["ip"],h.get("merged_into","?"),h.get("merge_reason","")))
-    out.append("\n%d input hosts -> %d devices, %d VMs, %d merges"%(len(hosts),len(dev),len(vms),len(sk)))
-    return "\n".join(out)
-mode=sys.argv[1]; data=reconcile(json.load(open(sys.argv[2])))
-if mode=="preview": print(preview(data))
-else:
-    o=sys.argv[3]; json.dump(data,open(o,"w"),indent=2); print(o)
+    hosts = data["hosts"]
+    devices = [h for h in hosts if h.get("sync_as") == "device"]
+    vms = [h for h in hosts if h.get("sync_as") == "vm"]
+    skips = [h for h in hosts if h.get("sync_as") == "skip"]
+    synth = [h for h in vms if h.get("source") == "hyperv-inventory"]
+    lines = []
+
+    def ipkey(h):
+        ip = h["ip"]
+        try:
+            return (0, [int(o) for o in ip.split(".")])
+        except ValueError:
+            return (1, [0, 0, 0, 0])
+
+    for h in sorted([x for x in hosts if x.get("sync_as") != "skip"], key=ipkey):
+        if h["sync_as"] == "vm":
+            tag = "VM    "
+        else:
+            tag = "KEEP  "
+        extra = ""
+        if h.get("merged_from"):
+            extra = "  <- merges " + ", ".join(h["merged_from"])
+        if h["sync_as"] == "vm" and h.get("vm_host"):
+            extra += "  [on %s]" % (h.get("vm_cluster") or h.get("vm_host"))
+        elif h["sync_as"] == "vm":
+            extra += "  [%s]" % h.get("vm_reason", "")
+        lines.append("%s%-15s %-11s %-30s%s" % (
+            tag, h["ip"], h.get("device_role", ""),
+            (h.get("hostname", "") or "")[:30], extra))
+    for h in sorted(skips, key=ipkey):
+        lines.append("MERGE %-15s -> %-15s (%s)" % (
+            h["ip"], h.get("merged_into", "?"), h.get("merge_reason", "")))
+    lines.append("\n%d records -> %d devices, %d VMs (%d synthesized from "
+                 "inventory), %d merges" % (
+                     len(hosts), len(devices), len(vms), len(synth), len(skips)))
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "reconcile"
+    path = sys.argv[2]
+    data = json.load(open(path))
+    data = reconcile(data)
+    if mode == "preview":
+        print(preview(data))
+    else:
+        out = sys.argv[3] if len(sys.argv) > 3 else path.replace(".json", ".reconciled.json")
+        json.dump(data, open(out, "w"), indent=2)
+        print(out)
 PYEOF
     if [[ "${2:-}" == "--preview" ]]; then
         python3 "$pyf" preview "$results_file"; rm -f "$pyf"; return 0
