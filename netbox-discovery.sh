@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.4.2
+#  Version: 2.4.3
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.4.2"
+SCRIPT_VERSION="2.4.3"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2028,9 +2028,17 @@ entity_text=' '.join(
 ).lower()
 # Include nmap port script output (http-title, banners, etc.) in combined
 # so devices identified via port scripts (e.g. FortiGate http-title) classify
+# Build classification text from CURATED nmap scripts only. 'fingerprint-strings'
+# is a raw dump of the full service response (incl. arbitrary HTML bodies); it
+# leaks tokens like the CSS font "-apple-system" and the meta tag
+# "apple-mobile-web-app-capable" that falsely matched the 'apple' vendor keyword,
+# and could match router/printer keywords from any page text. Exclude it (and
+# other raw response dumps) from keyword matching.
+_skip_scripts={'fingerprint-strings','fingerprint-string','http-html-title'}
 nmap_scripts=' '.join(
-    str(v) for p in host.get('ports',[]) for v in (p.get('scripts') or {}).values()
-    if isinstance(v,str)
+    str(v) for p in host.get('ports',[])
+    for k,v in (p.get('scripts') or {}).items()
+    if isinstance(v,str) and k not in _skip_scripts
 ).lower()
 # Service banners (SSH/HTTP/raw) carry strong OS hints, e.g. an SSH banner of
 # "SSH-2.0-OpenSSH_8.4p1 Debian-5" identifies a Debian/Linux host even when nmap
