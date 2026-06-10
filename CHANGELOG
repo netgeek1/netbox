@@ -1,3 +1,22 @@
+#  Changelog v2.5.0 (Phase B step 1 -- reconciler core + dry-run preview):
+#   - NEW reconcile_results(): collapses cross-host duplicates in a
+#     results_*.json into a canonical device/VM model BEFORE syncing. Pure
+#     data transform (embedded Python, no NetBox calls), writes
+#     <results>.reconciled.json. Union-find merge passes (transitive):
+#       1. SNMP ip_table ownership -- a secondary IP folds into its owner
+#          (192.168.0.2 -> 192.168.0.253), no more phantom device.
+#       2. shared interface MAC.
+#       3. normalized short hostname (FQDN<->NetBIOS<->dual-homed), with a
+#          generic-name denylist so two 'iPhone' devices stay separate while
+#          dual-homed SERVER03/SERVER04 still merge.
+#     Richest record wins identity; losers -> secondary_ips + sync_as=skip.
+#   - VM tagging: a Hyper-V OUI (00:15:5d) interface MAC on a non-hypervisor
+#     record sets sync_as=vm (OPNsense/pfSense/FortiManager/FortiAnalyzer),
+#     so a VM that is also discovered as a device resolves to a single VM.
+#   - Main menu option 8 'Preview Reconciliation' -- dry-run plan, no writes.
+#   - NOTE: sync_to_netbox does NOT yet consume the reconciled file; that is
+#     the next Phase B step after the preview is validated on a live scan.
+# 
 #  Changelog v2.4.3 (false-vendor fix from nmap fingerprint dump):
 #   - merge_host_data(): nmap 'fingerprint-strings' (a raw dump of the full
 #     service response, including arbitrary HTML bodies) is no longer fed to
