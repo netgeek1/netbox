@@ -1,3 +1,42 @@
+#  Changelog v2.4.0 (device de-duplication: FQDN <-> NetBIOS merge):
+#   - Root cause of SERVER01 vs server01.certifiedgeeks.net duplicate: the
+#     bash discovery created the device by NetBIOS name but skipped assigning
+#     the mgmt IP for WinRM hosts (winrm_nics present, NIC IPs were null), so
+#     the Hyper-V PS1 -- which names the device by FQDN -- could neither find
+#     it by IP (no IP link) nor by name (FQDN != NetBIOS) and made a 2nd one.
+#   - PS1 Set-NetboxDevice: IP-first dedup now uses the known mgmt IP
+#     (\$hyperVHost) instead of Get-NetIPAddress|Select -First 1, which on a
+#     Hyper-V host could return an internal vSwitch/mshome.net address.
+#   - PS1: new Find-DeviceByShortName -- normalized-name dedup (short host,
+#     case-insensitive) merges FQDN with NetBIOS; existing richer name and
+#     its discovered ports/interfaces are preserved as canonical.
+#   - bash nb_upsert_device(): same normalized short-name dedup fallback
+#     (name__ic) after exact-name lookup.
+#   - sync_to_netbox(): after the WinRM NIC loop, GUARANTEE the mgmt IP is
+#     assigned to the device (first real interface, else mgmt0) so IP-first
+#     dedup works on subsequent runs. Runs before the Hyper-V PS1 auto-sync.
+# 
+#  Changelog v2.3.9 (classification accuracy from raw-capture analysis):
+#   - merge_host_data(): SNMP sysDescr is now AUTHORITATIVE for the OS field
+#     (os_accuracy='snmp'); nmap's -O guess is only a fallback. nmap badly
+#     mis-fingerprints appliances (OPNsense->'Avaya G350', IPMI->'Cisco ASA',
+#     printer->'3M CT-30 thermostat'), which was overwriting good sysDescr.
+#   - Appliance-role (FW/RT/SW) and manufacturer keyword matching now use
+#     text that EXCLUDES the raw nmap OS guess unless SNMP corroborates, so
+#     a bare nmap guess can't force Firewall or leak a vendor (fixed IPMI BMC
+#     192.168.0.239 'truenas-oob' from Firewall/Cisco -> Endpoint/Unknown).
+#   - Service banners (SSH/HTTP Server/raw) folded into the match text, so a
+#     'OpenSSH ... Debian' banner classifies a Docker/Linux host as Server
+#     (fixed 192.168.0.190 'docker' from Printer -> Server).
+#   - port 9100 alone no longer forces Printer (>=2 of 9100/515/631 needed);
+#     Prometheus node-exporter on 9100 no longer mislabels Linux servers.
+#   - OID_MAP: + Netgear (4526)->Switch, TrueNAS/iXsystems (50536)->Server,
+#     FortiManager/FortiAnalyzer (12356.103)->Server (not Firewall).
+#   - Ubiquiti generic-OID APs (U6-Pro report bare 41112) corrected from
+#     Router to Wireless AP via sysDescr model match.
+#   - MFR keywords: + OPNsense(Deciso), pfSense(Netgate), TrueNAS(iXsystems),
+#     UniFi(Ubiquiti), Proxmox, Raspberry Pi. SV keywords: + NAS OSes.
+#
 #  Changelog v2.3.8 (raw discovery capture -- full evidence logging):
 #   - NEW RAW_CAPTURE=1 (default on): scan_single_host() now archives EVERY
 #     probe's raw output per host before deleting the temp dir, instead of
