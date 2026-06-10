@@ -1,3 +1,23 @@
+#  Changelog v2.4.1 (classification polish + IP-400 robustness + secondary IPs):
+#   - merge_host_data(): ALL appliance-role keyword branches (RT/SW/AP/PR/UP/
+#     CA) now use class_txt, which excludes the raw nmap -O OS guess (as FW
+#     already did). Fixes an IPMI BMC nmap-guessed 'APC Silicon DP320E UPS'
+#     being classified UPS (192.168.0.239 -> Endpoint).
+#   - NFS/server ports (2049 nfsd, 20048 mountd, 111 rpcbind, 21 ftp) now
+#     classify as Server before the SMB Workstation fallback, so a Linux
+#     NFS+Samba box is a Server (192.168.0.214 LOCALHOST -> Server).
+#   - Untrusted nmap OS guesses are blanked for appliance roles / OID-typed
+#     devices (FortiGate 'Tomato', FortiAnalyzer 'Aruba IAP-93', printer
+#     'SGI IRIX64'); SNMP sysDescr and asserted OS values are preserved.
+#   - PS1 Assign-IPToNIC(): robust reassignment -- no-ops if already on the
+#     VM NIC, VERIFIES the clear committed before reassigning (the cross-type
+#     400 cause), re-sends the address in the payload, and logs the actual
+#     NetBox 400 response body via Get-NBErrorBody for diagnosis.
+#   - sync_to_netbox(): SNMP ip_table assignment now assigns ALL IPs bound to
+#     an interface index, not just the first -- so a secondary IP (e.g.
+#     192.168.0.2 on UCG if_index 44) lands on the same interface as the
+#     primary (192.168.0.253) instead of being dropped.
+# 
 #  Changelog v2.4.0 (device de-duplication: FQDN <-> NetBIOS merge):
 #   - Root cause of SERVER01 vs server01.certifiedgeeks.net duplicate: the
 #     bash discovery created the device by NetBIOS name but skipped assigning
