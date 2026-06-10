@@ -1,3 +1,21 @@
+#  Changelog v2.5.2 (ARP-MAC propagation + replica-correct VM binding):
+#   - Phase-1 discovery now records an IP->MAC map (arp_map.txt) from
+#     arp-scan and the ARP cache (ip neigh / arp -n); arp_lookup() + a new
+#     $tmp/arp.json injected per host so nmap-only hosts that capture no MAC
+#     still carry one. merge_host_data sets host['mac'] from ARP when nmap
+#     has none; the reconciler's host_macs() now also reads the top-level
+#     MAC. Fixes 192.168.0.235 (CLI SysLog Server VM, auto-named, no scanned
+#     MAC, no guest IP reported) which previously could not be matched to a
+#     VM and showed as a duplicate device.
+#   - Hyper-V Replica VMs are NOT collapsed: a primary and its replica are
+#     two separate VMs on their two hosts. Because a Running primary and its
+#     Off replica can share a MAC, a discovered live IP that matches several
+#     instances binds to the RUNNING one (the replica is Off and is not
+#     serving that IP); the replica remains its own VM record. Synthetic VM
+#     keys are de-collided so two same-named VMs (a VM and its replica copy)
+#     on different hosts don't clash. VM instances on dual-homed hosts are
+#     counted once (the merged secondary IP is skipped before VM resolution).
+# 
 #  Changelog v2.5.1 (Phase B -- Hyper-V VM inventory in reconciliation):
 #   - probe_winrm(): the WinRM discovery PS now enumerates VMs READ-ONLY on
 #     Hyper-V hosts (Get-VM + Get-VMNetworkAdapter): per-VM name/state/vCPU/
