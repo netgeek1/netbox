@@ -1,3 +1,19 @@
+#  Changelog v2.5.7 (WinRM reliability + diagnostics):
+#   - The ping-sweep was NOT the cause of the WinRM failures (v2.5.4 ran with
+#     the sweep and WinRM worked). Real likely cause: probe_winrm used a 30s
+#     operation timeout and enumerated VM NICs PER VM (Get-VMNetworkAdapter
+#     -VM $vm in a loop), which on hosts with 9-11 VMs intermittently blew
+#     the timeout -- and every error was swallowed silently, so the whole
+#     WinRM result was lost (hosts -> Workstation, 0 VMs from inventory).
+#   - Fixes: (a) enumerate ALL VM NICs in ONE call (Get-VMNetworkAdapter
+#     -VMName *) grouped by VM, far faster; (b) raise operation/read timeouts
+#     to 120s/130s; (c) CAPTURE the failure reason into winrm.json as
+#     winrm_error (status+stderr or exception) instead of swallowing it, so
+#     the cause is visible in the raw capture if it still fails.
+#   - Degraded mode remains: even with no WinRM, the SNMP ARP table + 00:15:5d
+#     OUI fallback still tag every on-LAN VM (incl .235); WinRM adds the
+#     synthesized off-LAN/powered-off VMs, Server roles, and host attribution.
+# 
 #  Changelog v2.5.6 (CRITICAL fix: ping-sweep was killing the WinRM probe):
 #   - The v2.5.4 Hyper-V ping-sweep used [Task]::WaitAll($tasks) with NO
 #     timeout, positioned between Get-VM and the JSON output. When ICMP was
