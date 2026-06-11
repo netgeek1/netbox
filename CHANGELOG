@@ -1,3 +1,24 @@
+#  Changelog v2.6.0 (PHASE C -- central reconciled sync; Hyper-V PS1 retired):
+#   - sync_to_netbox() now reconciles the raw results FIRST and syncs the
+#     canonical model. It branches on sync_as: 'skip' records (merged away)
+#     are ignored; 'vm' records create/update a NetBox VM under a per-host
+#     Hyper-V cluster (nb_get_or_create_cluster + nb_upsert_vm) with vCPU,
+#     memory, status (active when Running) and a vNIC; 'device' records sync
+#     as before. Reconciliation-absorbed secondary_ips (e.g. .2 on .253) are
+#     attached to the owning device without creating a phantom.
+#   - NEW nb_add_vm_ip(): assigns an IP to a VM interface
+#     (assigned_object_type=virtualization.vminterface) and sets the VM
+#     primary_ip4 -- the correct object type for VMs (devices use nb_add_ip).
+#   - RETIRED the NetBox-writing Hyper-V PowerShell: the auto-invocation in
+#     sync and the manual menu action are gone, and the ~1260-line
+#     import_hyperv_powershell() function (with its embedded GENEOF PS1) has
+#     been deleted. Hyper-V VM creation is now done centrally in bash from
+#     the reconciled model, so no script that writes to NetBox is uploaded to
+#     any host. VM data collection remains the read-only WinRM inventory.
+#   - NOTE: the sync path makes live NetBox calls and could not be exercised
+#     in-harness; validate against a NetBox instance (option 8 preview is
+#     non-destructive and shows exactly what will be created).
+# 
 #  Changelog v2.5.9 (Phase C prep -- printer page fix + VM IP recovery):
 #   - probe_nmap(): port 9100 (raw JetDirect) is stripped from the -sV/NSE
 #     deep scan so no payload is sent to it -- some printers (HP) eject a
