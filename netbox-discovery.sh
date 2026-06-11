@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.8
+#  Version: 2.5.9
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.8"
+SCRIPT_VERSION="2.5.9"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1365,19 +1365,36 @@ probe_nmap() {
     # Deep scan: -sV/-O/scripts only against the confirmed-open ports (fast,
     # since there are few). If discovery found nothing, fall back to probing the
     # critical Windows/mgmt ports so OS/script detection still gets a chance.
-    local scan_ports="${found_ports:-135,139,443,445,3389,5985,5986}"
+    # Raw print port 9100 (JetDirect) prints whatever bytes arrive, so nmap's
+    # -sV/banner probes make some printers (e.g. HP) eject a garbage page. Strip
+    # 9100 from the version/script scan -- it stays in found_ports and is unioned
+    # into the open-port list, so Printer classification is unaffected, but no
+    # payload is ever sent to it.
+    local scan_ports
+    if [[ -n "$found_ports" ]]; then
+        scan_ports=$(printf '%s' "$found_ports" | tr ',' '\n' \
+            | grep -vx '9100' | paste -sd, -)
+    else
+        scan_ports="135,139,443,445,3389,5985,5986"
+    fi
     # -Pn: skip nmap's own host-discovery. Phase 1 already confirmed the host
     # is live; many Windows hosts block ICMP, so without -Pn nmap declares them
     # "down" and skips port/OS scanning entirely (empty result -> Endpoint).
-    nmap -Pn -sV -O --osscan-guess \
-        -p "$scan_ports" \
-        --script "banner,ssh-hostkey,snmp-info,\
+    if [[ -n "$scan_ports" ]]; then
+        nmap -Pn -sV -O --osscan-guess \
+            -p "$scan_ports" \
+            --script "banner,ssh-hostkey,snmp-info,\
 http-title,http-server-header,ssl-cert,\
 nbstat,smb-security-mode,dns-service-discovery,\
 ms-sql-info,mysql-info,mongodb-info,\
 rdp-enum-encryption,rdp-ntlm-info,vnc-info" \
-        -T4 --host-timeout 90s --max-retries 2 \
-        -oX "$xml" "$ip" >> "$LOG_FILE" 2>&1 || true
+            -T4 --host-timeout 90s --max-retries 2 \
+            -oX "$xml" "$ip" >> "$LOG_FILE" 2>&1 || true
+    else
+        # Only 9100 was open -- skip the deep scan entirely (sending it nothing)
+        # and emit an empty nmap.xml so the parser still runs and unions 9100.
+        printf '<?xml version="1.0"?>\n<nmaprun></nmaprun>\n' > "$xml"
+    fi
     # UDP top-1000 scan (requires root; graceful no-op if not available)
     local udp_xml="$tmp/nmap_udp.xml"
     # UDP scan: top-200 ports, short host-timeout. UDP is slow by nature
@@ -2927,6 +2944,11 @@ def reconcile(data):
             mac = (n.get("mac") or "").strip().lower()
             if ip and len(mac) == 17 and ip not in ip2mac:
                 ip2mac[ip] = mac
+    # Inverse map (MAC -> IP) to recover the guest IP of a VM that reports none
+    # via Get-VMNetworkAdapter: its vNIC MAC is in the gateway/host ARP tables.
+    mac2ip = {}
+    for ip, mac in ip2mac.items():
+        mac2ip.setdefault(mac, ip)
     for h in hosts:
         if not host_macs(h):
             m = ip2mac.get(h["ip"])
@@ -3026,8 +3048,19 @@ def reconcile(data):
         if inst_key(vm) in matched_keys:
             continue
         vm_ip = sorted(vm["ips"])[0] if vm["ips"] else None
+        ip_source = "guest-report" if vm_ip else None
+        # Recover the IP from the vNIC MAC via the gateway/host ARP map when the
+        # guest did not report one (no Hyper-V integration services).
+        if not vm_ip:
+            for mac in sorted(vm["macs"]):
+                if mac in mac2ip and mac2ip[mac] not in discovered_ips:
+                    vm_ip = mac2ip[mac]
+                    ip_source = "arp-recovered (mac %s)" % mac
+                    break
         if vm_ip and vm_ip in discovered_ips:
             continue
+        running = vm["state"].lower() == "running"
+        no_ip_flag = running and not vm_ip   # active VM with no resolvable IP
         key = vm_ip or ("vm:" + (vm["name"] or str(vm.get("vmid", "unknown"))))
         if key in used_keys:
             key = "vm:%s@%s" % (vm["name"], vm["host_name"] or vm["host_ip"])
@@ -3042,6 +3075,7 @@ def reconcile(data):
             "vm_reason": "Hyper-V VM '%s' on %s (%s; inventory)" % (
                 vm["name"], vm["host_name"] or vm["host_ip"], vm["state"]),
             "vm_cpu": vm["cpu"], "vm_mem_bytes": vm["mem"], "vm_state": vm["state"],
+            "vm_ip_source": ip_source, "vm_no_ip_flag": no_ip_flag,
             "ports": [], "interfaces": [], "discovery_methods": ["hyperv-inventory"],
         }
         if vm_ip:
@@ -3079,15 +3113,23 @@ def preview(data):
             extra += "  [on %s]" % (h.get("vm_cluster") or h.get("vm_host"))
         elif h["sync_as"] == "vm":
             extra += "  [%s]" % h.get("vm_reason", "")
+        if (h.get("vm_ip_source") or "").startswith("arp-recovered"):
+            extra += "  (IP via ARP)"
+        if h.get("vm_no_ip_flag"):
+            extra += "  !! ACTIVE VM, NO IP"
         lines.append("%s%-15s %-11s %-30s%s" % (
             tag, h["ip"], h.get("device_role", ""),
             (h.get("hostname", "") or "")[:30], extra))
     for h in sorted(skips, key=ipkey):
         lines.append("MERGE %-15s -> %-15s (%s)" % (
             h["ip"], h.get("merged_into", "?"), h.get("merge_reason", "")))
+    noip = [h for h in vms if h.get("vm_no_ip_flag")]
     lines.append("\n%d records -> %d devices, %d VMs (%d synthesized from "
                  "inventory), %d merges" % (
                      len(hosts), len(devices), len(vms), len(synth), len(skips)))
+    if noip:
+        lines.append("%d ACTIVE VM(s) with no resolvable IP: %s" % (
+            len(noip), ", ".join(h.get("vm_name", h["ip"]) for h in noip)))
     return "\n".join(lines)
 
 
