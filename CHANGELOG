@@ -1,3 +1,20 @@
+#  Changelog v2.5.8 (THE actual WinRM root cause: command line too long):
+#   - winrm.json revealed it: status=1 'The command line is too long.' This
+#     was never transient. pywinrm.run_ps base64-encodes the script and runs
+#     powershell -EncodedCommand via cmd.exe, whose command line caps at 8191
+#     chars. As VM enumeration (v2.5.1) and the neighbor table (v2.5.4) were
+#     added, the encoded PS_DISCOVER reached ~9520 chars -- over the cap -- so
+#     EVERY WinRM call failed and the whole result was discarded (hosts ->
+#     Workstation, 0 VMs from inventory). It worked in early runs only because
+#     the script was smaller then.
+#   - Fix: split PS_DISCOVER into two scripts run separately over the same
+#     session -- PS_BASE (CIM/NICs/IsHyperV, always) and PS_HYPERV (VM
+#     inventory + Get-NetNeighbor, only when IsHyperV). Each encodes to well
+#     under the cap (~3.8k / ~3.5k). Their JSON is merged so HyperVVMs and
+#     NeighborTable populate exactly as before. A per-step hyperv_error is
+#     also captured. This restores Server roles, the full VM inventory, the
+#     synthesized VMs and VM<->host attribution.
+# 
 #  Changelog v2.5.7 (WinRM reliability + diagnostics):
 #   - The ping-sweep was NOT the cause of the WinRM failures (v2.5.4 ran with
 #     the sweep and WinRM worked). Real likely cause: probe_winrm used a 30s
