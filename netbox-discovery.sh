@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.3
+#  Version: 2.5.4
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.3"
+SCRIPT_VERSION="2.5.4"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1909,6 +1909,35 @@ if ($isHyperV) {
         }
     } catch {}
 }
+# Neighbor (IP->MAC) table as seen from this Hyper-V host. The scanner often has
+# no L2 adjacency to the LAN (it runs in a NAT'd container), so it never learns
+# MAC addresses; a Hyper-V host sits on the same vSwitch as its VMs and resolves
+# them directly. We ping-sweep the local /24 to populate the ARP cache, then
+# return Get-NetNeighbor. The reconciler composes discovered-IP -> MAC (here) ->
+# VM (from HyperVVMs) to bind VMs that report no guest IP (e.g. CLI SysLog
+# Server -> 192.168.0.235).
+$neighbors = @()
+if ($isHyperV) {
+    try {
+        $ipv4 = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                 Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
+                 Select-Object -First 1).IPAddress
+        if ($ipv4) {
+            $base = ($ipv4 -split '\.')[0..2] -join '.'
+            $tasks = 1..254 | ForEach-Object {
+                (New-Object System.Net.NetworkInformation.Ping).SendPingAsync("$base.$_", 250)
+            }
+            try { [System.Threading.Tasks.Task]::WaitAll($tasks) } catch {}
+        }
+        $neighbors = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.State -in 'Reachable','Stale','Permanent' -and
+                           $_.LinkLayerAddress -match '^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$' } |
+            ForEach-Object {
+                [ordered]@{ IP="$($_.IPAddress)";
+                            MAC=($_.LinkLayerAddress -replace '-',':').ToLower() }
+            }
+    } catch {}
+}
 [ordered]@{ Hostname=$cs.Name; Domain=$cs.Domain; Manufacturer=$cs.Manufacturer;
             Model=$cs.Model; SerialNumber=$bios.SerialNumber; OS=$os.Caption;
             OSVersion=$os.Version; IsServer=($os.ProductType -ne 1);
@@ -1916,7 +1945,8 @@ if ($isHyperV) {
             CPUName=$cpu.Name; CPUCores=[int]$cpu.NumberOfCores;
             MemoryGB=[math]::Round($cs.TotalPhysicalMemory/1GB,2);
             NetworkAdapters=@($nics);
-            HyperVVMs=@($hvVMs) } | ConvertTo-Json -Depth 6
+            HyperVVMs=@($hvVMs);
+            NeighborTable=@($neighbors) } | ConvertTo-Json -Depth 6
 """
 result = None
 for cred in creds:
@@ -2036,6 +2066,9 @@ if winrm.get('available'):
     # Used by the reconciler to map discovered devices to VMs and to create VMs
     # that were not independently IP-scanned. No NetBox writes happen here.
     host['hyperv_vms']=winrm.get('HyperVVMs') or []
+    # IP->MAC table as seen from this Hyper-V host (L2-adjacent to its VMs);
+    # the reconciler uses it to fill MACs the L2-blind scanner never learned.
+    host['neighbor_table']=winrm.get('NeighborTable') or []
 
 if nmap.get('ports'):         host['discovery_methods'].append('nmap')
 if snmp.get('available'):     host['discovery_methods'].append('snmp')
@@ -2826,6 +2859,26 @@ def reconcile(data):
             loser["merge_reason"] = (reasons.get(loser["ip"])
                                      or reasons.get(winner["ip"])
                                      or "same device as %s" % winner["ip"])
+
+    # ---- Neighbor-table MAC backfill ---------------------------------------
+    # The scanner is frequently L2-blind (NAT'd container) and learns no MACs,
+    # and nmap -Pn captures none either. Each Hyper-V host returns its own
+    # IP->MAC neighbor table (it is L2-adjacent to its VMs). Use it to fill a
+    # MAC onto any record that has none, so VM matching by MAC can proceed
+    # (binds VMs whose guest IP is not reported, e.g. CLI SysLog Server -> .235).
+    ip2mac = {}
+    for h in hosts:
+        for n in h.get("neighbor_table", []) or []:
+            ip = (n.get("IP") or "").strip()
+            mac = (n.get("MAC") or "").strip().lower()
+            if ip and len(mac) == 17 and ip not in ip2mac:
+                ip2mac[ip] = mac
+    for h in hosts:
+        if not host_macs(h):
+            m = ip2mac.get(h["ip"])
+            if m:
+                h["mac"] = m
+                h.setdefault("mac_source", "hyperv-neighbor")
 
     # ---- VM resolution from Hyper-V inventory -------------------------------
     # Every VM instance is its OWN VM (Hyper-V Replica copies are NOT collapsed):
