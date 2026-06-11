@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.5
+#  Version: 2.5.6
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.5"
+SCRIPT_VERSION="2.5.6"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1945,26 +1945,14 @@ if ($isHyperV) {
         }
     } catch {}
 }
-# Neighbor (IP->MAC) table as seen from this Hyper-V host. The scanner often has
-# no L2 adjacency to the LAN (it runs in a NAT'd container), so it never learns
-# MAC addresses; a Hyper-V host sits on the same vSwitch as its VMs and resolves
-# them directly. We ping-sweep the local /24 to populate the ARP cache, then
-# return Get-NetNeighbor. The reconciler composes discovered-IP -> MAC (here) ->
-# VM (from HyperVVMs) to bind VMs that report no guest IP (e.g. CLI SysLog
-# Server -> 192.168.0.235).
+# Neighbor (IP->MAC) table as seen from this Hyper-V host -- a cheap, instant
+# read of the EXISTING neighbor cache (no ping sweep: an unbounded async sweep
+# could block until the WinRM op timed out, which discarded the whole VM
+# inventory). LAN-wide IP->MAC now comes from the SNMP ARP table; this is just a
+# zero-risk bonus for whatever the host already has cached.
 $neighbors = @()
 if ($isHyperV) {
     try {
-        $ipv4 = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                 Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
-                 Select-Object -First 1).IPAddress
-        if ($ipv4) {
-            $base = ($ipv4 -split '\.')[0..2] -join '.'
-            $tasks = 1..254 | ForEach-Object {
-                (New-Object System.Net.NetworkInformation.Ping).SendPingAsync("$base.$_", 250)
-            }
-            try { [System.Threading.Tasks.Task]::WaitAll($tasks) } catch {}
-        }
         $neighbors = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
             Where-Object { $_.State -in 'Reachable','Stale','Permanent' -and
                            $_.LinkLayerAddress -match '^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$' } |
