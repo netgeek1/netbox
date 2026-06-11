@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.4
+#  Version: 2.5.5
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.4"
+SCRIPT_VERSION="2.5.5"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1524,7 +1524,7 @@ probe_snmp() {
 
     snmp_disco_ensure_image || return
 
-    local raw="" label=""
+    local raw="" label="" _snmp_tok=""
 
     # 1. Try v2c communities
     local communities; communities=$(get_communities_for "$ip")
@@ -1533,7 +1533,7 @@ probe_snmp() {
         [[ -z "$comm" ]] && continue
         echo "[TRACE] snmp-disco $ip: trying v2c community '$comm'" >> "$LOG_FILE" 2>/dev/null || true
         raw=$(snmp_disco_run "$ip" --version 2 --community "$comm")
-        if snmp_disco_ok "$raw"; then label="v2c:${comm}"; break; fi
+        if snmp_disco_ok "$raw"; then label="v2c:${comm}"; _snmp_tok="$comm"; break; fi
         echo "[TRACE] snmp-disco $ip: v2c '$comm' -> ${raw:-<empty>}" >> "$LOG_FILE" 2>/dev/null || true
     done <<< "$communities"
 
@@ -1559,7 +1559,11 @@ probe_snmp() {
                 raw=$(snmp_disco_run "$ip" --version 3 --user "$v3u" \
                     --auth_key "$v3ap2" --auth_proto "$v3ap")
             fi
-            if snmp_disco_ok "$raw"; then label="v3:${v3u}"; break; fi
+            if snmp_disco_ok "$raw"; then
+                label="v3:${v3u}"
+                _snmp_tok="v3:${v3u}:${v3ap}:${v3ap2}:${v3pp}:${v3pp2}"
+                break
+            fi
             echo "[TRACE] snmp-disco $ip: v3 '$v3u' -> ${raw:-<empty>}" >> "$LOG_FILE" 2>/dev/null || true
         done < <(echo "$creds" | jq -c '.snmp_v3[]' 2>/dev/null || true)
     fi
@@ -1701,6 +1705,38 @@ out = {
 }
 print(json.dumps(out))
 PYEOF
+
+    # 4. Harvest this device's ARP/neighbor table (IP->MAC for the whole LAN).
+    # Routers/firewalls/L3 gateways hold the entire subnet's IP->MAC, which lets
+    # the reconciler resolve MACs the L2-blind scanner never sees -- including
+    # Hyper-V VMs that report no guest IP (e.g. .235). Walks the classic AT table
+    # (1.3.6.1.2.1.3.1.1.2) and the modern ipNetToMediaPhysAddress
+    # (1.3.6.1.2.1.4.22.1.2); the last four OID octets are the IPv4 address and
+    # the Hex-STRING value is the MAC. Read-only.
+    if [[ -n "$_snmp_tok" ]]; then
+        { _snmp_walk "$ip" "$_snmp_tok" 5 "1.3.6.1.2.1.3.1.1.2"
+          _snmp_walk "$ip" "$_snmp_tok" 5 "1.3.6.1.2.1.4.22.1.2"
+        } > "$tmp/arp_walk.txt" 2>/dev/null || true
+        python3 /dev/stdin "$tmp/arp_walk.txt" > "$tmp/snmp_arp.json" 2>/dev/null <<'ARPEOF'
+import json, re, sys
+arp = {}
+try:
+    lines = open(sys.argv[1]).read().splitlines()
+except Exception:
+    lines = []
+for ln in lines:
+    if 'Hex-STRING' not in ln and 'STRING' not in ln:
+        continue
+    m = re.search(r'(\d+\.\d+\.\d+\.\d+)\s*=.*?((?:[0-9A-Fa-f]{2}[ :-]){5}[0-9A-Fa-f]{2})', ln)
+    if not m:
+        continue
+    ip = m.group(1)
+    mac = re.sub(r'[ -]', ':', m.group(2).strip()).lower()
+    if len(mac) == 17 and mac != '00:00:00:00:00:00' and ip not in arp:
+        arp[ip] = mac
+print(json.dumps({'arp_table': [{'ip': k, 'mac': v} for k, v in arp.items()]}))
+ARPEOF
+    fi
 }
 
 # ?? Probe: SSH ????????????????????????????????????????????????????????????????
@@ -1986,6 +2022,7 @@ nmap=load('nmap'); snmp=load('snmp'); ssh=load('ssh')
 http=load('http'); nb=load('netbios'); dns=load('dns')
 bnr=load('banners'); mdns=load('mdns'); winrm=load('winrm')
 arp=load('arp')
+snmp_arp=load('snmp_arp')
 
 host={'ip':ip,'hostname':None,'mac':None,'vendor':None,
       'os':None,'os_accuracy':None,
@@ -2078,6 +2115,12 @@ if nb.get('available'):       host['discovery_methods'].append('netbios')
 if dns.get('ptr_hostname'):   host['discovery_methods'].append('dns')
 if bnr.get('banners'):        host['discovery_methods'].append('banner')
 if winrm.get('available'):    host['discovery_methods'].append('winrm')
+
+# SNMP ARP/neighbor table (router/firewall/gateway holds the whole subnet's
+# IP->MAC in one walk). Set for every host -- the L3 device that has it is often
+# SNMP-only with no WinRM. The reconciler folds these IP->MAC pairs in to resolve
+# MACs the L2-blind scanner never sees.
+host['arp_table']=(snmp_arp.get('arp_table') if isinstance(snmp_arp,dict) else None) or []
 
 # scan_tier: 1=winrm(richest) 2=ssh 3=snmp 4=nmap/fallback
 if winrm.get('available'):      host['scan_tier']=1
@@ -2860,12 +2903,14 @@ def reconcile(data):
                                      or reasons.get(winner["ip"])
                                      or "same device as %s" % winner["ip"])
 
-    # ---- Neighbor-table MAC backfill ---------------------------------------
+    # ---- Neighbor/ARP MAC backfill -----------------------------------------
     # The scanner is frequently L2-blind (NAT'd container) and learns no MACs,
-    # and nmap -Pn captures none either. Each Hyper-V host returns its own
-    # IP->MAC neighbor table (it is L2-adjacent to its VMs). Use it to fill a
-    # MAC onto any record that has none, so VM matching by MAC can proceed
-    # (binds VMs whose guest IP is not reported, e.g. CLI SysLog Server -> .235).
+    # and nmap -Pn captures none either. Two L2-adjacent sources fill them in:
+    #   * each Hyper-V host's Get-NetNeighbor table (it is on its VMs' vSwitch);
+    #   * any SNMP L3 device's ARP table (a router/firewall/gateway holds the
+    #     whole subnet's IP->MAC in one walk).
+    # discovered-IP -> MAC (here) -> VM (inventory) then binds VMs whose guest IP
+    # is not reported (e.g. CLI SysLog Server -> .235).
     ip2mac = {}
     for h in hosts:
         for n in h.get("neighbor_table", []) or []:
@@ -2873,12 +2918,17 @@ def reconcile(data):
             mac = (n.get("MAC") or "").strip().lower()
             if ip and len(mac) == 17 and ip not in ip2mac:
                 ip2mac[ip] = mac
+        for n in h.get("arp_table", []) or []:
+            ip = (n.get("ip") or "").strip()
+            mac = (n.get("mac") or "").strip().lower()
+            if ip and len(mac) == 17 and ip not in ip2mac:
+                ip2mac[ip] = mac
     for h in hosts:
         if not host_macs(h):
             m = ip2mac.get(h["ip"])
             if m:
                 h["mac"] = m
-                h.setdefault("mac_source", "hyperv-neighbor")
+                h.setdefault("mac_source", "arp/neighbor")
 
     # ---- VM resolution from Hyper-V inventory -------------------------------
     # Every VM instance is its OWN VM (Hyper-V Replica copies are NOT collapsed):
