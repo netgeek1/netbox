@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.7
+#  Version: 2.5.8
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.7"
+SCRIPT_VERSION="2.5.8"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1909,7 +1909,7 @@ try:
     creds = json.load(open(creds_file))
 except Exception:
     creds = []
-PS_DISCOVER = r"""
+PS_BASE = r"""
 $ErrorActionPreference = "SilentlyContinue"
 $cs   = Get-CimInstance Win32_ComputerSystem  2>$null
 $os   = Get-CimInstance Win32_OperatingSystem 2>$null
@@ -1926,59 +1926,50 @@ $nics = Get-NetAdapter -Physical 2>$null | Where-Object { $_.Status -eq "Up" } |
         }
 $isHyperV = $false
 try { $isHyperV = ($null -ne (Get-Command Get-VM -ErrorAction SilentlyContinue)) } catch {}
-$hvVMs = @()
-if ($isHyperV) {
-    try {
-        # Enumerate ALL VM NICs in ONE call (not per-VM) -- the per-VM loop was
-        # slow on hosts with many VMs and could blow the WinRM timeout, losing
-        # the whole result. Group adapters by VM name, then attach.
-        $adByVm = @{}
-        Get-VMNetworkAdapter -VMName * 2>$null | ForEach-Object {
-            $k = "$($_.VMName)"
-            $m = ($_.MacAddress -replace "(..)(?=.)",'$1:').ToUpper()
-            if (-not $adByVm.ContainsKey($k)) { $adByVm[$k] = @() }
-            $adByVm[$k] += [ordered]@{ Name=$_.Name; MacAddress=$m;
-                                       SwitchName=$_.SwitchName;
-                                       IPAddresses=@($_.IPAddresses) }
-        }
-        $hvVMs = Get-VM 2>$null | ForEach-Object {
-            $vm = $_
-            [ordered]@{ Name=$vm.Name; State="$($vm.State)";
-                        Generation=$vm.Generation;
-                        ProcessorCount=[int]$vm.ProcessorCount;
-                        MemoryStartupBytes=[int64]$vm.MemoryStartupBytes;
-                        VMId="$($vm.VMId)";
-                        NetworkAdapters=@($adByVm["$($vm.Name)"]) }
-        }
-    } catch {}
-}
-# Neighbor (IP->MAC) table as seen from this Hyper-V host -- a cheap, instant
-# read of the EXISTING neighbor cache (no ping sweep: an unbounded async sweep
-# could block until the WinRM op timed out, which discarded the whole VM
-# inventory). LAN-wide IP->MAC now comes from the SNMP ARP table; this is just a
-# zero-risk bonus for whatever the host already has cached.
-$neighbors = @()
-if ($isHyperV) {
-    try {
-        $neighbors = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.State -in 'Reachable','Stale','Permanent' -and
-                           $_.LinkLayerAddress -match '^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$' } |
-            ForEach-Object {
-                [ordered]@{ IP="$($_.IPAddress)";
-                            MAC=($_.LinkLayerAddress -replace '-',':').ToLower() }
-            }
-    } catch {}
-}
 [ordered]@{ Hostname=$cs.Name; Domain=$cs.Domain; Manufacturer=$cs.Manufacturer;
             Model=$cs.Model; SerialNumber=$bios.SerialNumber; OS=$os.Caption;
             OSVersion=$os.Version; IsServer=($os.ProductType -ne 1);
             IsHyperV=$isHyperV;
             CPUName=$cpu.Name; CPUCores=[int]$cpu.NumberOfCores;
             MemoryGB=[math]::Round($cs.TotalPhysicalMemory/1GB,2);
-            NetworkAdapters=@($nics);
-            HyperVVMs=@($hvVMs);
-            NeighborTable=@($neighbors) } | ConvertTo-Json -Depth 6
+            NetworkAdapters=@($nics) } | ConvertTo-Json -Depth 4
 """
+
+# Run separately ONLY on Hyper-V hosts. pywinrm run_ps base64-encodes the script
+# and runs powershell -EncodedCommand via cmd.exe, whose command line caps at
+# 8191 chars; the combined base+VM+neighbor script blew that limit ("The command
+# line is too long"), losing the whole WinRM result. Splitting keeps each call
+# well under the cap.
+PS_HYPERV = r"""
+$ErrorActionPreference = "SilentlyContinue"
+$adByVm = @{}
+Get-VMNetworkAdapter -VMName * 2>$null | ForEach-Object {
+    $k = "$($_.VMName)"
+    $m = ($_.MacAddress -replace "(..)(?=.)",'$1:').ToUpper()
+    if (-not $adByVm.ContainsKey($k)) { $adByVm[$k] = @() }
+    $adByVm[$k] += [ordered]@{ Name=$_.Name; MacAddress=$m;
+                               SwitchName=$_.SwitchName;
+                               IPAddresses=@($_.IPAddresses) }
+}
+$hvVMs = Get-VM 2>$null | ForEach-Object {
+    $vm = $_
+    [ordered]@{ Name=$vm.Name; State="$($vm.State)";
+                Generation=$vm.Generation;
+                ProcessorCount=[int]$vm.ProcessorCount;
+                MemoryStartupBytes=[int64]$vm.MemoryStartupBytes;
+                VMId="$($vm.VMId)";
+                NetworkAdapters=@($adByVm["$($vm.Name)"]) }
+}
+$neighbors = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { $_.State -in 'Reachable','Stale','Permanent' -and
+                   $_.LinkLayerAddress -match '^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$' } |
+    ForEach-Object {
+        [ordered]@{ IP="$($_.IPAddress)";
+                    MAC=($_.LinkLayerAddress -replace '-',':').ToLower() }
+    }
+[ordered]@{ HyperVVMs=@($hvVMs); NeighborTable=@($neighbors) } | ConvertTo-Json -Depth 6
+"""
+
 result = None
 last_err = ""
 for cred in creds:
@@ -1992,10 +1983,22 @@ for cred in creds:
             auth=(auth_user,password), transport="ntlm",
             server_cert_validation="ignore",
             operation_timeout_sec=120, read_timeout_sec=130)
-        r = sess.run_ps(PS_DISCOVER)
+        r = sess.run_ps(PS_BASE)
         if r.status_code==0 and r.std_out:
             data = json.loads(r.std_out.decode("utf-8","replace").strip())
             data.update({"available":True,"auth_user":auth_user,"winrm_port":int(port)})
+            if data.get("IsHyperV"):
+                try:
+                    r2 = sess.run_ps(PS_HYPERV)
+                    if r2.status_code==0 and r2.std_out:
+                        hv = json.loads(r2.std_out.decode("utf-8","replace").strip())
+                        data["HyperVVMs"]    = hv.get("HyperVVMs") or []
+                        data["NeighborTable"]= hv.get("NeighborTable") or []
+                    else:
+                        _se2 = (r2.std_err.decode("utf-8","replace")[:300] if getattr(r2,"std_err",None) else "")
+                        data["hyperv_error"] = f"status={r2.status_code} stderr={_se2}"
+                except Exception as e2:
+                    data["hyperv_error"] = f"{type(e2).__name__}: {str(e2)[:300]}"
             result = data; break
         else:
             _se = (r.std_err.decode("utf-8","replace")[:400] if getattr(r,"std_err",None) else "")
