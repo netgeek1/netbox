@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.2
+#  Version: 2.5.3
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.2"
+SCRIPT_VERSION="2.5.3"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1287,10 +1287,24 @@ scan_single_host() {
     probe_mdns    "$ip" "$tmp" </dev/null &
     probe_winrm   "$ip" "$tmp" </dev/null &
     wait
-    # Inject the Phase-1 ARP MAC so nmap-only hosts (which capture no MAC) still
-    # carry one -- lets the reconciler MAC-match them to Hyper-V VMs.
-    local _amac; _amac=$(arp_lookup "$ip")
-    [[ -n "$_amac" ]] && printf '{"mac":"%s"}' "$_amac" > "$tmp/arp.json"
+    # Capture the host's MAC from the kernel neighbor/ARP cache. By now we have
+    # sent this host probe traffic (nmap/SSH/HTTP), so a same-subnet host is
+    # resolved in the cache even when nmap used -Pn and recorded no MAC itself.
+    # This is what bridges nmap-only hosts (auto-named Linux VMs with no guest
+    # IP reported by Hyper-V, e.g. .235) to their Hyper-V VM by MAC. Falls back
+    # to the Phase-1 ARP map if the live cache has no entry.
+    local _amac=""
+    if cmd_exists ip; then
+        _amac=$(ip neigh show "$ip" 2>/dev/null \
+            | awk '{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}')
+    fi
+    [[ -z "$_amac" ]] && _amac=$(arp -n "$ip" 2>/dev/null \
+        | awk -v ip="$ip" '$1==ip && $3 ~ /:/{print $3; exit}')
+    [[ -z "$_amac" ]] && _amac=$(arp_lookup "$ip")
+    _amac=$(printf '%s' "$_amac" | tr 'A-F' 'a-f')
+    if [[ "$_amac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
+        printf '{"mac":"%s"}' "$_amac" > "$tmp/arp.json"
+    fi
     local host_json
     host_json=$(merge_host_data "$ip" "$tmp")
     append_host "$host_json"
@@ -2712,7 +2726,26 @@ def reconcile(data):
         else:
             name_to_ip[s] = h["ip"]
 
-    # ---- Group, pick canonical (richest), build merge output
+    # ---- Group, pick canonical deterministically, build merge output
+    # Canonical selection (ascending sort, first wins):
+    #   1. NOT an ip_table secondary -- a folded secondary (.2) can never win
+    #      over its owner (.253), regardless of IP order.
+    #   2. real name beats an auto-name (device-x-x-x-x) so the survivor keeps a
+    #      meaningful hostname.
+    #   3. lowest IP -- deterministic, stable across runs (user's choice).
+    secondary_ips_set = set(owner_of.keys())
+
+    def ipint(ip):
+        try:
+            return tuple(int(o) for o in ip.split("."))
+        except ValueError:
+            return (999, 999, 999, 999)
+
+    def canon_key(h):
+        return (h["ip"] in secondary_ips_set,
+                is_auto_name(h.get("hostname")),
+                ipint(h["ip"]))
+
     groups = {}
     for ip in ips:
         groups.setdefault(uf.find(ip), []).append(ip)
@@ -2723,11 +2756,52 @@ def reconcile(data):
         h["merged_from"] = []
         h.setdefault("secondary_ips", [])
 
+    # Role rank for enrichment: a stronger role on a merged-away interface wins
+    # (a dual-homed Hyper-V host whose .243 NIC looks like a bare Windows box
+    # must still end up Server, is_hyperv, with its VM inventory).
+    _role_rank = {"Firewall": 6, "Router": 6, "Switch": 5, "Wireless AP": 5,
+                  "Server": 4, "Printer": 4, "IP Camera": 4, "UPS": 4,
+                  "Storage": 4, "Workstation": 2, "Endpoint": 1, "": 0}
+
+    def enrich(winner, loser):
+        # Hyper-V identity + VM inventory must survive onto the canonical record.
+        winner["is_hyperv"] = bool(winner.get("is_hyperv") or loser.get("is_hyperv"))
+        if not winner.get("hyperv_vms") and loser.get("hyperv_vms"):
+            winner["hyperv_vms"] = loser["hyperv_vms"]
+        if not winner.get("winrm_nics") and loser.get("winrm_nics"):
+            winner["winrm_nics"] = loser["winrm_nics"]
+        # Strongest role wins.
+        if _role_rank.get(loser.get("device_role"), 0) > \
+                _role_rank.get(winner.get("device_role"), 0):
+            winner["device_role"] = loser["device_role"]
+        # Fill identity fields the winner is missing.
+        for f in ("manufacturer", "model", "os", "serial", "vendor", "hostname"):
+            wv = (winner.get(f) or "").strip()
+            lv = (loser.get(f) or "").strip()
+            if (not wv or wv in ("Unknown",) or
+                    (f == "hostname" and is_auto_name(wv))) and lv:
+                winner[f] = loser[f]
+        if loser.get("snmp_details", {}).get("sys_oid") and \
+                not winner.get("snmp_details", {}).get("sys_oid"):
+            winner["snmp_details"] = loser["snmp_details"]
+        # Best (lowest) scan tier, unioned interfaces + discovery methods.
+        winner["scan_tier"] = min(winner.get("scan_tier", 4),
+                                  loser.get("scan_tier", 4))
+        seen_if = {(i.get("mac"), i.get("name")) for i in winner.get("interfaces", [])}
+        for i in loser.get("interfaces", []) or []:
+            k = (i.get("mac"), i.get("name"))
+            if k not in seen_if:
+                winner.setdefault("interfaces", []).append(i)
+                seen_if.add(k)
+        winner["discovery_methods"] = sorted(set(
+            (winner.get("discovery_methods") or []) +
+            (loser.get("discovery_methods") or [])))
+
     for _, members in groups.items():
-        recs = sorted((by_ip[ip] for ip in members),
-                      key=richness, reverse=True)
+        recs = sorted((by_ip[ip] for ip in members), key=canon_key)
         winner = recs[0]
         for loser in recs[1:]:
+            enrich(winner, loser)
             winner["merged_from"].append(loser["ip"])
             # absorb loser's primary IP + its ip_table IPs as secondaries
             absorbed = [{"ip": loser["ip"], "mask": "255.255.255.0",
@@ -2749,7 +2823,9 @@ def reconcile(data):
             loser["sync_as"] = "skip"
             loser["canonical"] = False
             loser["merged_into"] = winner["ip"]
-            loser["merge_reason"] = reasons.get(loser["ip"], "merged")
+            loser["merge_reason"] = (reasons.get(loser["ip"])
+                                     or reasons.get(winner["ip"])
+                                     or "same device as %s" % winner["ip"])
 
     # ---- VM resolution from Hyper-V inventory -------------------------------
     # Every VM instance is its OWN VM (Hyper-V Replica copies are NOT collapsed):
