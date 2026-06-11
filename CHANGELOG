@@ -1,3 +1,19 @@
+#  Changelog v2.5.5 (SNMP ARP-table IP->MAC harvesting):
+#   - probe_snmp(): after a successful SNMP probe, walk the device's ARP/
+#     neighbor table -- the classic AT table (1.3.6.1.2.1.3.1.1.2) and the
+#     modern ipNetToMediaPhysAddress (1.3.6.1.2.1.4.22.1.2) -- and emit
+#     IP->MAC pairs (last four OID octets = IPv4, Hex-STRING = MAC). A
+#     router/firewall/gateway holds the WHOLE subnet's IP->MAC in one walk,
+#     so this resolves MACs for every host at once, not just Hyper-V VMs.
+#     The working v2c/v3 credential is reused via _snmp_walk. Read-only.
+#   - merge_host_data(): the harvested table is attached as host['arp_table'].
+#   - reconcile_results(): the MAC backfill now folds in BOTH sources --
+#     Hyper-V Get-NetNeighbor tables AND SNMP arp_table entries -- before VM
+#     matching, so a record the L2-blind scanner saw with no MAC (e.g. .235)
+#     is resolved from whichever L3/hypervisor device knows it, then bound to
+#     its VM. This is more general than the Hyper-V-only path (one gateway
+#     walk covers the entire LAN) and the two sources are complementary.
+# 
 #  Changelog v2.5.4 (Hyper-V neighbor-table MAC resolution):
 #   - Root cause found: the scanner has NO L2 adjacency to the LAN (it runs
 #     in a NAT'd container), so it never learns MAC addresses -- nmap -Pn
