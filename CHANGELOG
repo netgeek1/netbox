@@ -1,3 +1,17 @@
+#  Changelog v2.5.9 (Phase C prep -- printer page fix + VM IP recovery):
+#   - probe_nmap(): port 9100 (raw JetDirect) is stripped from the -sV/NSE
+#     deep scan so no payload is sent to it -- some printers (HP) eject a
+#     garbage page when 9100 is banner-probed. 9100 stays in found_ports and
+#     is unioned into the open-port list, so Printer classification is
+#     unchanged. If 9100 is the only open port, the deep scan is skipped.
+#   - reconcile_results(): an inverse MAC->IP map (from the SNMP ARP and
+#     Hyper-V neighbor tables) now recovers the guest IP of an active VM that
+#     reported none via Get-VMNetworkAdapter -- its vNIC MAC is looked up in
+#     the gateway/host ARP tables (vm_ip_source='arp-recovered'). Any ACTIVE
+#     (Running) VM still without a resolvable IP is flagged (vm_no_ip_flag)
+#     and listed in the preview, so every active VM either gets an IP or is
+#     surfaced for follow-up.
+# 
 #  Changelog v2.5.8 (THE actual WinRM root cause: command line too long):
 #   - winrm.json revealed it: status=1 'The command line is too long.' This
 #     was never transient. pywinrm.run_ps base64-encodes the script and runs
