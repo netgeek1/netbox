@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.6
+#  Version: 2.5.7
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.6"
+SCRIPT_VERSION="2.5.7"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1929,19 +1929,26 @@ try { $isHyperV = ($null -ne (Get-Command Get-VM -ErrorAction SilentlyContinue))
 $hvVMs = @()
 if ($isHyperV) {
     try {
+        # Enumerate ALL VM NICs in ONE call (not per-VM) -- the per-VM loop was
+        # slow on hosts with many VMs and could blow the WinRM timeout, losing
+        # the whole result. Group adapters by VM name, then attach.
+        $adByVm = @{}
+        Get-VMNetworkAdapter -VMName * 2>$null | ForEach-Object {
+            $k = "$($_.VMName)"
+            $m = ($_.MacAddress -replace "(..)(?=.)",'$1:').ToUpper()
+            if (-not $adByVm.ContainsKey($k)) { $adByVm[$k] = @() }
+            $adByVm[$k] += [ordered]@{ Name=$_.Name; MacAddress=$m;
+                                       SwitchName=$_.SwitchName;
+                                       IPAddresses=@($_.IPAddresses) }
+        }
         $hvVMs = Get-VM 2>$null | ForEach-Object {
             $vm = $_
-            $ad = Get-VMNetworkAdapter -VM $vm 2>$null | ForEach-Object {
-                $m = ($_.MacAddress -replace "(..)(?=.)",'$1:').ToUpper()
-                [ordered]@{ Name=$_.Name; MacAddress=$m;
-                            SwitchName=$_.SwitchName;
-                            IPAddresses=@($_.IPAddresses) }
-            }
             [ordered]@{ Name=$vm.Name; State="$($vm.State)";
                         Generation=$vm.Generation;
                         ProcessorCount=[int]$vm.ProcessorCount;
                         MemoryStartupBytes=[int64]$vm.MemoryStartupBytes;
-                        VMId="$($vm.VMId)"; NetworkAdapters=@($ad) }
+                        VMId="$($vm.VMId)";
+                        NetworkAdapters=@($adByVm["$($vm.Name)"]) }
         }
     } catch {}
 }
@@ -1973,6 +1980,7 @@ if ($isHyperV) {
             NeighborTable=@($neighbors) } | ConvertTo-Json -Depth 6
 """
 result = None
+last_err = ""
 for cred in creds:
     username = cred.get("username","")
     password = cred.get("password","")
@@ -1983,15 +1991,20 @@ for cred in creds:
         sess = _winrm.Session(f"{proto}://{ip}:{port}/wsman",
             auth=(auth_user,password), transport="ntlm",
             server_cert_validation="ignore",
-            operation_timeout_sec=30, read_timeout_sec=35)
+            operation_timeout_sec=120, read_timeout_sec=130)
         r = sess.run_ps(PS_DISCOVER)
         if r.status_code==0 and r.std_out:
             data = json.loads(r.std_out.decode("utf-8","replace").strip())
             data.update({"available":True,"auth_user":auth_user,"winrm_port":int(port)})
             result = data; break
-    except Exception: continue
+        else:
+            _se = (r.std_err.decode("utf-8","replace")[:400] if getattr(r,"std_err",None) else "")
+            last_err = f"status={r.status_code} stderr={_se}"
+    except Exception as e:
+        last_err = f"{type(e).__name__}: {str(e)[:400]}"
+        continue
 with open(out_file,"w") as f:
-    json.dump(result or {"available":False}, f)
+    json.dump(result or {"available":False,"winrm_error":last_err}, f)
 PYEOF
     rm -f "$creds_tmp"
 }
