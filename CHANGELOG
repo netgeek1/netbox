@@ -1,3 +1,24 @@
+#  Changelog v2.5.3 (robust ARP MAC capture + deterministic enriched merge):
+#   - scan_single_host(): the host MAC is now read from the LIVE kernel
+#     neighbor/ARP cache (ip neigh / arp -n) right AFTER probing, when a
+#     same-subnet host is resolved even if nmap used -Pn and recorded no
+#     MAC. The Phase-1 arp_map is only a fallback. Fixes 192.168.0.235 (the
+#     CLI SysLog Server VM: auto-named, nmap-only, no guest IP) which had no
+#     MAC at all in the prior run, so it could not bind to its VM and showed
+#     as a duplicate device. The earlier Phase-1-only map produced zero
+#     captures because the cache is not populated until Phase-2 traffic.
+#   - reconcile_results(): canonical record selection is now DETERMINISTIC --
+#     lowest IP wins, except (a) an ip_table secondary (192.168.0.2) can
+#     never win over its owner (.253) and (b) a real name beats an auto-name.
+#     Crucially the survivor is now ENRICHED from the records it absorbs:
+#     is_hyperv, hyperv_vms, winrm_nics, the strongest device_role, missing
+#     identity fields, SNMP OID, best scan_tier and unioned interfaces. This
+#     fixes dual-homed Hyper-V hosts whose WinRM/VM data lives on only one IP
+#     (SERVER03 .243/.245): the canonical .243 keeps Server + Hyper-V + all
+#     its VMs instead of degrading to a bare Windows Workstation.
+#   - NOTE: .5/.51 role flips between runs are scan variance (SNMP/SSH not
+#     answering that pass), not a classifier regression.
+#
 #  Changelog v2.5.2 (ARP-MAC propagation + replica-correct VM binding):
 #   - Phase-1 discovery now records an IP->MAC map (arp_map.txt) from
 #     arp-scan and the ARP cache (ip neigh / arp -n); arp_lookup() + a new
