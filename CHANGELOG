@@ -1,3 +1,20 @@
+#  Changelog v2.5.4 (Hyper-V neighbor-table MAC resolution):
+#   - Root cause found: the scanner has NO L2 adjacency to the LAN (it runs
+#     in a NAT'd container), so it never learns MAC addresses -- nmap -Pn
+#     captures none and the kernel ARP cache stays empty. Scanner-side MAC
+#     capture is impossible here; .235 (CLI SysLog Server VM, no guest IP
+#     reported) therefore had no key to bind to its VM.
+#   - probe_winrm(): each Hyper-V host now ping-sweeps its local /24 and
+#     returns its Get-NetNeighbor IP->MAC table as NeighborTable[]. A
+#     hypervisor is L2-adjacent to its VMs on the vSwitch, so it resolves
+#     the vNIC MAC the scanner cannot see. Read-only; no NetBox calls.
+#   - merge_host_data(): NeighborTable copied onto host['neighbor_table'].
+#   - reconcile_results(): before VM matching, builds a global IP->MAC map
+#     from all Hyper-V neighbor tables and fills a MAC onto any record that
+#     has none. discovered-IP -> MAC (neighbor) -> VM (inventory) then binds
+#     .235 to the Running CLI SysLog Server on SERVER01 with no duplicate;
+#     the Off replica remains its own VM on SERVER04.
+# 
 #  Changelog v2.5.3 (robust ARP MAC capture + deterministic enriched merge):
 #   - scan_single_host(): the host MAC is now read from the LIVE kernel
 #     neighbor/ARP cache (ip neigh / arp -n) right AFTER probing, when a
