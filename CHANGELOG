@@ -1,3 +1,21 @@
+#  Changelog v2.6.3 (virtual disks + custom-field read-back diagnostics):
+#   - VIRTUAL DISKS (were not created): setting only the VM 'disk' field does
+#     not populate the Disk column on NetBox 4.x -- that total is aggregated
+#     from virtualization/virtual-disks/ objects. PS_HYPERV now collects a
+#     per-VHD size array (Disks[]); the reconciler carries vm_disks; new
+#     nb_sync_virtual_disk() creates one disk object per VHD
+#     (<vmname>-disk<N>, size in GB). When only the legacy total is present
+#     (capture predating per-disk collection) a single -disk0 is created from
+#     it, so disks appear immediately and gain per-disk detail next capture.
+#   - CUSTOM FIELDS: the device and VM custom-field patches now READ BACK the
+#     stored value and log 'discovery_methods did not persist' with the
+#     actual stored custom_fields if it didn't stick. The earlier-version log
+#     showed both field scopes updating and no patch failures, so this pins
+#     down whether the value is being rejected NetBox-side and why.
+#   - NOTE: NetBox VirtualDisk.size is written in GB (matching the historical
+#     importer + how VM.disk aggregates). If disk sizes read ~1000x off,
+#     that's the one knob to flip to MB.
+# 
 #  Changelog v2.6.2 (restore lost when the Hyper-V PS1 was retired):
 #   Deleting import_hyperv_powershell in v2.6.0 dropped real work it had been
 #   doing on the host side. Re-implemented centrally in bash:
