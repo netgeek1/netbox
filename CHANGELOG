@@ -1,3 +1,24 @@
+#  Changelog v2.6.5 (three issues from the live sync):
+#   1. DISK FIELDS for 8 drives: the disk_N_* custom fields were always
+#      created for 0..7. Now only as many sets as the busiest host actually
+#      has are created (max hw_physical_disks count across hosts, capped 8),
+#      so unused disk_N fields are not littered into NetBox.
+#   2. SWITCH 192.168.0.52 missing everything: SNMP discovery SUCCEEDED for
+#      it (TRACE) but the KaSaNaa->contract mapper returned available:false
+#      because a stray non-JSON line on stdout broke a whole-file json.load.
+#      The mapper now tolerates noisy output, falling back to the largest
+#      {...} span, so a transient warning line no longer discards all SNMP
+#      data (interfaces, LLDP, etc.) for that switch.
+#   3. LLDP cables missing on nearly all devices: SNMP LLDP-MIB reports most
+#      neighbors with an EMPTY sys_name and only a chassis/port MAC, so the
+#      name-only lookup matched almost nothing. Added nb_device_by_mac() and
+#      a MAC fallback in the cable loop: when there is no usable name, the
+#      neighbor's chassis/port MAC is matched to the NetBox interface that
+#      owns it (via the 4.x mac-addresses object model) and the cable is run
+#      to that existing interface. NOTE: SNMP-based LLDP is inherently poorer
+#      than host-side lldpd (which advertises real names); full-fidelity
+#      topology still benefits from an on-host agent.
+#
 #  Changelog v2.6.4 (restore host hardware custom fields from the old PS1):
 #   The legacy importer set per-DEVICE hardware custom fields on the physical
 #   Hyper-V hosts (collected via Get-PhysicalDisk + ComputerSystem), which
