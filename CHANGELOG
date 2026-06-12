@@ -1,3 +1,23 @@
+#  Changelog v2.6.4 (restore host hardware custom fields from the old PS1):
+#   The legacy importer set per-DEVICE hardware custom fields on the physical
+#   Hyper-V hosts (collected via Get-PhysicalDisk + ComputerSystem), which
+#   went away when the PS1 was retired. These are 'the custom fields beyond
+#   Discovered Ports' on the Hyper-V hosts. Restored end-to-end:
+#   - PS_BASE now collects PhysicalDisks[] (SizeGB/Media/Interface via
+#     Get-PhysicalDisk, falling back to Win32_DiskDrive) and
+#     LogicalProcessors. (~5.9k encoded, still under the 8191 cmd-line cap.)
+#   - merge_host_data carries hw_cpu_model/hw_os_version/hw_vcpus/
+#     hw_memory_mb/hw_memory_gb/hw_physical_disks onto the host record; the
+#     reconciler's enrich() preserves them onto the canonical dual-homed host.
+#   - sync_to_netbox ensures the custom fields (vcpus, memory_mb, memory_gb,
+#     disk_total_gb, disk_count, os_version, cpu_model, and disk_0..disk_7
+#     size_gb/media/interface) and patches them onto each device that reports
+#     WinRM hardware. Per-disk fields cap at 8 disks. Patch failures are
+#     logged (Device HW CF patch failed ...).
+#   - VM disk detail remains the native virtualization/virtual-disks objects
+#     from v2.6.3; these device-level disk_* fields describe the physical
+#     server, not the guests.
+# 
 #  Changelog v2.6.3 (virtual disks + custom-field read-back diagnostics):
 #   - VIRTUAL DISKS (were not created): setting only the VM 'disk' field does
 #     not populate the Disk column on NetBox 4.x -- that total is aggregated
