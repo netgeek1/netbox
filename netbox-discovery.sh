@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.6.3
+#  Version: 2.6.4
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.6.3"
+SCRIPT_VERSION="2.6.4"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2079,12 +2079,31 @@ $nics = Get-NetAdapter -Physical 2>$null | Where-Object { $_.Status -eq "Up" } |
         }
 $isHyperV = $false
 try { $isHyperV = ($null -ne (Get-Command Get-VM -ErrorAction SilentlyContinue)) } catch {}
+$pdisks = @()
+try {
+    if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
+        $pd = Get-PhysicalDisk 2>$null
+    } else { $pd = Get-CimInstance Win32_DiskDrive 2>$null }
+    foreach ($d in $pd) {
+        $sz = [int64]0; $md = "Unknown"; $ifc = "Unknown"
+        if ($d.Size) { $sz = [int64]$d.Size }
+        if ($d.MediaType)        { $md  = [string]$d.MediaType }
+        if ($d.BusType)          { $ifc = [string]$d.BusType }
+        elseif ($d.InterfaceType){ $ifc = [string]$d.InterfaceType }
+        if ($sz -gt 0) {
+            $pdisks += [ordered]@{ SizeGB=[int][Math]::Ceiling($sz/1GB);
+                                   Media=$md; Interface=$ifc }
+        }
+    }
+} catch {}
 [ordered]@{ Hostname=$cs.Name; Domain=$cs.Domain; Manufacturer=$cs.Manufacturer;
             Model=$cs.Model; SerialNumber=$bios.SerialNumber; OS=$os.Caption;
             OSVersion=$os.Version; IsServer=($os.ProductType -ne 1);
             IsHyperV=$isHyperV;
             CPUName=$cpu.Name; CPUCores=[int]$cpu.NumberOfCores;
+            LogicalProcessors=[int]$cs.NumberOfLogicalProcessors;
             MemoryGB=[math]::Round($cs.TotalPhysicalMemory/1GB,2);
+            PhysicalDisks=@($pdisks);
             NetworkAdapters=@($nics) } | ConvertTo-Json -Depth 4
 """
 
@@ -2273,6 +2292,20 @@ if winrm.get('available'):
         'prefix_lens':n.get('PrefixLens',[]) or []}
         for n in (winrm.get('NetworkAdapters') or [])]
     host['is_hyperv']=bool(winrm.get('IsHyperV',False))
+    # Host hardware (for device custom fields: vcpus/memory/disk/os/cpu model).
+    host['hw_cpu_model']=winrm.get('CPUName') or ''
+    host['hw_os_version']=winrm.get('OSVersion') or ''
+    try: host['hw_vcpus']=int(winrm.get('LogicalProcessors') or winrm.get('CPUCores') or 0)
+    except Exception: host['hw_vcpus']=0
+    try: host['hw_memory_mb']=int(round(float(winrm.get('MemoryGB') or 0)*1024))
+    except Exception: host['hw_memory_mb']=0
+    try: host['hw_memory_gb']=int(round(float(winrm.get('MemoryGB') or 0)))
+    except Exception: host['hw_memory_gb']=0
+    host['hw_physical_disks']=[
+        {'size_gb':int(d.get('SizeGB') or 0),
+         'media':str(d.get('Media') or 'Unknown'),
+         'interface':str(d.get('Interface') or 'Unknown')}
+        for d in (winrm.get('PhysicalDisks') or []) if int(d.get('SizeGB') or 0) > 0]
     # Read-only Hyper-V VM inventory (name/state/cpu/mem + per-adapter MAC/IPs).
     # Used by the reconciler to map discovered devices to VMs and to create VMs
     # that were not independently IP-scanned. No NetBox writes happen here.
@@ -3020,6 +3053,14 @@ def reconcile(data):
             winner["hyperv_vms"] = loser["hyperv_vms"]
         if not winner.get("winrm_nics") and loser.get("winrm_nics"):
             winner["winrm_nics"] = loser["winrm_nics"]
+        # Host hardware (vcpus/memory/disks/os/cpu) must survive onto the winner
+        # if it only lives on the merged-away (e.g. dual-homed WinRM) record.
+        for f in ("hw_cpu_model", "hw_os_version", "hw_vcpus",
+                  "hw_memory_mb", "hw_memory_gb"):
+            if not winner.get(f) and loser.get(f):
+                winner[f] = loser[f]
+        if not winner.get("hw_physical_disks") and loser.get("hw_physical_disks"):
+            winner["hw_physical_disks"] = loser["hw_physical_disks"]
         # Strongest role wins.
         if _role_rank.get(loser.get("device_role"), 0) > \
                 _role_rank.get(winner.get("device_role"), 0):
@@ -3367,6 +3408,24 @@ sync_to_netbox() {
         "dcim.device,virtualization.virtualmachine"
     nb_ensure_custom_field "discovery_methods" "Discovery Methods" "text" \
         "dcim.device,virtualization.virtualmachine"
+    # Host hardware custom fields (restored from the legacy importer): physical
+    # server vcpus/memory/disks/os/cpu. Set on devices that report WinRM hardware.
+    nb_ensure_custom_field "vcpus"         "vCPUs"           "integer" "dcim.device"
+    nb_ensure_custom_field "memory_mb"     "Memory (MB)"     "integer" "dcim.device"
+    nb_ensure_custom_field "memory_gb"     "Memory (GB)"     "integer" "dcim.device"
+    nb_ensure_custom_field "disk_total_gb" "Disk Total (GB)" "integer" "dcim.device"
+    nb_ensure_custom_field "disk_count"    "Disk Count"      "integer" "dcim.device"
+    nb_ensure_custom_field "os_version"    "OS Version"      "text"    "dcim.device"
+    nb_ensure_custom_field "cpu_model"     "CPU Model"       "text"    "dcim.device"
+    local _di
+    for _di in 0 1 2 3 4 5 6 7; do
+        nb_ensure_custom_field "disk_${_di}_size_gb" "Disk ${_di} Size (GB)" \
+            "integer" "dcim.device"
+        nb_ensure_custom_field "disk_${_di}_media" "Disk ${_di} Media" \
+            "text" "dcim.device"
+        nb_ensure_custom_field "disk_${_di}_interface" "Disk ${_di} Interface" \
+            "text" "dcim.device"
+    done
 
     # PHASE B/C: reconcile the raw results into a canonical device/VM model and
     # sync THAT (honors sync_as=device/vm/skip, secondary_ips, vm_host/cluster).
@@ -3716,6 +3775,37 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
             else
                 log_error "Device CF patch failed for $hn: $(echo "$_cfr" \
                     | jq -c '.custom_fields // .detail // .' 2>/dev/null | head -c 200)"
+            fi
+        fi
+
+        # Host hardware custom fields (vcpus/memory/disk_*/os/cpu) for devices
+        # that reported WinRM hardware. Disks are capped at 8 (disk_0..disk_7).
+        local _hw_dcount
+        _hw_dcount=$(echo "$host" | jq -r '(.hw_physical_disks // []) | length' 2>/dev/null || echo 0)
+        local _hw_vcpus _hw_cpu
+        _hw_vcpus=$(echo "$host" | jq -r '.hw_vcpus // 0' 2>/dev/null || echo 0)
+        _hw_cpu=$(echo "$host" | jq -r '.hw_cpu_model // ""' 2>/dev/null || echo "")
+        if [[ "$_hw_vcpus" != "0" || -n "$_hw_cpu" || "$_hw_dcount" -gt 0 ]]; then
+            local _hwcf
+            _hwcf=$(echo "$host" | jq -c '
+                (.hw_physical_disks // []) as $d
+                | {vcpus:(.hw_vcpus // 0), memory_mb:(.hw_memory_mb // 0),
+                   memory_gb:(.hw_memory_gb // 0), os_version:(.hw_os_version // ""),
+                   cpu_model:(.hw_cpu_model // ""),
+                   disk_total_gb:([$d[].size_gb] | add // 0),
+                   disk_count:($d | length)}
+                + (reduce range(0; ([$d|length,8]|min)) as $i ({};
+                    . + {("disk_\($i)_size_gb"):  ($d[$i].size_gb // 0),
+                         ("disk_\($i)_media"):     ($d[$i].media // "Unknown"),
+                         ("disk_\($i)_interface"): ($d[$i].interface // "Unknown")}))
+            ' 2>/dev/null || echo "")
+            if [[ -n "$_hwcf" && "$_hwcf" != "null" ]]; then
+                local _hwr
+                _hwr=$(nb_patch "dcim/devices/${dev_id}/" \
+                    "{\"custom_fields\":$_hwcf}")
+                echo "$_hwr" | jq -e '.id' >/dev/null 2>&1 \
+                    || log_error "Device HW CF patch failed for $hn: $(echo "$_hwr" \
+                        | jq -c '.custom_fields // .detail // .' 2>/dev/null | head -c 200)"
             fi
         fi
 
