@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.6.0
+#  Version: 2.6.1
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.6.1"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -831,16 +831,32 @@ nb_create_cable() {
 
 # Idempotent custom field creator -- only POSTs if field does not yet exist
 nb_ensure_custom_field() {
-    local name="$1" label="$2" type="${3:-text}" obj_types="${4:-dcim.device}"
+    local name="$1" label="$2" type="${3:-text}"
+    local obj_types="${4:-dcim.device}"
+    # obj_types is a comma-separated list -> JSON array
+    local ot_json; ot_json=$(printf '%s' "$obj_types" \
+        | jq -R 'split(",") | map(select(length>0))')
     local enc; enc=$(nb_urlencode "$name")
     local res; res=$(nb_get "extras/custom-fields/?name=${enc}")
     local id; id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
     if [[ -z "$id" ]]; then
         nb_post "extras/custom-fields/" \
             "$(jq -n --arg n "$name" --arg l "$label" --arg t "$type" \
-                --argjson ot "[\"$obj_types\"]" \
+                --argjson ot "$ot_json" \
                 '{name:$n,label:$l,type:$t,object_types:$ot}')" \
             >/dev/null 2>&1 || true
+    else
+        # Field exists: ensure it is scoped to ALL requested object types so VMs
+        # and devices can both carry the value (NetBox 4 uses object_types).
+        local cur; cur=$(echo "$res" \
+            | jq -c '.results[0].object_types // .results[0].content_types // []')
+        local merged; merged=$(jq -n --argjson a "$cur" --argjson b "$ot_json" \
+            '($a + $b) | unique')
+        if [[ "$(echo "$merged" | jq -S .)" != "$(echo "$cur" | jq -S .)" ]]; then
+            nb_patch "extras/custom-fields/${id}/" \
+                "$(jq -n --argjson ot "$merged" '{object_types:$ot}')" \
+                >/dev/null 2>&1 || true
+        fi
     fi
 }
 
@@ -2004,7 +2020,7 @@ $hvVMs = Get-VM 2>$null | ForEach-Object {
     [ordered]@{ Name=$vm.Name; State="$($vm.State)";
                 Generation=$vm.Generation;
                 ProcessorCount=[int]$vm.ProcessorCount;
-                MemoryStartupBytes=[int64]$vm.MemoryStartupBytes;
+                MemoryStartupBytes=[int64]$vm.MemoryStartup;
                 VMId="$($vm.VMId)";
                 NetworkAdapters=@($adByVm["$($vm.Name)"]) }
 }
@@ -3061,6 +3077,8 @@ def reconcile(data):
             h["vm_host"] = vm["host_ip"]
             h["vm_cluster"] = vm["host_name"] or vm["host_ip"]
             h["vm_state"] = vm["state"]
+            h["vm_cpu"] = vm["cpu"]
+            h["vm_mem_bytes"] = vm["mem"]
             h["vm_reason"] = "Hyper-V VM '%s' on %s (%s, by %s)" % (
                 vm["name"], vm["host_name"] or vm["host_ip"], vm["state"], how)
             matched_keys.add(inst_key(vm))
@@ -3228,9 +3246,12 @@ sync_to_netbox() {
     [[ -z "$site_id" || ! "$site_id" =~ ^[0-9]+$ ]] \
         && { log_error "Cannot create site"; pause; return 1; }
     log_info "Site ID: $site_id"
-    # Ensure custom fields exist (idempotent)
-    nb_ensure_custom_field "discovered_ports" "Discovered Ports" "text" "dcim.device"
-    nb_ensure_custom_field "discovery_methods" "Discovery Methods" "text" "dcim.device"
+    # Ensure custom fields exist on BOTH devices and VMs (idempotent; merges
+    # scope onto an existing field so servers and VMs can both carry the value)
+    nb_ensure_custom_field "discovered_ports" "Discovered Ports" "text" \
+        "dcim.device,virtualization.virtualmachine"
+    nb_ensure_custom_field "discovery_methods" "Discovery Methods" "text" \
+        "dcim.device,virtualization.virtualmachine"
 
     # PHASE B/C: reconcile the raw results into a canonical device/VM model and
     # sync THAT (honors sync_as=device/vm/skip, secondary_ips, vm_host/cluster).
@@ -3306,6 +3327,20 @@ sync_to_netbox() {
                 "auto-discovered" 2>/dev/null) || true
             if [[ -n "$vm_ip" && -n "$vmif_id" && "$vmif_id" =~ ^[0-9]+$ ]]; then
                 nb_add_vm_ip "$vm_ip" "$vm_id" "$vmif_id" >/dev/null 2>&1 || true
+            fi
+            # Custom fields on the VM (open ports + discovery methods), same as
+            # devices. Synthesized VMs have no ports but still get the methods.
+            local _vp _vdm
+            _vp=$(echo "$host" | jq -r \
+                '[.ports[]? | .port + "/" + (.service // .proto // "tcp")] | join(", ")' \
+                2>/dev/null || echo "")
+            _vdm=$(echo "$host" | jq -r \
+                '(.discovery_methods // []) | join(", ")' 2>/dev/null || echo "")
+            if [[ -n "$_vp" || -n "$_vdm" ]]; then
+                nb_patch "virtualization/virtual-machines/${vm_id}/" \
+                    "$(jq -n --arg p "$_vp" --arg d "$_vdm" \
+                        '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')" \
+                    >/dev/null 2>&1 || true
             fi
             printf "${G}OK${NC}\n"; (( ok++ )); continue
         fi
