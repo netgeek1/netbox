@@ -1,3 +1,27 @@
+#  Changelog v2.6.6 (correct LLDP cabling + multiple collection fallbacks):
+#   ROOT CAUSE of the mis-assigned cable: an LLDP neighbor's advertised
+#   port_id is the REMOTE device's port (e.g. laundry-sw's 'g4'), but the
+#   code used it to name the LOCAL interface -- so 'g4' was added to the
+#   wrong switch. The actual local port lives in the LLDP-MIB row index,
+#   which the KaSaNaa container discards.
+#   Collection now has THREE fallbacks, not SSH-only (most devices have no
+#   SSH), in priority order:
+#    1. Host-side lldpd over SSH (lldpctl/lldpcli keyvalue) -- Linux hosts;
+#       gives local interface + remote name/port directly.
+#    2. Supplementary SNMP LLDP-MIB walk (_snmp_walk_n, numeric OIDs):
+#       lldpRemSysName/PortId/ChassisId joined with lldpLocPortId via the
+#       localPortNum in the row index -> the LOCAL port is finally known for
+#       SNMP devices (switches/gateway). This is how 2.5.8 collected, now
+#       with the local side resolved.
+#    3. Container lldp_neighbors/cdp_neighbors (remote-only) as a last
+#       resort.
+#   The cable loop normalizes all sources to {local_port, remote_name,
+#   remote_mac, remote_port}, then: resolves the remote device by name ->
+#   short name -> chassis MAC; puts the remote port on the REMOTE device;
+#   and attaches the LOCAL side to the real local port when known, else a
+#   clearly-named 'uplink-<remote>' (never the remote port). Reuses existing
+#   interfaces (idempotent by name) instead of duplicating them.
+# 
 #  Changelog v2.6.5 (three issues from the live sync):
 #   1. DISK FIELDS for 8 drives: the disk_N_* custom fields were always
 #      created for 0..7. Now only as many sets as the busiest host actually
