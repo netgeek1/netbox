@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.6.5
+#  Version: 2.6.6
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.6.5"
+SCRIPT_VERSION="2.6.6"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1087,6 +1087,20 @@ _snmp_walk() {
     fi
 }
 
+# Numeric-OID variant (-On -Oe): emits raw numeric OIDs so table indexes can be
+# parsed positionally (needed for the LLDP-MIB local-port mapping).
+_snmp_walk_n() {
+    local ip="$1" tok="$2" tout="$3" oid="$4"
+    if [[ "$tok" == v3:* ]]; then
+        local IFS=':'; read -r _ u ap ap2 pp pp2 <<< "$tok"
+        snmpwalk -On -v3 -u "$u" -l authPriv \
+            -a "$ap" -A "$ap2" -x "$pp" -X "$pp2" \
+            -t "$tout" -r 1 "$ip" "$oid" 2>/dev/null || true
+    else
+        snmpwalk -On -v2c -c "$tok" -t "$tout" -r 1 "$ip" "$oid" 2>/dev/null || true
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # TARGET PARSING  (multi-subnet support)
 # parse_targets: normalises any mix of CIDRs, IPs, and file paths into an
@@ -1917,6 +1931,61 @@ for ln in lines:
 print(json.dumps({'arp_table': [{'ip': k, 'mac': v} for k, v in arp.items()]}))
 ARPEOF
     fi
+
+    # Supplementary LLDP-MIB walk to recover the LOCAL port of each neighbor --
+    # the one thing the KaSaNaa container drops (it reports only the remote
+    # sys-name/port). lldpRemTable rows are indexed by
+    # .timeMark.localPortNum.remIndex; lldpLocPortId/Desc map localPortNum -> a
+    # human port name. Numeric OIDs so the index parses positionally. Read-only,
+    # best-effort: a switch without the LLDP-MIB simply yields nothing and we
+    # fall back to the container's remote-only data.
+    if [[ -n "$_snmp_tok" ]]; then
+        { _snmp_walk_n "$ip" "$_snmp_tok" 5 "1.0.8802.1.1.2.1.4.1.1.9"
+          _snmp_walk_n "$ip" "$_snmp_tok" 5 "1.0.8802.1.1.2.1.4.1.1.7"
+          _snmp_walk_n "$ip" "$_snmp_tok" 5 "1.0.8802.1.1.2.1.4.1.1.5"
+          _snmp_walk_n "$ip" "$_snmp_tok" 5 "1.0.8802.1.1.2.1.3.7.1.3"
+          _snmp_walk_n "$ip" "$_snmp_tok" 5 "1.0.8802.1.1.2.1.3.7.1.4"
+        } > "$tmp/lldp_walk.txt" 2>/dev/null || true
+        python3 /dev/stdin "$tmp/lldp_walk.txt" > "$tmp/snmp_lldp.json" 2>/dev/null <<'LLDPEOF'
+import json, re, sys
+rem_name, rem_port, rem_chassis, loc_port = {}, {}, {}, {}
+try:
+    lines = open(sys.argv[1]).read().splitlines()
+except Exception:
+    lines = []
+def parse(ln):
+    m = re.match(r'\.?([\d.]+)\s*=\s*(?:Hex-STRING|STRING|INTEGER|'
+                 r'Network Address|OID|IpAddress):?\s*(.*)$', ln)
+    if not m:
+        m = re.match(r'\.?([\d.]+)\s*=\s*"?(.*?)"?$', ln)
+    return (m.group(1).lstrip('.'), m.group(2).strip().strip('"')) if m else (None, None)
+def hexmac(s):
+    h = re.findall(r'[0-9A-Fa-f]{2}', s or '')
+    return ':'.join(x.lower() for x in h) if len(h) == 6 else ''
+B = {'name': '1.0.8802.1.1.2.1.4.1.1.9.', 'port': '1.0.8802.1.1.2.1.4.1.1.7.',
+     'chas': '1.0.8802.1.1.2.1.4.1.1.5.', 'loc': '1.0.8802.1.1.2.1.3.7.1.3.',
+     'locd': '1.0.8802.1.1.2.1.3.7.1.4.'}
+for ln in lines:
+    oid, v = parse(ln)
+    if not oid:
+        continue
+    if   oid.startswith(B['name']): rem_name[oid[len(B['name']):]] = v
+    elif oid.startswith(B['port']): rem_port[oid[len(B['port']):]] = v
+    elif oid.startswith(B['chas']): rem_chassis[oid[len(B['chas']):]] = v
+    elif oid.startswith(B['loc']):  loc_port[oid[len(B['loc']):]] = v
+    elif oid.startswith(B['locd']): loc_port.setdefault(oid[len(B['locd']):], v)
+out = []
+for idx, name in rem_name.items():
+    parts = idx.split('.')          # timeMark.localPortNum.remIndex
+    lpn = parts[1] if len(parts) >= 3 else (parts[0] if parts else '')
+    rport = rem_port.get(idx, '')
+    if hexmac(rport):
+        rport = hexmac(rport)
+    out.append({'local_port': loc_port.get(lpn, lpn), 'remote_name': name,
+                'remote_port': rport, 'remote_mac': hexmac(rem_chassis.get(idx, ''))})
+print(json.dumps({'lldp_local': out}))
+LLDPEOF
+    fi
 }
 
 # ?? Probe: SSH ????????????????????????????????????????????????????????????????
@@ -1934,7 +2003,9 @@ probe_ssh() {
     remote_cmd='printf "HN=%s\n" "$(hostname)"; uname -a; \
 cat /etc/os-release 2>/dev/null || sw_vers 2>/dev/null; \
 ip addr 2>/dev/null || ifconfig; lscpu 2>/dev/null | head -5; \
-free -h 2>/dev/null | head -2'
+free -h 2>/dev/null | head -2; \
+echo "---LLDP---"; \
+(lldpctl -f keyvalue 2>/dev/null || lldpcli show neighbors -f keyvalue 2>/dev/null)'
     local sys_info="" cred
     while IFS= read -r cred; do
         [[ -z "$cred" || "$cred" == "null" ]] && continue
@@ -1953,6 +2024,38 @@ free -h 2>/dev/null | head -2'
         fi
         [[ -n "$sys_info" ]] && break
     done < <(get_ssh_creds_for "$ip")
+    # Parse host-side LLDP (lldpctl keyvalue) into a neighbor list with the
+    # LOCAL interface known (the one thing SNMP LLDP-MIB cannot give us cleanly).
+    local lldp_raw; lldp_raw=$(echo "$sys_info" | sed -n '/^---LLDP---$/,$p' | tail -n +2)
+    local host_lldp_json
+    host_lldp_json=$(printf '%s' "$lldp_raw" | python3 -c '
+import sys, json
+nb = {}
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("lldp.") or "=" not in line:
+        continue
+    key, val = line.split("=", 1)
+    parts = key.split(".")
+    if len(parts) < 3:
+        continue
+    lif = parts[1]
+    rest = ".".join(parts[2:])
+    e = nb.setdefault(lif, {"local_port": lif, "remote_name": "",
+                            "remote_mac": "", "remote_port": ""})
+    if rest == "chassis.name" or rest.endswith(".chassis.name"):
+        e["remote_name"] = val
+    elif rest.startswith("chassis.") and rest.endswith(".mac"):
+        e["remote_mac"] = val
+    elif rest == "chassis.mac":
+        e["remote_mac"] = val
+    elif rest in ("port.descr", "port.ifname", "port.id"):
+        if not e["remote_port"]:
+            e["remote_port"] = val
+out = [v for v in nb.values() if v["remote_name"] or v["remote_mac"]]
+print(json.dumps(out))
+' 2>/dev/null || echo "[]")
+    [[ -z "$host_lldp_json" ]] && host_lldp_json="[]"
     jq -n \
         --arg banner "$banner" \
         --arg hn     "$(echo "$sys_info" | grep '^HN=' | cut -d= -f2)" \
@@ -1961,8 +2064,9 @@ free -h 2>/dev/null | head -2'
         --arg kernel "$(echo "$sys_info" | grep '^Linux\|^Darwin' | head -1)" \
         --arg cpu    "$(echo "$sys_info" | grep -i 'model name\|CPU' \
                          | head -1 | sed 's/.*: //')" \
+        --argjson lldp "$host_lldp_json" \
         '{available:true,banner:$banner,hostname:$hn,os:$os,
-          kernel:$kernel,cpu:$cpu}' > "$tmp/ssh.json"
+          kernel:$kernel,cpu:$cpu,host_lldp:$lldp}' > "$tmp/ssh.json"
 }
 
 # ?? Probe: HTTP/HTTPS ?????????????????????????????????????????????????????????
@@ -2243,6 +2347,7 @@ http=load('http'); nb=load('netbios'); dns=load('dns')
 bnr=load('banners'); mdns=load('mdns'); winrm=load('winrm')
 arp=load('arp')
 snmp_arp=load('snmp_arp')
+snmp_lldp=load('snmp_lldp')
 
 host={'ip':ip,'hostname':None,'mac':None,'vendor':None,
       'os':None,'os_accuracy':None,
@@ -2263,6 +2368,7 @@ host={'ip':ip,'hostname':None,'mac':None,'vendor':None,
           'community':snmp.get('community','')},
       'ssh_details':{'cpu':ssh.get('cpu',''),'banner':ssh.get('banner',''),
           'kernel':ssh.get('kernel','')},
+      'host_lldp':ssh.get('host_lldp',[]) or [],
       'discovery_methods':[]}
 
 for src in (snmp.get('sys_name'),ssh.get('hostname'),nmap.get('hostname'),
@@ -2355,6 +2461,9 @@ if winrm.get('available'):    host['discovery_methods'].append('winrm')
 # SNMP-only with no WinRM. The reconciler folds these IP->MAC pairs in to resolve
 # MACs the L2-blind scanner never sees.
 host['arp_table']=(snmp_arp.get('arp_table') if isinstance(snmp_arp,dict) else None) or []
+# SNMP LLDP-MIB neighbors WITH the local port resolved (the container's
+# lldp_neighbors lacks it). Preferred over lldp_neighbors for cabling.
+host['lldp_local']=(snmp_lldp.get('lldp_local') if isinstance(snmp_lldp,dict) else None) or []
 
 # scan_tier: 1=winrm(richest) 2=ssh 3=snmp 4=nmap/fallback
 if winrm.get('available'):      host['scan_tier']=1
@@ -3761,49 +3870,81 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
 
         local nbr
         while IFS= read -r nbr; do
-            local nbr_name nbr_local_port nbr_remote_port
-            nbr_name=$(echo "$nbr" | jq -r '.sys_name // .device_id // empty')
-            nbr_local_port=$(echo "$nbr" | jq -r '.port_id // .remote_port // empty')
-            nbr_remote_port=$(echo "$nbr" | jq -r '.port_desc // .remote_port // empty')
-            local nbr_dev_id="" nbr_if_id=""
-            # 1. Match by advertised system name.
-            if [[ -n "$nbr_name" ]]; then
-                local nbr_enc; nbr_enc=$(nb_urlencode "$nbr_name")
-                nbr_dev_id=$(nb_get "dcim/devices/?name=${nbr_enc}" \
+            local n_local n_rname n_rmac n_rport
+            n_local=$(echo "$nbr" | jq -r '.local_port  // ""')
+            n_rname=$(echo "$nbr" | jq -r '.remote_name // ""')
+            n_rmac=$(echo  "$nbr" | jq -r '.remote_mac  // ""')
+            n_rport=$(echo "$nbr" | jq -r '.remote_port // ""')
+
+            # --- Resolve the REMOTE device (by name, short name, then MAC) ---
+            local rdev="" rif=""
+            if [[ -n "$n_rname" ]]; then
+                rdev=$(nb_get "dcim/devices/?name=$(nb_urlencode "$n_rname")" \
                     | jq -r '.results[0].id // empty' 2>/dev/null || echo "")
-            fi
-            # 2. Fall back to the chassis/port MAC (LLDP entries with no sys_name
-            #    carry only a MAC). Reuse the existing NetBox interface that owns
-            #    that MAC as the far-end termination.
-            if [[ -z "$nbr_dev_id" || ! "$nbr_dev_id" =~ ^[0-9]+$ ]]; then
-                local _mg; _mg=$(echo "$nbr" | jq -r \
-                    '.chassis_id // .port_id // empty')
-                if [[ "$_mg" =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]]; then
-                    local _dm; _dm=$(nb_device_by_mac "$_mg")
-                    nbr_dev_id=$(echo "$_dm" | awk '{print $1}')
-                    nbr_if_id=$(echo "$_dm" | awk '{print $2}')
+                if [[ -z "$rdev" && "$n_rname" == *.* ]]; then
+                    rdev=$(nb_get "dcim/devices/?name=$(nb_urlencode "${n_rname%%.*}")" \
+                        | jq -r '.results[0].id // empty' 2>/dev/null || echo "")
                 fi
             fi
-            [[ -z "$nbr_dev_id" || ! "$nbr_dev_id" =~ ^[0-9]+$ ]] && continue
-            local local_if_id
-            local_if_id=$(nb_add_interface "$dev_id" \
-                "${nbr_local_port:-to-${nbr_name:-$nbr_dev_id}}" "other" "" \
-                "Topology link" 2>/dev/null) || true
-            # If MAC match didn't already give us the far interface, create one.
-            if [[ -z "$nbr_if_id" || ! "$nbr_if_id" =~ ^[0-9]+$ ]]; then
-                nbr_if_id=$(nb_add_interface "$nbr_dev_id" \
-                    "${nbr_remote_port:-to-$hn}" "other" "" \
-                    "Topology link to $hn" 2>/dev/null) || true
+            if [[ -z "$rdev" && "$n_rmac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+                local _dm; _dm=$(nb_device_by_mac "$n_rmac")
+                rdev=$(echo "$_dm" | awk '{print $1}'); rif=$(echo "$_dm" | awk '{print $2}')
             fi
-            [[ -z "$local_if_id" || ! "$local_if_id" =~ ^[0-9]+$ ]] && continue
-            [[ -z "$nbr_if_id"   || ! "$nbr_if_id"   =~ ^[0-9]+$ ]] && continue
-            nb_create_cable "$local_if_id" "$nbr_if_id" \
-                "$hn <-> ${nbr_name:-$nbr_dev_id}" >/dev/null 2>&1 || true
-            log_info "Cable: $hn <-> ${nbr_name:-mac:$nbr_dev_id}"
-        done < <({
-            echo "$host" | jq -c '.lldp_neighbors[]?' 2>/dev/null
-            echo "$host" | jq -c '.cdp_neighbors[]?'  2>/dev/null
-        } 2>/dev/null || true)
+            if [[ -z "$rdev" && "$n_rport" =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]]; then
+                local _dm2; _dm2=$(nb_device_by_mac "$n_rport")
+                rdev=$(echo "$_dm2" | awk '{print $1}'); rif=$(echo "$_dm2" | awk '{print $2}')
+            fi
+            [[ -z "$rdev" || ! "$rdev" =~ ^[0-9]+$ ]] && continue
+            [[ "$rdev" == "$dev_id" ]] && continue   # never cable a device to itself
+
+            # --- LOCAL interface (on THIS device): the local port when known,
+            #     otherwise a descriptive uplink -- NEVER the remote port. ---
+            local lif=""
+            if [[ -n "$n_local" && "$n_local" != "null" ]]; then
+                lif=$(nb_add_interface "$dev_id" "$n_local" "other" "" \
+                    "LLDP/CDP uplink" 2>/dev/null) || true
+            else
+                lif=$(nb_add_interface "$dev_id" \
+                    "uplink-${n_rname:-dev$rdev}" "other" "" \
+                    "Topology link to ${n_rname:-device $rdev}" 2>/dev/null) || true
+            fi
+
+            # --- REMOTE interface (on the neighbor): the remote port, unless a
+            #     MAC lookup already pinned the exact interface. ---
+            if [[ -z "$rif" || ! "$rif" =~ ^[0-9]+$ ]]; then
+                if [[ -n "$n_rport" \
+                      && ! "$n_rport" =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]]; then
+                    rif=$(nb_add_interface "$rdev" "$n_rport" "other" "" \
+                        "Link to $hn" 2>/dev/null) || true
+                else
+                    rif=$(nb_add_interface "$rdev" "link-to-$hn" "other" "" \
+                        "Link to $hn" 2>/dev/null) || true
+                fi
+            fi
+            [[ -z "$lif" || ! "$lif" =~ ^[0-9]+$ ]] && continue
+            [[ -z "$rif" || ! "$rif" =~ ^[0-9]+$ ]] && continue
+            nb_create_cable "$lif" "$rif" \
+                "$hn <-> ${n_rname:-dev$rdev}" >/dev/null 2>&1 || true
+            log_info "Cable: $hn[${n_local:-?}] <-> ${n_rname:-mac}[${n_rport:-?}]"
+        done < <(echo "$host" | jq -c '
+            # Normalize every topology source into {local_port, remote_name,
+            # remote_mac, remote_port}. Sources that know the local port
+            # (host-side lldpd over SSH, and the SNMP LLDP-MIB walk) come first;
+            # the container LLDP/CDP lists (remote-only) are the fallback.
+              ((.host_lldp  // []) | map({local_port:(.local_port//""),
+                  remote_name:(.remote_name//""), remote_mac:(.remote_mac//""),
+                  remote_port:(.remote_port//"")}))
+            + ((.lldp_local // []) | map({local_port:(.local_port//""),
+                  remote_name:(.remote_name//""), remote_mac:(.remote_mac//""),
+                  remote_port:(.remote_port//"")}))
+            + ((.lldp_neighbors // []) | map({local_port:"",
+                  remote_name:(.sys_name//""), remote_mac:"",
+                  remote_port:(.port_id//.port_desc//"")}))
+            + ((.cdp_neighbors // []) | map({local_port:"",
+                  remote_name:(.device_id//""), remote_mac:"",
+                  remote_port:(.remote_port//"")}))
+            | map(select(.remote_name != "" or .remote_mac != ""))
+            | unique | .[]' 2>/dev/null || true)
 
         # Populate custom fields: open ports + discovery methods
         local _ports_cf _dmethods_cf
