@@ -1,3 +1,24 @@
+#  Changelog v2.6.1 (VM detail + custom-field fixes from first live sync):
+#   - BUG 1 (memory blank on all VMs): PS_HYPERV read $vm.MemoryStartupBytes,
+#     which is NOT a property of the Get-VM object (returned 0). Corrected to
+#     $vm.MemoryStartup. VM memory now populates on the next capture.
+#   - BUG 2 (vCPU/memory blank on IP-MATCHED VMs): the reconciler's matched-VM
+#     branch set vm_name/host/cluster/state but not vm_cpu/vm_mem_bytes (only
+#     the synthesized branch did), so .5/.14/.30/... synced with empty CPU and
+#     memory while synthesized VMs showed them. Matched VMs now carry
+#     vm_cpu/vm_mem_bytes from the inventory entry.
+#   - BUG 3 (custom fields missing on VMs AND servers): discovered_ports and
+#     discovery_methods were scoped to dcim.device only and patched only in
+#     the device branch (the VM branch returned before it). Now: (a)
+#     nb_ensure_custom_field accepts a comma-separated object_types list and
+#     MERGES scope onto an existing field, so the fields cover both
+#     dcim.device and virtualization.virtualmachine; (b) the VM sync branch
+#     patches discovered_ports/discovery_methods onto the VM. Devices
+#     (incl. the Hyper-V servers, which are Server-role) keep populating via
+#     the device branch, now guaranteed the field is scoped to dcim.device.
+#   - Disk: not yet collected (Get-VM exposes no disk size); a future change
+#     can add Get-VMHardDiskDrive/Get-VHD and create NetBox virtual-disks.
+# 
 #  Changelog v2.6.0 (PHASE C -- central reconciled sync; Hyper-V PS1 retired):
 #   - sync_to_netbox() now reconciles the raw results FIRST and syncs the
 #     canonical model. It branches on sync_as: 'skip' records (merged away)
