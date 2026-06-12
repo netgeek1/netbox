@@ -1,3 +1,27 @@
+#  Changelog v2.6.2 (restore lost when the Hyper-V PS1 was retired):
+#   Deleting import_hyperv_powershell in v2.6.0 dropped real work it had been
+#   doing on the host side. Re-implemented centrally in bash:
+#   - MAC ADDRESSES (regressed): NetBox 4.x models MACs as first-class
+#     /dcim/mac-addresses/ objects; the old mac_address interface field is
+#     ignored on 4.2+. New nb_ensure_mac_address() creates the MAC object,
+#     assigns it to the (vm)interface, and sets primary_mac_address. Both
+#     nb_add_interface (dcim.interface) and nb_add_vm_interface
+#     (virtualization.vminterface) now use it; the deprecated field is gone.
+#     VM vNIC MACs flow from the Hyper-V inventory through the reconciler
+#     (vm_mac on matched and synthesized records) to the interface.
+#   - DISK (was never collected): PS_HYPERV now sums Get-VHD sizes per VM
+#     (DiskBytes); the reconciler carries vm_disk_bytes; nb_upsert_vm gained a
+#     disk_gb arg (ceil bytes->GB) and sets the VM disk field.
+#   - MEMORY (dynamic-memory VMs showed wrong/zero): PS_HYPERV now reports
+#     MemoryMaximum for DynamicMemoryEnabled VMs, else MemoryStartup -- the
+#     same rule the old PS1 used. Matters because several VMs were converted
+#     to Dynamic Memory.
+#   - CUSTOM FIELDS: nb_ensure_custom_field hardened to normalize object_types
+#     (string OR object form), never drop an existing scope, and LOG create/
+#     patch failures. The device and VM custom-field patches now also log
+#     failures instead of swallowing them, so if a host/VM still lacks fields
+#     the reason appears in the log (diagnostics-forward, like winrm_error).
+# 
 #  Changelog v2.6.1 (VM detail + custom-field fixes from first live sync):
 #   - BUG 1 (memory blank on all VMs): PS_HYPERV read $vm.MemoryStartupBytes,
 #     which is NOT a property of the Get-VM object (returned 0). Corrected to
