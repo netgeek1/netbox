@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.6.2
+#  Version: 2.6.3
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.6.2"
+SCRIPT_VERSION="2.6.3"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -677,6 +677,32 @@ nb_add_vm_ip() {
             "{\"primary_ip4\":$ip_id}" >/dev/null 2>&1 || true
     fi
     echo "$ip_id"
+}
+
+# nb_sync_virtual_disk <vm_id> <name> <size_gb>
+# Create/update a NetBox virtual disk. NetBox 4.x aggregates the VM's total disk
+# from these objects, so the VM "Disk" column only populates when they exist.
+# size is in GB to match the historical importer behavior.
+nb_sync_virtual_disk() {
+    local vm_id="$1" name="$2" size_gb="$3"
+    [[ -z "$vm_id"  || ! "$vm_id"  =~ ^[0-9]+$ ]] && return 0
+    [[ -z "$size_gb" || ! "$size_gb" =~ ^[0-9]+$ || "$size_gb" == "0" ]] && return 0
+    local enc; enc=$(nb_urlencode "$name")
+    local existing; existing=$(nb_get \
+        "virtualization/virtual-disks/?virtual_machine_id=${vm_id}&name=${enc}")
+    local did; did=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
+    local payload
+    payload=$(jq -n --arg n "$name" --argjson vm "$vm_id" --argjson s "$size_gb" \
+        '{name:$n,virtual_machine:$vm,size:$s}')
+    local resp
+    if [[ -z "$did" ]]; then
+        resp=$(nb_post "virtualization/virtual-disks/" "$payload")
+    else
+        resp=$(nb_patch "virtualization/virtual-disks/${did}/" "$payload")
+    fi
+    echo "$resp" | jq -e '.id' >/dev/null 2>&1 \
+        || log_error "Virtual disk '$name' sync failed: $(echo "$resp" \
+            | jq -c '.size // .detail // .' 2>/dev/null | head -c 160)"
 }
 
 # nb_ensure_mac_address <mac> <assigned_object_type> <interface_id>
@@ -2081,11 +2107,15 @@ Get-VMNetworkAdapter -VMName * 2>$null | ForEach-Object {
 $hvVMs = Get-VM 2>$null | ForEach-Object {
     $vm = $_
     $dbytes = [int64]0
+    $dlist = @()
     foreach ($dd in (Get-VMHardDiskDrive -VMName $vm.Name 2>$null)) {
         try {
             if ($dd.Path -and (Test-Path $dd.Path)) {
                 $vh = Get-VHD -Path $dd.Path -ErrorAction Stop
-                if ($vh -and $vh.Size) { $dbytes += [int64]$vh.Size }
+                if ($vh -and $vh.Size) {
+                    $dbytes += [int64]$vh.Size
+                    $dlist  += [int64]$vh.Size
+                }
             }
         } catch {}
     }
@@ -2096,6 +2126,7 @@ $hvVMs = Get-VM 2>$null | ForEach-Object {
                 ProcessorCount=[int]$vm.ProcessorCount;
                 MemoryStartupBytes=$memB;
                 DiskBytes=$dbytes;
+                Disks=@($dlist);
                 VMId="$($vm.VMId)";
                 NetworkAdapters=@($adByVm["$($vm.Name)"]) }
 }
@@ -3105,6 +3136,7 @@ def reconcile(data):
                 "host_name": h.get("hostname", ""), "macs": macs, "ips": ips,
                 "cpu": vm.get("ProcessorCount"), "mem": vm.get("MemoryStartupBytes"),
                 "disk": vm.get("DiskBytes"),
+                "disks": vm.get("Disks") or [],
                 "state": (vm.get("State") or ""), "vmid": vm.get("VMId"),
             })
 
@@ -3156,6 +3188,7 @@ def reconcile(data):
             h["vm_cpu"] = vm["cpu"]
             h["vm_mem_bytes"] = vm["mem"]
             h["vm_disk_bytes"] = vm["disk"]
+            h["vm_disks"] = vm["disks"]
             if vm["macs"]:
                 h["vm_mac"] = sorted(vm["macs"])[0]
             h["vm_reason"] = "Hyper-V VM '%s' on %s (%s, by %s)" % (
@@ -3204,6 +3237,7 @@ def reconcile(data):
                 vm["name"], vm["host_name"] or vm["host_ip"], vm["state"]),
             "vm_cpu": vm["cpu"], "vm_mem_bytes": vm["mem"], "vm_state": vm["state"],
             "vm_disk_bytes": vm["disk"],
+            "vm_disks": vm["disks"],
             "vm_mac": (sorted(vm["macs"])[0] if vm["macs"] else ""),
             "vm_ip_source": ip_source, "vm_no_ip_flag": no_ip_flag,
             "ports": [], "interfaces": [], "discovery_methods": ["hyperv-inventory"],
@@ -3417,6 +3451,22 @@ sync_to_netbox() {
             if [[ -n "$vm_ip" && -n "$vmif_id" && "$vmif_id" =~ ^[0-9]+$ ]]; then
                 nb_add_vm_ip "$vm_ip" "$vm_id" "$vmif_id" >/dev/null 2>&1 || true
             fi
+            # Virtual disks: one object per VHD when per-disk sizes are available
+            # (DiskBytes array), else a single disk from the total. NetBox 4.x
+            # aggregates the VM's Disk column from these objects.
+            local _dcount=0 _dbytes
+            while IFS= read -r _dbytes; do
+                [[ -z "$_dbytes" || ! "$_dbytes" =~ ^[0-9]+$ || "$_dbytes" == "0" ]] \
+                    && continue
+                local _dgb=$(( (_dbytes + 1073741823) / 1073741824 ))
+                nb_sync_virtual_disk "$vm_id" "${vm_name}-disk${_dcount}" "$_dgb" \
+                    2>/dev/null || true
+                (( _dcount++ )) || true
+            done < <(echo "$host" | jq -r '.vm_disks[]?' 2>/dev/null || true)
+            if [[ "$_dcount" -eq 0 && -n "$disk_gb" && "$disk_gb" =~ ^[0-9]+$ ]]; then
+                nb_sync_virtual_disk "$vm_id" "${vm_name}-disk0" "$disk_gb" \
+                    2>/dev/null || true
+            fi
             # Custom fields on the VM (open ports + discovery methods), same as
             # devices. Synthesized VMs have no ports but still get the methods.
             local _vp _vdm
@@ -3430,9 +3480,15 @@ sync_to_netbox() {
                 _vcfr=$(nb_patch "virtualization/virtual-machines/${vm_id}/" \
                     "$(jq -n --arg p "$_vp" --arg d "$_vdm" \
                         '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')")
-                echo "$_vcfr" | jq -e '.id' >/dev/null 2>&1 \
-                    || log_error "VM CF patch failed for $vm_name: $(echo "$_vcfr" \
+                if echo "$_vcfr" | jq -e '.id' >/dev/null 2>&1; then
+                    local _vdm_stored
+                    _vdm_stored=$(echo "$_vcfr" | jq -r '.custom_fields.discovery_methods // ""')
+                    [[ -n "$_vdm" && -z "$_vdm_stored" ]] \
+                        && log_error "VM $vm_name: discovery_methods did not persist; stored CF=$(echo "$_vcfr" | jq -c '.custom_fields' 2>/dev/null | head -c 200)"
+                else
+                    log_error "VM CF patch failed for $vm_name: $(echo "$_vcfr" \
                         | jq -c '.custom_fields // .detail // .' 2>/dev/null | head -c 200)"
+                fi
             fi
             printf "${G}OK${NC}\n"; (( ok++ )); continue
         fi
@@ -3652,9 +3708,15 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
             _cfr=$(nb_patch "dcim/devices/${dev_id}/" \
                 "$(jq -n --arg p "$_ports_cf" --arg d "$_dmethods_cf" \
                     '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')")
-            echo "$_cfr" | jq -e '.id' >/dev/null 2>&1 \
-                || log_error "Device CF patch failed for $hn: $(echo "$_cfr" \
+            if echo "$_cfr" | jq -e '.id' >/dev/null 2>&1; then
+                local _dm_stored
+                _dm_stored=$(echo "$_cfr" | jq -r '.custom_fields.discovery_methods // ""')
+                [[ -n "$_dmethods_cf" && -z "$_dm_stored" ]] \
+                    && log_error "Device $hn: discovery_methods did not persist; stored CF=$(echo "$_cfr" | jq -c '.custom_fields' 2>/dev/null | head -c 200)"
+            else
+                log_error "Device CF patch failed for $hn: $(echo "$_cfr" \
                     | jq -c '.custom_fields // .detail // .' 2>/dev/null | head -c 200)"
+            fi
         fi
 
         printf "${G}OK${NC}\n"; (( ok++ ))
