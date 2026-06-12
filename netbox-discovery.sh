@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.6.1
+#  Version: 2.6.2
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.6.1"
+SCRIPT_VERSION="2.6.2"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -679,6 +679,41 @@ nb_add_vm_ip() {
     echo "$ip_id"
 }
 
+# nb_ensure_mac_address <mac> <assigned_object_type> <interface_id>
+# NetBox 4.x models MAC addresses as first-class objects rather than a writable
+# field on the interface (the old mac_address field is ignored on NetBox 4.2+).
+# This finds/creates the MAC object, attaches it to the given (vm)interface, and
+# sets it as that interface's primary_mac_address. Echoes the MAC object id.
+#   assigned_object_type: "dcim.interface" or "virtualization.vminterface"
+nb_ensure_mac_address() {
+    local mac="$1" otype="$2" iface_id="$3"
+    [[ -z "$mac" || "$mac" == "null" ]] && return 0
+    [[ -z "$iface_id" || ! "$iface_id" =~ ^[0-9]+$ ]] && return 0
+    mac=$(printf '%s' "$mac" | tr 'a-f' 'A-F')   # NetBox stores upper-case
+    local enc; enc=$(nb_urlencode "$mac")
+    local res; res=$(nb_get "dcim/mac-addresses/?mac_address=${enc}")
+    local mid; mid=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
+    if [[ -z "$mid" ]]; then
+        local payload
+        payload=$(jq -n --arg m "$mac" --arg t "$otype" --argjson i "$iface_id" \
+            '{mac_address:$m,assigned_object_type:$t,assigned_object_id:$i}')
+        local cr; cr=$(nb_post "dcim/mac-addresses/" "$payload")
+        mid=$(echo "$cr" | jq -r '.id // empty' 2>/dev/null)
+    else
+        nb_patch "dcim/mac-addresses/${mid}/" \
+            "$(jq -n --arg t "$otype" --argjson i "$iface_id" \
+                '{assigned_object_type:$t,assigned_object_id:$i}')" \
+            >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$mid" && "$mid" =~ ^[0-9]+$ ]]; then
+        local ipath="virtualization/interfaces"
+        [[ "$otype" == "dcim.interface" ]] && ipath="dcim/interfaces"
+        nb_patch "${ipath}/${iface_id}/" \
+            "{\"primary_mac_address\":$mid}" >/dev/null 2>&1 || true
+    fi
+    echo "$mid"
+}
+
 nb_add_interface() {
     local device_id="$1" if_name="$2" if_type="${3:-other}" \
           mac="${4:-}" desc="${5:-}"
@@ -692,12 +727,14 @@ nb_add_interface() {
             --argjson dev  "$device_id" \
             --arg     name "$if_name" \
             --arg     type "$if_type" \
-            --arg     mac  "$mac" \
             --arg     desc "$desc" \
-            '{device:$dev,name:$name,type:$type,description:$desc,
-              mac_address:(if $mac!="" and $mac!="null" then $mac else null end)}')
+            '{device:$dev,name:$name,type:$type,description:$desc}')
         local res; res=$(nb_post "dcim/interfaces/" "$payload")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
+    fi
+    # Attach MAC via the object model (NetBox 4.x)
+    if [[ -n "$id" && "$id" =~ ^[0-9]+$ && -n "$mac" && "$mac" != "null" ]]; then
+        nb_ensure_mac_address "$mac" "dcim.interface" "$id" >/dev/null 2>&1 || true
     fi
     echo "$id"
 }
@@ -840,22 +877,42 @@ nb_ensure_custom_field() {
     local res; res=$(nb_get "extras/custom-fields/?name=${enc}")
     local id; id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
     if [[ -z "$id" ]]; then
-        nb_post "extras/custom-fields/" \
+        local cr
+        cr=$(nb_post "extras/custom-fields/" \
             "$(jq -n --arg n "$name" --arg l "$label" --arg t "$type" \
                 --argjson ot "$ot_json" \
-                '{name:$n,label:$l,type:$t,object_types:$ot}')" \
-            >/dev/null 2>&1 || true
+                '{name:$n,label:$l,type:$t,object_types:$ot}')")
+        if echo "$cr" | jq -e '.id' >/dev/null 2>&1; then
+            log_info "Created custom field '$name' (scope: $obj_types)"
+        else
+            log_error "Custom field '$name' create failed: $(echo "$cr" \
+                | jq -c '.object_types // .name // .detail // .' 2>/dev/null \
+                | head -c 200)"
+        fi
     else
-        # Field exists: ensure it is scoped to ALL requested object types so VMs
-        # and devices can both carry the value (NetBox 4 uses object_types).
-        local cur; cur=$(echo "$res" \
-            | jq -c '.results[0].object_types // .results[0].content_types // []')
+        # Field exists: ensure it is scoped to ALL requested object types (additive
+        # only -- never drop an existing scope). Normalize to strings in case the
+        # API returns object_types as objects rather than dotted strings.
+        local cur
+        cur=$(echo "$res" | jq -c \
+            '(.results[0].object_types // .results[0].content_types // [])
+             | map(if type=="object" then
+                   ((.app_label // (.["display"]|split(" | ")[0])) + "." +
+                    (.model // (.["display"]|split(" | ")[1])))
+               else . end)')
+        [[ -z "$cur" || "$cur" == "null" ]] && cur="[]"
         local merged; merged=$(jq -n --argjson a "$cur" --argjson b "$ot_json" \
             '($a + $b) | unique')
         if [[ "$(echo "$merged" | jq -S .)" != "$(echo "$cur" | jq -S .)" ]]; then
-            nb_patch "extras/custom-fields/${id}/" \
-                "$(jq -n --argjson ot "$merged" '{object_types:$ot}')" \
-                >/dev/null 2>&1 || true
+            local pr
+            pr=$(nb_patch "extras/custom-fields/${id}/" \
+                "$(jq -n --argjson ot "$merged" '{object_types:$ot}')")
+            if echo "$pr" | jq -e '.id' >/dev/null 2>&1; then
+                log_info "Custom field '$name' scope -> $(echo "$merged" | jq -c .)"
+            else
+                log_error "Custom field '$name' scope update failed: $(echo "$pr" \
+                    | jq -c '.object_types // .detail // .' 2>/dev/null | head -c 200)"
+            fi
         fi
     fi
 }
@@ -894,7 +951,8 @@ nb_get_or_create_cluster() {
 
 nb_upsert_vm() {
     local name="$1" cluster_id="$2" status="${3:-active}" \
-          vcpus="${4:-}" memory_mb="${5:-}" site_id="${6:-}" comments="${7:-}"
+          vcpus="${4:-}" memory_mb="${5:-}" site_id="${6:-}" comments="${7:-}" \
+          disk_gb="${8:-}"
     local enc; enc=$(nb_urlencode "$name")
     local existing; existing=$(nb_get \
         "virtualization/virtual-machines/?name=${enc}")
@@ -911,6 +969,8 @@ nb_upsert_vm() {
         && payload=$(echo "$payload" | jq ".vcpus=$vcpus")
     [[ -n "$memory_mb" && "$memory_mb" =~ ^[0-9]+$ ]] \
         && payload=$(echo "$payload" | jq ".memory=$memory_mb")
+    [[ -n "$disk_gb"   && "$disk_gb"   =~ ^[0-9]+$ && "$disk_gb" != "0" ]] \
+        && payload=$(echo "$payload" | jq ".disk=$disk_gb")
     [[ -n "$site_id"   && "$site_id"   =~ ^[0-9]+$ ]] \
         && payload=$(echo "$payload" | jq ".site=$site_id")
     if [[ -z "$vm_id" ]]; then
@@ -943,12 +1003,15 @@ nb_add_vm_interface() {
         payload=$(jq -n \
             --argjson vm  "$vm_id" \
             --arg     name "$if_name" \
-            --arg     mac  "$mac" \
             --arg     desc "$desc" \
-            '{virtual_machine:$vm,name:$name,description:$desc,
-              mac_address:(if $mac!="" and $mac!="null" then $mac else null end)}')
+            '{virtual_machine:$vm,name:$name,description:$desc}')
         local res; res=$(nb_post "virtualization/interfaces/" "$payload")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
+    fi
+    # Attach MAC via the object model (NetBox 4.x; mac_address field is ignored)
+    if [[ -n "$id" && "$id" =~ ^[0-9]+$ && -n "$mac" && "$mac" != "null" ]]; then
+        nb_ensure_mac_address "$mac" "virtualization.vminterface" "$id" \
+            >/dev/null 2>&1 || true
     fi
     echo "$id"
 }
@@ -2017,10 +2080,22 @@ Get-VMNetworkAdapter -VMName * 2>$null | ForEach-Object {
 }
 $hvVMs = Get-VM 2>$null | ForEach-Object {
     $vm = $_
+    $dbytes = [int64]0
+    foreach ($dd in (Get-VMHardDiskDrive -VMName $vm.Name 2>$null)) {
+        try {
+            if ($dd.Path -and (Test-Path $dd.Path)) {
+                $vh = Get-VHD -Path $dd.Path -ErrorAction Stop
+                if ($vh -and $vh.Size) { $dbytes += [int64]$vh.Size }
+            }
+        } catch {}
+    }
+    if ($vm.DynamicMemoryEnabled) { $memB = [int64]$vm.MemoryMaximum }
+    else                          { $memB = [int64]$vm.MemoryStartup }
     [ordered]@{ Name=$vm.Name; State="$($vm.State)";
                 Generation=$vm.Generation;
                 ProcessorCount=[int]$vm.ProcessorCount;
-                MemoryStartupBytes=[int64]$vm.MemoryStartup;
+                MemoryStartupBytes=$memB;
+                DiskBytes=$dbytes;
                 VMId="$($vm.VMId)";
                 NetworkAdapters=@($adByVm["$($vm.Name)"]) }
 }
@@ -3029,6 +3104,7 @@ def reconcile(data):
                 "name": vm.get("Name", ""), "host_ip": h["ip"],
                 "host_name": h.get("hostname", ""), "macs": macs, "ips": ips,
                 "cpu": vm.get("ProcessorCount"), "mem": vm.get("MemoryStartupBytes"),
+                "disk": vm.get("DiskBytes"),
                 "state": (vm.get("State") or ""), "vmid": vm.get("VMId"),
             })
 
@@ -3079,6 +3155,9 @@ def reconcile(data):
             h["vm_state"] = vm["state"]
             h["vm_cpu"] = vm["cpu"]
             h["vm_mem_bytes"] = vm["mem"]
+            h["vm_disk_bytes"] = vm["disk"]
+            if vm["macs"]:
+                h["vm_mac"] = sorted(vm["macs"])[0]
             h["vm_reason"] = "Hyper-V VM '%s' on %s (%s, by %s)" % (
                 vm["name"], vm["host_name"] or vm["host_ip"], vm["state"], how)
             matched_keys.add(inst_key(vm))
@@ -3124,6 +3203,8 @@ def reconcile(data):
             "vm_reason": "Hyper-V VM '%s' on %s (%s; inventory)" % (
                 vm["name"], vm["host_name"] or vm["host_ip"], vm["state"]),
             "vm_cpu": vm["cpu"], "vm_mem_bytes": vm["mem"], "vm_state": vm["state"],
+            "vm_disk_bytes": vm["disk"],
+            "vm_mac": (sorted(vm["macs"])[0] if vm["macs"] else ""),
             "vm_ip_source": ip_source, "vm_no_ip_flag": no_ip_flag,
             "ports": [], "interfaces": [], "discovery_methods": ["hyperv-inventory"],
         }
@@ -3301,15 +3382,23 @@ sync_to_netbox() {
         fi
         if [[ "$sync_as" == "vm" ]]; then
             local vm_name vm_cluster vcpus mem_b mem_mb vm_state vm_mac vm_ip
+            local disk_b disk_gb
             vm_name=$(echo "$host"    | jq -r '.vm_name // .hostname // "unknown-vm"')
             vm_cluster=$(echo "$host" | jq -r '.vm_cluster // "Hyper-V"')
             vcpus=$(echo "$host"      | jq -r '.vm_cpu // empty')
             mem_b=$(echo "$host"      | jq -r '.vm_mem_bytes // empty')
+            disk_b=$(echo "$host"     | jq -r '.vm_disk_bytes // empty')
             vm_state=$(echo "$host"   | jq -r '.vm_state // "Running"')
-            vm_mac=$(echo "$host"     | jq -r '.mac // (.interfaces[0].mac // "")')
+            # Prefer the VM's own vNIC MAC (from Hyper-V inventory), then any
+            # MAC resolved for the matched host record.
+            vm_mac=$(echo "$host" | jq -r \
+                '.vm_mac // .mac // (.interfaces[0].mac // "")')
             vm_ip="$ip"; [[ "$vm_ip" == vm:* ]] && vm_ip=""
             if [[ -n "$mem_b" && "$mem_b" =~ ^[0-9]+$ ]]; then
                 mem_mb=$(( mem_b / 1048576 )); else mem_mb=""; fi
+            if [[ -n "$disk_b" && "$disk_b" =~ ^[0-9]+$ && "$disk_b" != "0" ]]; then
+                disk_gb=$(( (disk_b + 1073741823) / 1073741824 ))  # ceil to GB
+            else disk_gb=""; fi
             local vm_status="offline"
             [[ "${vm_state,,}" == "running" ]] && vm_status="active"
             printf "  ${C}[%d/%d]${NC} ${W}%-16s${NC} %-28s %-14s " \
@@ -3320,7 +3409,7 @@ sync_to_netbox() {
             if [[ -z "$cl_id" || ! "$cl_id" =~ ^[0-9]+$ ]]; then
                 printf "${R}FAIL(cluster)${NC}\n"; (( fail++ )); continue; fi
             vm_id=$(nb_upsert_vm "$vm_name" "$cl_id" "$vm_status" \
-                "$vcpus" "$mem_mb" "$site_id" "$comments" 2>>"$LOG_FILE")
+                "$vcpus" "$mem_mb" "$site_id" "$comments" "$disk_gb" 2>>"$LOG_FILE")
             if [[ -z "$vm_id" || ! "$vm_id" =~ ^[0-9]+$ ]]; then
                 printf "${R}FAIL${NC}\n"; (( fail++ )); continue; fi
             vmif_id=$(nb_add_vm_interface "$vm_id" "vNIC" "$vm_mac" \
@@ -3337,10 +3426,13 @@ sync_to_netbox() {
             _vdm=$(echo "$host" | jq -r \
                 '(.discovery_methods // []) | join(", ")' 2>/dev/null || echo "")
             if [[ -n "$_vp" || -n "$_vdm" ]]; then
-                nb_patch "virtualization/virtual-machines/${vm_id}/" \
+                local _vcfr
+                _vcfr=$(nb_patch "virtualization/virtual-machines/${vm_id}/" \
                     "$(jq -n --arg p "$_vp" --arg d "$_vdm" \
-                        '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')" \
-                    >/dev/null 2>&1 || true
+                        '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')")
+                echo "$_vcfr" | jq -e '.id' >/dev/null 2>&1 \
+                    || log_error "VM CF patch failed for $vm_name: $(echo "$_vcfr" \
+                        | jq -c '.custom_fields // .detail // .' 2>/dev/null | head -c 200)"
             fi
             printf "${G}OK${NC}\n"; (( ok++ )); continue
         fi
@@ -3556,10 +3648,13 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
         _dmethods_cf=$(echo "$host" | jq -r \
             '.discovery_methods | join(", ")' 2>/dev/null || echo "")
         if [[ -n "$_ports_cf" || -n "$_dmethods_cf" ]]; then
-            nb_patch "dcim/devices/${dev_id}/" \
+            local _cfr
+            _cfr=$(nb_patch "dcim/devices/${dev_id}/" \
                 "$(jq -n --arg p "$_ports_cf" --arg d "$_dmethods_cf" \
-                    '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')" \
-                >/dev/null 2>&1 || true
+                    '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')")
+            echo "$_cfr" | jq -e '.id' >/dev/null 2>&1 \
+                || log_error "Device CF patch failed for $hn: $(echo "$_cfr" \
+                    | jq -c '.custom_fields // .detail // .' 2>/dev/null | head -c 200)"
         fi
 
         printf "${G}OK${NC}\n"; (( ok++ ))
