@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.6.4
+#  Version: 2.6.5
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.6.4"
+SCRIPT_VERSION="2.6.5"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -892,6 +892,24 @@ nb_create_cable() {
           \"label\":\"$label\"}" >/dev/null 2>&1 || true
 }
 
+# nb_device_by_mac <mac> -> echoes "<device_id> <interface_id>" when an interface
+# carrying that MAC exists in NetBox (via the 4.x mac-addresses object model).
+# Lets LLDP neighbors with no advertised sys_name (only a chassis/port MAC) still
+# be matched to the right device.
+nb_device_by_mac() {
+    local mac; mac=$(printf '%s' "$1" | tr 'a-f' 'A-F' | tr '-' ':')
+    [[ "$mac" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || return 0
+    local enc; enc=$(nb_urlencode "$mac")
+    local r; r=$(nb_get "dcim/mac-addresses/?mac_address=${enc}")
+    local otype oid
+    otype=$(echo "$r" | jq -r '.results[0].assigned_object_type // empty' 2>/dev/null)
+    oid=$(echo "$r"   | jq -r '.results[0].assigned_object_id // empty' 2>/dev/null)
+    [[ "$otype" == "dcim.interface" && "$oid" =~ ^[0-9]+$ ]] || return 0
+    local dev; dev=$(nb_get "dcim/interfaces/${oid}/" \
+        | jq -r '.device.id // empty' 2>/dev/null)
+    [[ "$dev" =~ ^[0-9]+$ ]] && echo "$dev $oid"
+}
+
 # Idempotent custom field creator -- only POSTs if field does not yet exist
 nb_ensure_custom_field() {
     local name="$1" label="$2" type="${3:-text}"
@@ -1736,12 +1754,21 @@ probe_snmp() {
     SNMP_LABEL="$label" python3 /dev/stdin "$tmp/kasanaa_raw.json" > "$tmp/snmp.json" 2>>"$LOG_FILE" <<'PYEOF'
 import json, os, re, sys
 
+k = None
 try:
     with open(sys.argv[1]) as _f:
-        k = json.load(_f)
+        _txt = _f.read()
+    try:
+        k = json.loads(_txt)
+    except Exception:
+        # Tolerate leading/trailing noise (a stray warning/progress line on
+        # stdout broke a whole-file parse for at least one switch). Fall back to
+        # the largest {...} span in the output.
+        _m = re.search(r'\{.*\}', _txt, re.S)
+        k = json.loads(_m.group(0)) if _m else None
 except Exception:
-    print('{"available":false}'); sys.exit(0)
-if not isinstance(k, dict) or 'error' in k:
+    k = None
+if k is None or not isinstance(k, dict) or 'error' in k:
     print('{"available":false}'); sys.exit(0)
 
 label = os.environ.get('SNMP_LABEL', '')
@@ -3417,8 +3444,14 @@ sync_to_netbox() {
     nb_ensure_custom_field "disk_count"    "Disk Count"      "integer" "dcim.device"
     nb_ensure_custom_field "os_version"    "OS Version"      "text"    "dcim.device"
     nb_ensure_custom_field "cpu_model"     "CPU Model"       "text"    "dcim.device"
-    local _di
-    for _di in 0 1 2 3 4 5 6 7; do
+    # Only create as many per-disk field sets as the busiest host actually has
+    # (capped at 8), so we don't litter NetBox with unused disk_N fields.
+    local _maxdisks _di
+    _maxdisks=$(jq '[.hosts[].hw_physical_disks // [] | length] | max // 0' \
+        "$results_file" 2>/dev/null || echo 0)
+    [[ ! "$_maxdisks" =~ ^[0-9]+$ ]] && _maxdisks=0
+    [[ "$_maxdisks" -gt 8 ]] && _maxdisks=8
+    for (( _di=0; _di<_maxdisks; _di++ )); do
         nb_ensure_custom_field "disk_${_di}_size_gb" "Disk ${_di} Size (GB)" \
             "integer" "dcim.device"
         nb_ensure_custom_field "disk_${_di}_media" "Disk ${_di} Media" \
@@ -3732,24 +3765,41 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
             nbr_name=$(echo "$nbr" | jq -r '.sys_name // .device_id // empty')
             nbr_local_port=$(echo "$nbr" | jq -r '.port_id // .remote_port // empty')
             nbr_remote_port=$(echo "$nbr" | jq -r '.port_desc // .remote_port // empty')
-            [[ -z "$nbr_name" ]] && continue
-            local nbr_enc nbr_dev_id
-            nbr_enc=$(nb_urlencode "$nbr_name")
-            nbr_dev_id=$(nb_get "dcim/devices/?name=${nbr_enc}" \
-                | jq -r '.results[0].id // empty' 2>/dev/null || echo "")
+            local nbr_dev_id="" nbr_if_id=""
+            # 1. Match by advertised system name.
+            if [[ -n "$nbr_name" ]]; then
+                local nbr_enc; nbr_enc=$(nb_urlencode "$nbr_name")
+                nbr_dev_id=$(nb_get "dcim/devices/?name=${nbr_enc}" \
+                    | jq -r '.results[0].id // empty' 2>/dev/null || echo "")
+            fi
+            # 2. Fall back to the chassis/port MAC (LLDP entries with no sys_name
+            #    carry only a MAC). Reuse the existing NetBox interface that owns
+            #    that MAC as the far-end termination.
+            if [[ -z "$nbr_dev_id" || ! "$nbr_dev_id" =~ ^[0-9]+$ ]]; then
+                local _mg; _mg=$(echo "$nbr" | jq -r \
+                    '.chassis_id // .port_id // empty')
+                if [[ "$_mg" =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]]; then
+                    local _dm; _dm=$(nb_device_by_mac "$_mg")
+                    nbr_dev_id=$(echo "$_dm" | awk '{print $1}')
+                    nbr_if_id=$(echo "$_dm" | awk '{print $2}')
+                fi
+            fi
             [[ -z "$nbr_dev_id" || ! "$nbr_dev_id" =~ ^[0-9]+$ ]] && continue
-            local local_if_id nbr_if_id
+            local local_if_id
             local_if_id=$(nb_add_interface "$dev_id" \
-                "${nbr_local_port:-to-$nbr_name}" "other" "" \
-                "Topology link to $nbr_name" 2>/dev/null) || true
-            nbr_if_id=$(nb_add_interface "$nbr_dev_id" \
-                "${nbr_remote_port:-to-$hn}" "other" "" \
-                "Topology link to $hn" 2>/dev/null) || true
+                "${nbr_local_port:-to-${nbr_name:-$nbr_dev_id}}" "other" "" \
+                "Topology link" 2>/dev/null) || true
+            # If MAC match didn't already give us the far interface, create one.
+            if [[ -z "$nbr_if_id" || ! "$nbr_if_id" =~ ^[0-9]+$ ]]; then
+                nbr_if_id=$(nb_add_interface "$nbr_dev_id" \
+                    "${nbr_remote_port:-to-$hn}" "other" "" \
+                    "Topology link to $hn" 2>/dev/null) || true
+            fi
             [[ -z "$local_if_id" || ! "$local_if_id" =~ ^[0-9]+$ ]] && continue
             [[ -z "$nbr_if_id"   || ! "$nbr_if_id"   =~ ^[0-9]+$ ]] && continue
             nb_create_cable "$local_if_id" "$nbr_if_id" \
-                "$hn <-> $nbr_name" >/dev/null 2>&1 || true
-            log_info "Cable: $hn <-> $nbr_name"
+                "$hn <-> ${nbr_name:-$nbr_dev_id}" >/dev/null 2>&1 || true
+            log_info "Cable: $hn <-> ${nbr_name:-mac:$nbr_dev_id}"
         done < <({
             echo "$host" | jq -c '.lldp_neighbors[]?' 2>/dev/null
             echo "$host" | jq -c '.cdp_neighbors[]?'  2>/dev/null
