@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.13
+#  Version: 2.5.14
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.13"
+SCRIPT_VERSION="2.5.14"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -4957,11 +4957,13 @@ param([string]$OutFile = "")
 $ErrorActionPreference = "SilentlyContinue"
 
 function _trim($s) { if ($null -ne $s) { ([string]$s).Trim() } else { "" } }
+function _firstNonEmpty { foreach ($a in $args) { $t = _trim $a; if ($t) { return $t } }; return "" }
 
 # ---- Host hardware + physical NICs (identical to the WinRM PS_BASE probe) ----
 $cs   = Get-CimInstance Win32_ComputerSystem  2>$null
 $os   = Get-CimInstance Win32_OperatingSystem 2>$null
 $bios = Get-CimInstance Win32_BIOS            2>$null
+$bb   = Get-CimInstance Win32_BaseBoard       2>$null
 $cpu  = Get-CimInstance Win32_Processor 2>$null | Select-Object -First 1
 $nics = Get-NetAdapter -Physical 2>$null | Where-Object { $_.Status -eq "Up" } |
         ForEach-Object {
@@ -4998,8 +5000,9 @@ try {
     }
 } catch {}
 $hostObj = [ordered]@{ Hostname=$cs.Name; Domain=$cs.Domain;
-            Manufacturer=(_trim $cs.Manufacturer);
-            Model=(_trim $cs.Model); SerialNumber=(_trim $bios.SerialNumber);
+            Manufacturer=(_firstNonEmpty $cs.Manufacturer $bb.Manufacturer);
+            Model=(_firstNonEmpty $cs.Model $bb.Product);
+            SerialNumber=(_firstNonEmpty $bios.SerialNumber $bb.SerialNumber);
             OS=$os.Caption;
             OSVersion=$os.Version; IsServer=($os.ProductType -ne 1);
             IsHyperV=$isHyperV;
@@ -5067,7 +5070,7 @@ if ($isHyperV) {
 
 # ---- Merge + emit (single JSON; no NetBox, no WinRM) ----
 $payload = [ordered]@{
-    CollectorVersion = "1.1"
+    CollectorVersion = "1.2"
     CollectedAt      = (Get-Date).ToString("o")
     Host             = $hostObj
     HyperVVMs        = @($hvVMs)
