@@ -1,3 +1,54 @@
+#  Changelog v2.5.12 (standalone collector for WinRM-closed machines):
+#   - Added generate_collector_script() + Import menu option 8. Emits a
+#     standalone, READ-ONLY netbox-collector.ps1 that runs on ANY Windows
+#     machine (workstation or Hyper-V host) with NO WinRM and NO NetBox access,
+#     and writes ONE merged JSON file (host hardware + physical disks + NICs/IPs,
+#     and -- if Hyper-V -- VMs with vCPU/memory/disks/NIC MACs + neighbor table).
+#   - Motivation: Windows workstations generally do not (and should not) have
+#     WinRM open, so the WinRM probes can never reach them. The standalone script
+#     is hand-carried to those hosts, run locally, and the resulting JSON is
+#     brought back and ingested -- the same data path that 2.5.9's "save PS1 for
+#     manual execution" mode provided, but collect-only (no NetBox writes).
+#   - Uses the EXACT PS_BASE + PS_HYPERV collection bodies (validated byte-for-
+#     byte against the embedded source), so a host collected by hand and one
+#     collected over WinRM produce identical JSON. Cmdlets are all Get-* only;
+#     zero writes. Purely additive: sync_to_netbox, import_hyperv_powershell,
+#     merge_host_data and probe_ssh are untouched.
+#   - This is step 1 of the single-writer re-architecture: collector emits JSON
+#     -> (next) import path + reconciler consumption -> (next) sync_to_netbox
+#     consumes the reconciled model and the PS1's direct NetBox writes retire.
+#
+#  Changelog v2.5.11 (enrich the read-only WinRM collector -- collection only):
+#   - PS_HYPERV: fixed the latent memory bug ($vm.MemoryStartupBytes always 0)
+#     with a dynamic-memory-aware value (MemoryMaximum when DynamicMemoryEnabled,
+#     else MemoryStartup), and added per-VM disk collection via Get-VMHardDiskDrive
+#     + Get-VHD (DiskBytes total + Disks[] array).
+#   - PS_BASE: added host PhysicalDisks via Get-PhysicalDisk (fallback
+#     Win32_DiskDrive) -- each {SizeGB, Media, Interface} -- plus
+#     LogicalProcessors from Win32_ComputerSystem.
+#   - These enrich the read-only winrm.json only. In 2.5.9 the PS_HYPERV/PS_BASE
+#     output feeds the reconciler/preview, NOT the live NetBox writes (those come
+#     from the host-side PS1), so this changes nothing about current sync
+#     behaviour -- it just makes the collected JSON complete for the upcoming
+#     single-writer wiring. Encoded PS_BASE/PS_HYPERV remain < 8191 (WinRM cap).
+#
+#  Changelog v2.5.10 (reverted to 2.5.9 baseline; isolated cable fix):
+#   - Reverted the entire 2.6.x line (Phase C rewrite) after it caused a
+#     cascade of regressions. 2.5.9 is the known-good base (working host-side
+#     PS1, correct switch ID + Hyper-V hardware, SNMP ARP harvesting).
+#   - LLDP/CDP cable fix (isolated): a neighbor's advertised port_id/port_desc
+#     is the REMOTE device's port, not ours. It was being used to name the
+#     LOCAL interface, so e.g. laundry-sw's 'g4' was added onto mancave-sw.
+#     Now the advertised port terminates on the REMOTE device, and the local
+#     side is a descriptive 'uplink-<neighbor>' (the container LLDP data does
+#     not include our own local port; resolving it precisely needs the
+#     SNMP LLDP-MIB local-port walk, deferred to a separate step).
+#   - KNOWN/OPEN (next, by design): sync_to_netbox still syncs RAW results,
+#     not the reconciled model, so .2 is not folded into .253 and the PS1
+#     writes VMs on an uncoordinated path (no VM IPs, no device/VM dedup).
+#     Planned fix: PS1 emits a JSON payload (read-only) pulled via WinRM and
+#     fed to the reconciler, with a single coordinated writer.
+#
 #  Changelog v2.6.6 (correct LLDP cabling + multiple collection fallbacks):
 #   ROOT CAUSE of the mis-assigned cable: an LLDP neighbor's advertised
 #   port_id is the REMOTE device's port (e.g. laundry-sw's 'g4'), but the
