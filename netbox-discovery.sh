@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.12
+#  Version: 2.5.13
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.12"
+SCRIPT_VERSION="2.5.13"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -4956,6 +4956,8 @@ generate_collector_script() {
 param([string]$OutFile = "")
 $ErrorActionPreference = "SilentlyContinue"
 
+function _trim($s) { if ($null -ne $s) { ([string]$s).Trim() } else { "" } }
+
 # ---- Host hardware + physical NICs (identical to the WinRM PS_BASE probe) ----
 $cs   = Get-CimInstance Win32_ComputerSystem  2>$null
 $os   = Get-CimInstance Win32_OperatingSystem 2>$null
@@ -4968,8 +4970,14 @@ $nics = Get-NetAdapter -Physical 2>$null | Where-Object { $_.Status -eq "Up" } |
                   Where-Object { $_.AddressFamily -eq "IPv4" -and $_.IPAddress -ne "127.0.0.1" }
             [ordered]@{ Name=$if.Name; Description=$if.InterfaceDescription;
                         MacAddress=($if.MacAddress -replace "-",":").ToUpper();
-                        IPAddresses=@($v4.IPAddress); PrefixLens=@([int[]]$v4.PrefixLength) }
+                        IPAddresses=@(@($v4.IPAddress) | Where-Object { $_ });
+                        PrefixLens=@(@($v4.PrefixLength) | Where-Object { $null -ne $_ }) }
         }
+# Host-level IPv4s across ALL adapters (incl. Hyper-V vEthernet, where the
+# management IP usually lives) -- the physical NIC alone often has none.
+$hostIPs = @(Get-NetIPAddress -AddressFamily IPv4 2>$null |
+    Where-Object { $_.IPAddress -ne "127.0.0.1" -and $_.IPAddress -notlike "169.254.*" } |
+    Select-Object -ExpandProperty IPAddress -Unique)
 $isHyperV = $false
 try { $isHyperV = ($null -ne (Get-Command Get-VM -ErrorAction SilentlyContinue)) } catch {}
 $pdisks = @()
@@ -4989,13 +4997,16 @@ try {
         }
     }
 } catch {}
-$hostObj = [ordered]@{ Hostname=$cs.Name; Domain=$cs.Domain; Manufacturer=$cs.Manufacturer;
-            Model=$cs.Model; SerialNumber=$bios.SerialNumber; OS=$os.Caption;
+$hostObj = [ordered]@{ Hostname=$cs.Name; Domain=$cs.Domain;
+            Manufacturer=(_trim $cs.Manufacturer);
+            Model=(_trim $cs.Model); SerialNumber=(_trim $bios.SerialNumber);
+            OS=$os.Caption;
             OSVersion=$os.Version; IsServer=($os.ProductType -ne 1);
             IsHyperV=$isHyperV;
-            CPUName=$cpu.Name; CPUCores=[int]$cpu.NumberOfCores;
+            CPUName=(_trim $cpu.Name); CPUCores=[int]$cpu.NumberOfCores;
             LogicalProcessors=[int]$cs.NumberOfLogicalProcessors;
             MemoryGB=[math]::Round($cs.TotalPhysicalMemory/1GB,2);
+            IPv4Addresses=@($hostIPs);
             PhysicalDisks=@($pdisks);
             NetworkAdapters=@($nics) }
 
@@ -5010,7 +5021,7 @@ if ($isHyperV) {
         if (-not $adByVm.ContainsKey($k)) { $adByVm[$k] = @() }
         $adByVm[$k] += [ordered]@{ Name=$_.Name; MacAddress=$m;
                                    SwitchName=$_.SwitchName;
-                                   IPAddresses=@($_.IPAddresses) }
+                                   IPAddresses=@(@($_.IPAddresses) | Where-Object { $_ }) }
     }
     $hvVMs = Get-VM 2>$null | ForEach-Object {
         $vm = $_
@@ -5035,9 +5046,19 @@ if ($isHyperV) {
                     VMId="$($vm.VMId)";
                     NetworkAdapters=@($adByVm["$($vm.Name)"]) }
     }
+    # Neighbor (ARP) table -- unicast only. Drop broadcast/multicast so the
+    # reconciler gets clean IP<->MAC pairs for resolving VM/host IPs.
     $neighbors = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.State -in 'Reachable','Stale','Permanent' -and
-                       $_.LinkLayerAddress -match '^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$' } |
+        Where-Object {
+            $_.State -in 'Reachable','Stale','Permanent' -and
+            $_.LinkLayerAddress -match '^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$' -and
+            $_.LinkLayerAddress -ne 'FF-FF-FF-FF-FF-FF' -and
+            $_.LinkLayerAddress -notmatch '^01-00-5E' -and
+            $_.LinkLayerAddress -notmatch '^33-33' -and
+            $_.IPAddress -notmatch '^(22[4-9]|23[0-9])\.' -and
+            $_.IPAddress -notlike '*.255' -and
+            $_.IPAddress -ne '255.255.255.255'
+        } |
         ForEach-Object {
             [ordered]@{ IP="$($_.IPAddress)";
                         MAC=($_.LinkLayerAddress -replace '-',':').ToLower() }
@@ -5046,7 +5067,7 @@ if ($isHyperV) {
 
 # ---- Merge + emit (single JSON; no NetBox, no WinRM) ----
 $payload = [ordered]@{
-    CollectorVersion = "1.0"
+    CollectorVersion = "1.1"
     CollectedAt      = (Get-Date).ToString("o")
     Host             = $hostObj
     HyperVVMs        = @($hvVMs)
@@ -5059,12 +5080,15 @@ if (-not $OutFile) {
     if ($desk -and (Test-Path $desk)) { $OutFile = Join-Path $desk $base }
     else { $OutFile = Join-Path $env:TEMP $base }
 }
-$json | Out-File -FilePath $OutFile -Encoding UTF8
+# Write UTF-8 WITHOUT BOM (Out-File -Encoding UTF8 emits a BOM that breaks
+# strict JSON parsers).
+[System.IO.File]::WriteAllText($OutFile, $json, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host ""
 Write-Host "NetBox collector JSON written to:"
 Write-Host "  $OutFile"
 Write-Host ""
 Write-Host "Copy this file back to the netbox-discovery host and import it."
+
 COLLECTEOF
     chmod 0644 "$dest" 2>/dev/null
     log_ok "Standalone collector written: $dest"
