@@ -1,3 +1,19 @@
+#  Changelog v2.5.13 (collector data-quality fixes from first live JSON):
+#   Verified against real SERVER01 + INTEL-NUC collector output; fixed:
+#   - UTF-8 BOM: Out-File -Encoding UTF8 prepended a BOM that breaks strict
+#     JSON parsers. Now writes BOM-less UTF-8 via .NET WriteAllText.
+#   - Host management IP was missing: on Hyper-V hosts the mgmt IP sits on a
+#     vEthernet adapter, but only -Physical NICs were read. Added host-level
+#     IPv4Addresses gathered across ALL adapters (loopback/169.254 excluded).
+#   - IPAddresses:[null] artifact -> empty array when a NIC has no IPv4.
+#   - NeighborTable noise: dropped broadcast/multicast (ff:ff.., 01:00:5e..,
+#     33:33.., 224-239.x, *.255) so only real unicast IP<->MAC pairs remain
+#     (these resolve VM/host IPs the guests don't self-report).
+#   - Whitespace hardware fields (e.g. NUC returns 33 spaces) trimmed to empty
+#     so no junk Manufacturer/Model/Serial/device-types are created.
+#   CollectorVersion bumped to 1.1. Same fixes will be mirrored into the WinRM
+#   PS_BASE/PS_HYPERV probes when the reconciler is wired to consume this data.
+#
 #  Changelog v2.5.12 (standalone collector for WinRM-closed machines):
 #   - Added generate_collector_script() + Import menu option 8. Emits a
 #     standalone, READ-ONLY netbox-collector.ps1 that runs on ANY Windows
