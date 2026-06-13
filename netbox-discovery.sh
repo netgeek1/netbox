@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.6.6
+#  Version: 2.5.12
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.6.6"
+SCRIPT_VERSION="2.5.12"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -648,98 +648,6 @@ nb_add_ip() {
     echo "$ip_id"
 }
 
-# nb_add_vm_ip <ip> <vm_id> <vm_interface_id> -- assign an IP to a VM interface
-# (assigned_object_type=virtualization.vminterface) and set the VM primary_ip4.
-# Devices use nb_add_ip (dcim.interface); VMs need this distinct object type.
-nb_add_vm_ip() {
-    local ip="$1" vm_id="${2:-}" vmif_id="${3:-}"
-    [[ -z "$ip" || "$ip" == vm:* ]] && return 0
-    [[ "$ip" != */* ]] && ip="${ip}/32"
-    local enc; enc=$(nb_urlencode "$ip")
-    local existing; existing=$(nb_get "ipam/ip-addresses/?address=${enc}")
-    local ip_id; ip_id=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
-    local payload
-    payload=$(jq -n --arg addr "$ip" '{address:$addr,status:"active"}')
-    if [[ -n "$vmif_id" && "$vmif_id" =~ ^[0-9]+$ ]]; then
-        payload=$(echo "$payload" | jq \
-            ".assigned_object_type=\"virtualization.vminterface\" \
-             | .assigned_object_id=$vmif_id")
-    fi
-    if [[ -z "$ip_id" ]]; then
-        local res; res=$(nb_post "ipam/ip-addresses/" "$payload")
-        ip_id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
-    else
-        nb_patch "ipam/ip-addresses/${ip_id}/" "$payload" >/dev/null 2>&1 || true
-    fi
-    if [[ -n "$vm_id" && "$vm_id" =~ ^[0-9]+$ \
-          && -n "$ip_id" && "$ip_id" =~ ^[0-9]+$ ]]; then
-        nb_patch "virtualization/virtual-machines/${vm_id}/" \
-            "{\"primary_ip4\":$ip_id}" >/dev/null 2>&1 || true
-    fi
-    echo "$ip_id"
-}
-
-# nb_sync_virtual_disk <vm_id> <name> <size_gb>
-# Create/update a NetBox virtual disk. NetBox 4.x aggregates the VM's total disk
-# from these objects, so the VM "Disk" column only populates when they exist.
-# size is in GB to match the historical importer behavior.
-nb_sync_virtual_disk() {
-    local vm_id="$1" name="$2" size_gb="$3"
-    [[ -z "$vm_id"  || ! "$vm_id"  =~ ^[0-9]+$ ]] && return 0
-    [[ -z "$size_gb" || ! "$size_gb" =~ ^[0-9]+$ || "$size_gb" == "0" ]] && return 0
-    local enc; enc=$(nb_urlencode "$name")
-    local existing; existing=$(nb_get \
-        "virtualization/virtual-disks/?virtual_machine_id=${vm_id}&name=${enc}")
-    local did; did=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
-    local payload
-    payload=$(jq -n --arg n "$name" --argjson vm "$vm_id" --argjson s "$size_gb" \
-        '{name:$n,virtual_machine:$vm,size:$s}')
-    local resp
-    if [[ -z "$did" ]]; then
-        resp=$(nb_post "virtualization/virtual-disks/" "$payload")
-    else
-        resp=$(nb_patch "virtualization/virtual-disks/${did}/" "$payload")
-    fi
-    echo "$resp" | jq -e '.id' >/dev/null 2>&1 \
-        || log_error "Virtual disk '$name' sync failed: $(echo "$resp" \
-            | jq -c '.size // .detail // .' 2>/dev/null | head -c 160)"
-}
-
-# nb_ensure_mac_address <mac> <assigned_object_type> <interface_id>
-# NetBox 4.x models MAC addresses as first-class objects rather than a writable
-# field on the interface (the old mac_address field is ignored on NetBox 4.2+).
-# This finds/creates the MAC object, attaches it to the given (vm)interface, and
-# sets it as that interface's primary_mac_address. Echoes the MAC object id.
-#   assigned_object_type: "dcim.interface" or "virtualization.vminterface"
-nb_ensure_mac_address() {
-    local mac="$1" otype="$2" iface_id="$3"
-    [[ -z "$mac" || "$mac" == "null" ]] && return 0
-    [[ -z "$iface_id" || ! "$iface_id" =~ ^[0-9]+$ ]] && return 0
-    mac=$(printf '%s' "$mac" | tr 'a-f' 'A-F')   # NetBox stores upper-case
-    local enc; enc=$(nb_urlencode "$mac")
-    local res; res=$(nb_get "dcim/mac-addresses/?mac_address=${enc}")
-    local mid; mid=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
-    if [[ -z "$mid" ]]; then
-        local payload
-        payload=$(jq -n --arg m "$mac" --arg t "$otype" --argjson i "$iface_id" \
-            '{mac_address:$m,assigned_object_type:$t,assigned_object_id:$i}')
-        local cr; cr=$(nb_post "dcim/mac-addresses/" "$payload")
-        mid=$(echo "$cr" | jq -r '.id // empty' 2>/dev/null)
-    else
-        nb_patch "dcim/mac-addresses/${mid}/" \
-            "$(jq -n --arg t "$otype" --argjson i "$iface_id" \
-                '{assigned_object_type:$t,assigned_object_id:$i}')" \
-            >/dev/null 2>&1 || true
-    fi
-    if [[ -n "$mid" && "$mid" =~ ^[0-9]+$ ]]; then
-        local ipath="virtualization/interfaces"
-        [[ "$otype" == "dcim.interface" ]] && ipath="dcim/interfaces"
-        nb_patch "${ipath}/${iface_id}/" \
-            "{\"primary_mac_address\":$mid}" >/dev/null 2>&1 || true
-    fi
-    echo "$mid"
-}
-
 nb_add_interface() {
     local device_id="$1" if_name="$2" if_type="${3:-other}" \
           mac="${4:-}" desc="${5:-}"
@@ -753,14 +661,12 @@ nb_add_interface() {
             --argjson dev  "$device_id" \
             --arg     name "$if_name" \
             --arg     type "$if_type" \
+            --arg     mac  "$mac" \
             --arg     desc "$desc" \
-            '{device:$dev,name:$name,type:$type,description:$desc}')
+            '{device:$dev,name:$name,type:$type,description:$desc,
+              mac_address:(if $mac!="" and $mac!="null" then $mac else null end)}')
         local res; res=$(nb_post "dcim/interfaces/" "$payload")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
-    fi
-    # Attach MAC via the object model (NetBox 4.x)
-    if [[ -n "$id" && "$id" =~ ^[0-9]+$ && -n "$mac" && "$mac" != "null" ]]; then
-        nb_ensure_mac_address "$mac" "dcim.interface" "$id" >/dev/null 2>&1 || true
     fi
     echo "$id"
 }
@@ -892,72 +798,18 @@ nb_create_cable() {
           \"label\":\"$label\"}" >/dev/null 2>&1 || true
 }
 
-# nb_device_by_mac <mac> -> echoes "<device_id> <interface_id>" when an interface
-# carrying that MAC exists in NetBox (via the 4.x mac-addresses object model).
-# Lets LLDP neighbors with no advertised sys_name (only a chassis/port MAC) still
-# be matched to the right device.
-nb_device_by_mac() {
-    local mac; mac=$(printf '%s' "$1" | tr 'a-f' 'A-F' | tr '-' ':')
-    [[ "$mac" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || return 0
-    local enc; enc=$(nb_urlencode "$mac")
-    local r; r=$(nb_get "dcim/mac-addresses/?mac_address=${enc}")
-    local otype oid
-    otype=$(echo "$r" | jq -r '.results[0].assigned_object_type // empty' 2>/dev/null)
-    oid=$(echo "$r"   | jq -r '.results[0].assigned_object_id // empty' 2>/dev/null)
-    [[ "$otype" == "dcim.interface" && "$oid" =~ ^[0-9]+$ ]] || return 0
-    local dev; dev=$(nb_get "dcim/interfaces/${oid}/" \
-        | jq -r '.device.id // empty' 2>/dev/null)
-    [[ "$dev" =~ ^[0-9]+$ ]] && echo "$dev $oid"
-}
-
 # Idempotent custom field creator -- only POSTs if field does not yet exist
 nb_ensure_custom_field() {
-    local name="$1" label="$2" type="${3:-text}"
-    local obj_types="${4:-dcim.device}"
-    # obj_types is a comma-separated list -> JSON array
-    local ot_json; ot_json=$(printf '%s' "$obj_types" \
-        | jq -R 'split(",") | map(select(length>0))')
+    local name="$1" label="$2" type="${3:-text}" obj_types="${4:-dcim.device}"
     local enc; enc=$(nb_urlencode "$name")
     local res; res=$(nb_get "extras/custom-fields/?name=${enc}")
     local id; id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
     if [[ -z "$id" ]]; then
-        local cr
-        cr=$(nb_post "extras/custom-fields/" \
+        nb_post "extras/custom-fields/" \
             "$(jq -n --arg n "$name" --arg l "$label" --arg t "$type" \
-                --argjson ot "$ot_json" \
-                '{name:$n,label:$l,type:$t,object_types:$ot}')")
-        if echo "$cr" | jq -e '.id' >/dev/null 2>&1; then
-            log_info "Created custom field '$name' (scope: $obj_types)"
-        else
-            log_error "Custom field '$name' create failed: $(echo "$cr" \
-                | jq -c '.object_types // .name // .detail // .' 2>/dev/null \
-                | head -c 200)"
-        fi
-    else
-        # Field exists: ensure it is scoped to ALL requested object types (additive
-        # only -- never drop an existing scope). Normalize to strings in case the
-        # API returns object_types as objects rather than dotted strings.
-        local cur
-        cur=$(echo "$res" | jq -c \
-            '(.results[0].object_types // .results[0].content_types // [])
-             | map(if type=="object" then
-                   ((.app_label // (.["display"]|split(" | ")[0])) + "." +
-                    (.model // (.["display"]|split(" | ")[1])))
-               else . end)')
-        [[ -z "$cur" || "$cur" == "null" ]] && cur="[]"
-        local merged; merged=$(jq -n --argjson a "$cur" --argjson b "$ot_json" \
-            '($a + $b) | unique')
-        if [[ "$(echo "$merged" | jq -S .)" != "$(echo "$cur" | jq -S .)" ]]; then
-            local pr
-            pr=$(nb_patch "extras/custom-fields/${id}/" \
-                "$(jq -n --argjson ot "$merged" '{object_types:$ot}')")
-            if echo "$pr" | jq -e '.id' >/dev/null 2>&1; then
-                log_info "Custom field '$name' scope -> $(echo "$merged" | jq -c .)"
-            else
-                log_error "Custom field '$name' scope update failed: $(echo "$pr" \
-                    | jq -c '.object_types // .detail // .' 2>/dev/null | head -c 200)"
-            fi
-        fi
+                --argjson ot "[\"$obj_types\"]" \
+                '{name:$n,label:$l,type:$t,object_types:$ot}')" \
+            >/dev/null 2>&1 || true
     fi
 }
 
@@ -995,8 +847,7 @@ nb_get_or_create_cluster() {
 
 nb_upsert_vm() {
     local name="$1" cluster_id="$2" status="${3:-active}" \
-          vcpus="${4:-}" memory_mb="${5:-}" site_id="${6:-}" comments="${7:-}" \
-          disk_gb="${8:-}"
+          vcpus="${4:-}" memory_mb="${5:-}" site_id="${6:-}" comments="${7:-}"
     local enc; enc=$(nb_urlencode "$name")
     local existing; existing=$(nb_get \
         "virtualization/virtual-machines/?name=${enc}")
@@ -1013,8 +864,6 @@ nb_upsert_vm() {
         && payload=$(echo "$payload" | jq ".vcpus=$vcpus")
     [[ -n "$memory_mb" && "$memory_mb" =~ ^[0-9]+$ ]] \
         && payload=$(echo "$payload" | jq ".memory=$memory_mb")
-    [[ -n "$disk_gb"   && "$disk_gb"   =~ ^[0-9]+$ && "$disk_gb" != "0" ]] \
-        && payload=$(echo "$payload" | jq ".disk=$disk_gb")
     [[ -n "$site_id"   && "$site_id"   =~ ^[0-9]+$ ]] \
         && payload=$(echo "$payload" | jq ".site=$site_id")
     if [[ -z "$vm_id" ]]; then
@@ -1047,15 +896,12 @@ nb_add_vm_interface() {
         payload=$(jq -n \
             --argjson vm  "$vm_id" \
             --arg     name "$if_name" \
+            --arg     mac  "$mac" \
             --arg     desc "$desc" \
-            '{virtual_machine:$vm,name:$name,description:$desc}')
+            '{virtual_machine:$vm,name:$name,description:$desc,
+              mac_address:(if $mac!="" and $mac!="null" then $mac else null end)}')
         local res; res=$(nb_post "virtualization/interfaces/" "$payload")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
-    fi
-    # Attach MAC via the object model (NetBox 4.x; mac_address field is ignored)
-    if [[ -n "$id" && "$id" =~ ^[0-9]+$ && -n "$mac" && "$mac" != "null" ]]; then
-        nb_ensure_mac_address "$mac" "virtualization.vminterface" "$id" \
-            >/dev/null 2>&1 || true
     fi
     echo "$id"
 }
@@ -1084,20 +930,6 @@ _snmp_walk() {
             -t "$tout" -r 1 "$ip" "$oid" 2>/dev/null || true
     else
         snmpwalk -v2c -c "$tok" -t "$tout" -r 1 "$ip" "$oid" 2>/dev/null || true
-    fi
-}
-
-# Numeric-OID variant (-On -Oe): emits raw numeric OIDs so table indexes can be
-# parsed positionally (needed for the LLDP-MIB local-port mapping).
-_snmp_walk_n() {
-    local ip="$1" tok="$2" tout="$3" oid="$4"
-    if [[ "$tok" == v3:* ]]; then
-        local IFS=':'; read -r _ u ap ap2 pp pp2 <<< "$tok"
-        snmpwalk -On -v3 -u "$u" -l authPriv \
-            -a "$ap" -A "$ap2" -x "$pp" -X "$pp2" \
-            -t "$tout" -r 1 "$ip" "$oid" 2>/dev/null || true
-    else
-        snmpwalk -On -v2c -c "$tok" -t "$tout" -r 1 "$ip" "$oid" 2>/dev/null || true
     fi
 }
 
@@ -1768,21 +1600,12 @@ probe_snmp() {
     SNMP_LABEL="$label" python3 /dev/stdin "$tmp/kasanaa_raw.json" > "$tmp/snmp.json" 2>>"$LOG_FILE" <<'PYEOF'
 import json, os, re, sys
 
-k = None
 try:
     with open(sys.argv[1]) as _f:
-        _txt = _f.read()
-    try:
-        k = json.loads(_txt)
-    except Exception:
-        # Tolerate leading/trailing noise (a stray warning/progress line on
-        # stdout broke a whole-file parse for at least one switch). Fall back to
-        # the largest {...} span in the output.
-        _m = re.search(r'\{.*\}', _txt, re.S)
-        k = json.loads(_m.group(0)) if _m else None
+        k = json.load(_f)
 except Exception:
-    k = None
-if k is None or not isinstance(k, dict) or 'error' in k:
+    print('{"available":false}'); sys.exit(0)
+if not isinstance(k, dict) or 'error' in k:
     print('{"available":false}'); sys.exit(0)
 
 label = os.environ.get('SNMP_LABEL', '')
@@ -1931,61 +1754,6 @@ for ln in lines:
 print(json.dumps({'arp_table': [{'ip': k, 'mac': v} for k, v in arp.items()]}))
 ARPEOF
     fi
-
-    # Supplementary LLDP-MIB walk to recover the LOCAL port of each neighbor --
-    # the one thing the KaSaNaa container drops (it reports only the remote
-    # sys-name/port). lldpRemTable rows are indexed by
-    # .timeMark.localPortNum.remIndex; lldpLocPortId/Desc map localPortNum -> a
-    # human port name. Numeric OIDs so the index parses positionally. Read-only,
-    # best-effort: a switch without the LLDP-MIB simply yields nothing and we
-    # fall back to the container's remote-only data.
-    if [[ -n "$_snmp_tok" ]]; then
-        { _snmp_walk_n "$ip" "$_snmp_tok" 5 "1.0.8802.1.1.2.1.4.1.1.9"
-          _snmp_walk_n "$ip" "$_snmp_tok" 5 "1.0.8802.1.1.2.1.4.1.1.7"
-          _snmp_walk_n "$ip" "$_snmp_tok" 5 "1.0.8802.1.1.2.1.4.1.1.5"
-          _snmp_walk_n "$ip" "$_snmp_tok" 5 "1.0.8802.1.1.2.1.3.7.1.3"
-          _snmp_walk_n "$ip" "$_snmp_tok" 5 "1.0.8802.1.1.2.1.3.7.1.4"
-        } > "$tmp/lldp_walk.txt" 2>/dev/null || true
-        python3 /dev/stdin "$tmp/lldp_walk.txt" > "$tmp/snmp_lldp.json" 2>/dev/null <<'LLDPEOF'
-import json, re, sys
-rem_name, rem_port, rem_chassis, loc_port = {}, {}, {}, {}
-try:
-    lines = open(sys.argv[1]).read().splitlines()
-except Exception:
-    lines = []
-def parse(ln):
-    m = re.match(r'\.?([\d.]+)\s*=\s*(?:Hex-STRING|STRING|INTEGER|'
-                 r'Network Address|OID|IpAddress):?\s*(.*)$', ln)
-    if not m:
-        m = re.match(r'\.?([\d.]+)\s*=\s*"?(.*?)"?$', ln)
-    return (m.group(1).lstrip('.'), m.group(2).strip().strip('"')) if m else (None, None)
-def hexmac(s):
-    h = re.findall(r'[0-9A-Fa-f]{2}', s or '')
-    return ':'.join(x.lower() for x in h) if len(h) == 6 else ''
-B = {'name': '1.0.8802.1.1.2.1.4.1.1.9.', 'port': '1.0.8802.1.1.2.1.4.1.1.7.',
-     'chas': '1.0.8802.1.1.2.1.4.1.1.5.', 'loc': '1.0.8802.1.1.2.1.3.7.1.3.',
-     'locd': '1.0.8802.1.1.2.1.3.7.1.4.'}
-for ln in lines:
-    oid, v = parse(ln)
-    if not oid:
-        continue
-    if   oid.startswith(B['name']): rem_name[oid[len(B['name']):]] = v
-    elif oid.startswith(B['port']): rem_port[oid[len(B['port']):]] = v
-    elif oid.startswith(B['chas']): rem_chassis[oid[len(B['chas']):]] = v
-    elif oid.startswith(B['loc']):  loc_port[oid[len(B['loc']):]] = v
-    elif oid.startswith(B['locd']): loc_port.setdefault(oid[len(B['locd']):], v)
-out = []
-for idx, name in rem_name.items():
-    parts = idx.split('.')          # timeMark.localPortNum.remIndex
-    lpn = parts[1] if len(parts) >= 3 else (parts[0] if parts else '')
-    rport = rem_port.get(idx, '')
-    if hexmac(rport):
-        rport = hexmac(rport)
-    out.append({'local_port': loc_port.get(lpn, lpn), 'remote_name': name,
-                'remote_port': rport, 'remote_mac': hexmac(rem_chassis.get(idx, ''))})
-print(json.dumps({'lldp_local': out}))
-LLDPEOF
-    fi
 }
 
 # ?? Probe: SSH ????????????????????????????????????????????????????????????????
@@ -2003,9 +1771,7 @@ probe_ssh() {
     remote_cmd='printf "HN=%s\n" "$(hostname)"; uname -a; \
 cat /etc/os-release 2>/dev/null || sw_vers 2>/dev/null; \
 ip addr 2>/dev/null || ifconfig; lscpu 2>/dev/null | head -5; \
-free -h 2>/dev/null | head -2; \
-echo "---LLDP---"; \
-(lldpctl -f keyvalue 2>/dev/null || lldpcli show neighbors -f keyvalue 2>/dev/null)'
+free -h 2>/dev/null | head -2'
     local sys_info="" cred
     while IFS= read -r cred; do
         [[ -z "$cred" || "$cred" == "null" ]] && continue
@@ -2024,38 +1790,6 @@ echo "---LLDP---"; \
         fi
         [[ -n "$sys_info" ]] && break
     done < <(get_ssh_creds_for "$ip")
-    # Parse host-side LLDP (lldpctl keyvalue) into a neighbor list with the
-    # LOCAL interface known (the one thing SNMP LLDP-MIB cannot give us cleanly).
-    local lldp_raw; lldp_raw=$(echo "$sys_info" | sed -n '/^---LLDP---$/,$p' | tail -n +2)
-    local host_lldp_json
-    host_lldp_json=$(printf '%s' "$lldp_raw" | python3 -c '
-import sys, json
-nb = {}
-for line in sys.stdin:
-    line = line.strip()
-    if not line.startswith("lldp.") or "=" not in line:
-        continue
-    key, val = line.split("=", 1)
-    parts = key.split(".")
-    if len(parts) < 3:
-        continue
-    lif = parts[1]
-    rest = ".".join(parts[2:])
-    e = nb.setdefault(lif, {"local_port": lif, "remote_name": "",
-                            "remote_mac": "", "remote_port": ""})
-    if rest == "chassis.name" or rest.endswith(".chassis.name"):
-        e["remote_name"] = val
-    elif rest.startswith("chassis.") and rest.endswith(".mac"):
-        e["remote_mac"] = val
-    elif rest == "chassis.mac":
-        e["remote_mac"] = val
-    elif rest in ("port.descr", "port.ifname", "port.id"):
-        if not e["remote_port"]:
-            e["remote_port"] = val
-out = [v for v in nb.values() if v["remote_name"] or v["remote_mac"]]
-print(json.dumps(out))
-' 2>/dev/null || echo "[]")
-    [[ -z "$host_lldp_json" ]] && host_lldp_json="[]"
     jq -n \
         --arg banner "$banner" \
         --arg hn     "$(echo "$sys_info" | grep '^HN=' | cut -d= -f2)" \
@@ -2064,9 +1798,8 @@ print(json.dumps(out))
         --arg kernel "$(echo "$sys_info" | grep '^Linux\|^Darwin' | head -1)" \
         --arg cpu    "$(echo "$sys_info" | grep -i 'model name\|CPU' \
                          | head -1 | sed 's/.*: //')" \
-        --argjson lldp "$host_lldp_json" \
         '{available:true,banner:$banner,hostname:$hn,os:$os,
-          kernel:$kernel,cpu:$cpu,host_lldp:$lldp}' > "$tmp/ssh.json"
+          kernel:$kernel,cpu:$cpu}' > "$tmp/ssh.json"
 }
 
 # ?? Probe: HTTP/HTTPS ?????????????????????????????????????????????????????????
@@ -2262,10 +1995,7 @@ $hvVMs = Get-VM 2>$null | ForEach-Object {
         try {
             if ($dd.Path -and (Test-Path $dd.Path)) {
                 $vh = Get-VHD -Path $dd.Path -ErrorAction Stop
-                if ($vh -and $vh.Size) {
-                    $dbytes += [int64]$vh.Size
-                    $dlist  += [int64]$vh.Size
-                }
+                if ($vh -and $vh.Size) { $dbytes += [int64]$vh.Size; $dlist += [int64]$vh.Size }
             }
         } catch {}
     }
@@ -2347,7 +2077,6 @@ http=load('http'); nb=load('netbios'); dns=load('dns')
 bnr=load('banners'); mdns=load('mdns'); winrm=load('winrm')
 arp=load('arp')
 snmp_arp=load('snmp_arp')
-snmp_lldp=load('snmp_lldp')
 
 host={'ip':ip,'hostname':None,'mac':None,'vendor':None,
       'os':None,'os_accuracy':None,
@@ -2368,7 +2097,6 @@ host={'ip':ip,'hostname':None,'mac':None,'vendor':None,
           'community':snmp.get('community','')},
       'ssh_details':{'cpu':ssh.get('cpu',''),'banner':ssh.get('banner',''),
           'kernel':ssh.get('kernel','')},
-      'host_lldp':ssh.get('host_lldp',[]) or [],
       'discovery_methods':[]}
 
 for src in (snmp.get('sys_name'),ssh.get('hostname'),nmap.get('hostname'),
@@ -2425,20 +2153,6 @@ if winrm.get('available'):
         'prefix_lens':n.get('PrefixLens',[]) or []}
         for n in (winrm.get('NetworkAdapters') or [])]
     host['is_hyperv']=bool(winrm.get('IsHyperV',False))
-    # Host hardware (for device custom fields: vcpus/memory/disk/os/cpu model).
-    host['hw_cpu_model']=winrm.get('CPUName') or ''
-    host['hw_os_version']=winrm.get('OSVersion') or ''
-    try: host['hw_vcpus']=int(winrm.get('LogicalProcessors') or winrm.get('CPUCores') or 0)
-    except Exception: host['hw_vcpus']=0
-    try: host['hw_memory_mb']=int(round(float(winrm.get('MemoryGB') or 0)*1024))
-    except Exception: host['hw_memory_mb']=0
-    try: host['hw_memory_gb']=int(round(float(winrm.get('MemoryGB') or 0)))
-    except Exception: host['hw_memory_gb']=0
-    host['hw_physical_disks']=[
-        {'size_gb':int(d.get('SizeGB') or 0),
-         'media':str(d.get('Media') or 'Unknown'),
-         'interface':str(d.get('Interface') or 'Unknown')}
-        for d in (winrm.get('PhysicalDisks') or []) if int(d.get('SizeGB') or 0) > 0]
     # Read-only Hyper-V VM inventory (name/state/cpu/mem + per-adapter MAC/IPs).
     # Used by the reconciler to map discovered devices to VMs and to create VMs
     # that were not independently IP-scanned. No NetBox writes happen here.
@@ -2461,9 +2175,6 @@ if winrm.get('available'):    host['discovery_methods'].append('winrm')
 # SNMP-only with no WinRM. The reconciler folds these IP->MAC pairs in to resolve
 # MACs the L2-blind scanner never sees.
 host['arp_table']=(snmp_arp.get('arp_table') if isinstance(snmp_arp,dict) else None) or []
-# SNMP LLDP-MIB neighbors WITH the local port resolved (the container's
-# lldp_neighbors lacks it). Preferred over lldp_neighbors for cabling.
-host['lldp_local']=(snmp_lldp.get('lldp_local') if isinstance(snmp_lldp,dict) else None) or []
 
 # scan_tier: 1=winrm(richest) 2=ssh 3=snmp 4=nmap/fallback
 if winrm.get('available'):      host['scan_tier']=1
@@ -3189,14 +2900,6 @@ def reconcile(data):
             winner["hyperv_vms"] = loser["hyperv_vms"]
         if not winner.get("winrm_nics") and loser.get("winrm_nics"):
             winner["winrm_nics"] = loser["winrm_nics"]
-        # Host hardware (vcpus/memory/disks/os/cpu) must survive onto the winner
-        # if it only lives on the merged-away (e.g. dual-homed WinRM) record.
-        for f in ("hw_cpu_model", "hw_os_version", "hw_vcpus",
-                  "hw_memory_mb", "hw_memory_gb"):
-            if not winner.get(f) and loser.get(f):
-                winner[f] = loser[f]
-        if not winner.get("hw_physical_disks") and loser.get("hw_physical_disks"):
-            winner["hw_physical_disks"] = loser["hw_physical_disks"]
         # Strongest role wins.
         if _role_rank.get(loser.get("device_role"), 0) > \
                 _role_rank.get(winner.get("device_role"), 0):
@@ -3312,8 +3015,6 @@ def reconcile(data):
                 "name": vm.get("Name", ""), "host_ip": h["ip"],
                 "host_name": h.get("hostname", ""), "macs": macs, "ips": ips,
                 "cpu": vm.get("ProcessorCount"), "mem": vm.get("MemoryStartupBytes"),
-                "disk": vm.get("DiskBytes"),
-                "disks": vm.get("Disks") or [],
                 "state": (vm.get("State") or ""), "vmid": vm.get("VMId"),
             })
 
@@ -3362,12 +3063,6 @@ def reconcile(data):
             h["vm_host"] = vm["host_ip"]
             h["vm_cluster"] = vm["host_name"] or vm["host_ip"]
             h["vm_state"] = vm["state"]
-            h["vm_cpu"] = vm["cpu"]
-            h["vm_mem_bytes"] = vm["mem"]
-            h["vm_disk_bytes"] = vm["disk"]
-            h["vm_disks"] = vm["disks"]
-            if vm["macs"]:
-                h["vm_mac"] = sorted(vm["macs"])[0]
             h["vm_reason"] = "Hyper-V VM '%s' on %s (%s, by %s)" % (
                 vm["name"], vm["host_name"] or vm["host_ip"], vm["state"], how)
             matched_keys.add(inst_key(vm))
@@ -3413,9 +3108,6 @@ def reconcile(data):
             "vm_reason": "Hyper-V VM '%s' on %s (%s; inventory)" % (
                 vm["name"], vm["host_name"] or vm["host_ip"], vm["state"]),
             "vm_cpu": vm["cpu"], "vm_mem_bytes": vm["mem"], "vm_state": vm["state"],
-            "vm_disk_bytes": vm["disk"],
-            "vm_disks": vm["disks"],
-            "vm_mac": (sorted(vm["macs"])[0] if vm["macs"] else ""),
             "vm_ip_source": ip_source, "vm_no_ip_flag": no_ip_flag,
             "ports": [], "interfaces": [], "discovery_methods": ["hyperv-inventory"],
         }
@@ -3538,48 +3230,9 @@ sync_to_netbox() {
     [[ -z "$site_id" || ! "$site_id" =~ ^[0-9]+$ ]] \
         && { log_error "Cannot create site"; pause; return 1; }
     log_info "Site ID: $site_id"
-    # Ensure custom fields exist on BOTH devices and VMs (idempotent; merges
-    # scope onto an existing field so servers and VMs can both carry the value)
-    nb_ensure_custom_field "discovered_ports" "Discovered Ports" "text" \
-        "dcim.device,virtualization.virtualmachine"
-    nb_ensure_custom_field "discovery_methods" "Discovery Methods" "text" \
-        "dcim.device,virtualization.virtualmachine"
-    # Host hardware custom fields (restored from the legacy importer): physical
-    # server vcpus/memory/disks/os/cpu. Set on devices that report WinRM hardware.
-    nb_ensure_custom_field "vcpus"         "vCPUs"           "integer" "dcim.device"
-    nb_ensure_custom_field "memory_mb"     "Memory (MB)"     "integer" "dcim.device"
-    nb_ensure_custom_field "memory_gb"     "Memory (GB)"     "integer" "dcim.device"
-    nb_ensure_custom_field "disk_total_gb" "Disk Total (GB)" "integer" "dcim.device"
-    nb_ensure_custom_field "disk_count"    "Disk Count"      "integer" "dcim.device"
-    nb_ensure_custom_field "os_version"    "OS Version"      "text"    "dcim.device"
-    nb_ensure_custom_field "cpu_model"     "CPU Model"       "text"    "dcim.device"
-    # Only create as many per-disk field sets as the busiest host actually has
-    # (capped at 8), so we don't litter NetBox with unused disk_N fields.
-    local _maxdisks _di
-    _maxdisks=$(jq '[.hosts[].hw_physical_disks // [] | length] | max // 0' \
-        "$results_file" 2>/dev/null || echo 0)
-    [[ ! "$_maxdisks" =~ ^[0-9]+$ ]] && _maxdisks=0
-    [[ "$_maxdisks" -gt 8 ]] && _maxdisks=8
-    for (( _di=0; _di<_maxdisks; _di++ )); do
-        nb_ensure_custom_field "disk_${_di}_size_gb" "Disk ${_di} Size (GB)" \
-            "integer" "dcim.device"
-        nb_ensure_custom_field "disk_${_di}_media" "Disk ${_di} Media" \
-            "text" "dcim.device"
-        nb_ensure_custom_field "disk_${_di}_interface" "Disk ${_di} Interface" \
-            "text" "dcim.device"
-    done
-
-    # PHASE B/C: reconcile the raw results into a canonical device/VM model and
-    # sync THAT (honors sync_as=device/vm/skip, secondary_ips, vm_host/cluster).
-    if [[ "$results_file" != *.reconciled.json ]]; then
-        local _recon; _recon=$(reconcile_results "$results_file" 2>/dev/null | tail -1)
-        [[ -f "$_recon" ]] && results_file="$_recon" \
-            && log_info "Syncing reconciled model: $(basename "$results_file")"
-    fi
-
-    # Cluster type for Hyper-V VMs (created once; VMs attach to per-host clusters)
-    local HV_CLUSTER_TYPE_ID
-    HV_CLUSTER_TYPE_ID=$(nb_get_or_create_cluster_type "Hyper-V" 2>/dev/null)
+    # Ensure custom fields exist (idempotent)
+    nb_ensure_custom_field "discovered_ports" "Discovered Ports" "text" "dcim.device"
+    nb_ensure_custom_field "discovery_methods" "Discovery Methods" "text" "dcim.device"
 
     local total; total=$(jq '.hosts | length' "$results_file")
     local ok=0 fail=0 idx=0
@@ -3609,90 +3262,6 @@ sync_to_netbox() {
         [[ -n "$uptime"  ]] && comments="${comments}\nUptime     : $uptime"
         [[ -n "$oid"     ]] && comments="${comments}\nSNMP OID   : $oid"
         comments="${comments}\nDiscovery  : $dmethods"
-
-        # PHASE C: branch on the reconciled disposition.
-        local sync_as; sync_as=$(echo "$host" | jq -r '.sync_as // "device"')
-        if [[ "$sync_as" == "skip" ]]; then
-            continue   # merged into another record during reconciliation
-        fi
-        if [[ "$sync_as" == "vm" ]]; then
-            local vm_name vm_cluster vcpus mem_b mem_mb vm_state vm_mac vm_ip
-            local disk_b disk_gb
-            vm_name=$(echo "$host"    | jq -r '.vm_name // .hostname // "unknown-vm"')
-            vm_cluster=$(echo "$host" | jq -r '.vm_cluster // "Hyper-V"')
-            vcpus=$(echo "$host"      | jq -r '.vm_cpu // empty')
-            mem_b=$(echo "$host"      | jq -r '.vm_mem_bytes // empty')
-            disk_b=$(echo "$host"     | jq -r '.vm_disk_bytes // empty')
-            vm_state=$(echo "$host"   | jq -r '.vm_state // "Running"')
-            # Prefer the VM's own vNIC MAC (from Hyper-V inventory), then any
-            # MAC resolved for the matched host record.
-            vm_mac=$(echo "$host" | jq -r \
-                '.vm_mac // .mac // (.interfaces[0].mac // "")')
-            vm_ip="$ip"; [[ "$vm_ip" == vm:* ]] && vm_ip=""
-            if [[ -n "$mem_b" && "$mem_b" =~ ^[0-9]+$ ]]; then
-                mem_mb=$(( mem_b / 1048576 )); else mem_mb=""; fi
-            if [[ -n "$disk_b" && "$disk_b" =~ ^[0-9]+$ && "$disk_b" != "0" ]]; then
-                disk_gb=$(( (disk_b + 1073741823) / 1073741824 ))  # ceil to GB
-            else disk_gb=""; fi
-            local vm_status="offline"
-            [[ "${vm_state,,}" == "running" ]] && vm_status="active"
-            printf "  ${C}[%d/%d]${NC} ${W}%-16s${NC} %-28s %-14s " \
-                "$idx" "$total" "${vm_ip:-$ip}" "${vm_name:0:28}" "VM/$vm_cluster"
-            local cl_id vm_id vmif_id
-            cl_id=$(nb_get_or_create_cluster "$vm_cluster" \
-                "$HV_CLUSTER_TYPE_ID" "$site_id" 2>>"$LOG_FILE")
-            if [[ -z "$cl_id" || ! "$cl_id" =~ ^[0-9]+$ ]]; then
-                printf "${R}FAIL(cluster)${NC}\n"; (( fail++ )); continue; fi
-            vm_id=$(nb_upsert_vm "$vm_name" "$cl_id" "$vm_status" \
-                "$vcpus" "$mem_mb" "$site_id" "$comments" "$disk_gb" 2>>"$LOG_FILE")
-            if [[ -z "$vm_id" || ! "$vm_id" =~ ^[0-9]+$ ]]; then
-                printf "${R}FAIL${NC}\n"; (( fail++ )); continue; fi
-            vmif_id=$(nb_add_vm_interface "$vm_id" "vNIC" "$vm_mac" \
-                "auto-discovered" 2>/dev/null) || true
-            if [[ -n "$vm_ip" && -n "$vmif_id" && "$vmif_id" =~ ^[0-9]+$ ]]; then
-                nb_add_vm_ip "$vm_ip" "$vm_id" "$vmif_id" >/dev/null 2>&1 || true
-            fi
-            # Virtual disks: one object per VHD when per-disk sizes are available
-            # (DiskBytes array), else a single disk from the total. NetBox 4.x
-            # aggregates the VM's Disk column from these objects.
-            local _dcount=0 _dbytes
-            while IFS= read -r _dbytes; do
-                [[ -z "$_dbytes" || ! "$_dbytes" =~ ^[0-9]+$ || "$_dbytes" == "0" ]] \
-                    && continue
-                local _dgb=$(( (_dbytes + 1073741823) / 1073741824 ))
-                nb_sync_virtual_disk "$vm_id" "${vm_name}-disk${_dcount}" "$_dgb" \
-                    2>/dev/null || true
-                (( _dcount++ )) || true
-            done < <(echo "$host" | jq -r '.vm_disks[]?' 2>/dev/null || true)
-            if [[ "$_dcount" -eq 0 && -n "$disk_gb" && "$disk_gb" =~ ^[0-9]+$ ]]; then
-                nb_sync_virtual_disk "$vm_id" "${vm_name}-disk0" "$disk_gb" \
-                    2>/dev/null || true
-            fi
-            # Custom fields on the VM (open ports + discovery methods), same as
-            # devices. Synthesized VMs have no ports but still get the methods.
-            local _vp _vdm
-            _vp=$(echo "$host" | jq -r \
-                '[.ports[]? | .port + "/" + (.service // .proto // "tcp")] | join(", ")' \
-                2>/dev/null || echo "")
-            _vdm=$(echo "$host" | jq -r \
-                '(.discovery_methods // []) | join(", ")' 2>/dev/null || echo "")
-            if [[ -n "$_vp" || -n "$_vdm" ]]; then
-                local _vcfr
-                _vcfr=$(nb_patch "virtualization/virtual-machines/${vm_id}/" \
-                    "$(jq -n --arg p "$_vp" --arg d "$_vdm" \
-                        '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')")
-                if echo "$_vcfr" | jq -e '.id' >/dev/null 2>&1; then
-                    local _vdm_stored
-                    _vdm_stored=$(echo "$_vcfr" | jq -r '.custom_fields.discovery_methods // ""')
-                    [[ -n "$_vdm" && -z "$_vdm_stored" ]] \
-                        && log_error "VM $vm_name: discovery_methods did not persist; stored CF=$(echo "$_vcfr" | jq -c '.custom_fields' 2>/dev/null | head -c 200)"
-                else
-                    log_error "VM CF patch failed for $vm_name: $(echo "$_vcfr" \
-                        | jq -c '.custom_fields // .detail // .' 2>/dev/null | head -c 200)"
-                fi
-            fi
-            printf "${G}OK${NC}\n"; (( ok++ )); continue
-        fi
 
         printf "  ${C}[%d/%d]${NC} ${W}%-16s${NC} %-28s %-14s " \
             "$idx" "$total" "$ip" "$hn" "$role"
@@ -3849,102 +3418,42 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
             fi
         fi
 
-        # Secondary IPs absorbed during reconciliation (e.g. 192.168.0.2 folded
-        # into 192.168.0.253). Attach each to an interface on this device WITHOUT
-        # changing primary_ip4, so the device shows all its addresses and no
-        # phantom device is created for the secondary.
-        local _sec _sip _sif
-        while IFS= read -r _sec; do
-            [[ -z "$_sec" || "$_sec" == "null" ]] && continue
-            _sip=$(echo "$_sec" | jq -r '.ip // empty')
-            [[ -z "$_sip" || "$_sip" == vm:* || "$_sip" == "$ip" ]] && continue
-            _sif=$(nb_get "dcim/interfaces/?device_id=${dev_id}&limit=1" \
-                | jq -r '.results[0].id // empty' 2>/dev/null)
-            if [[ -z "$_sif" || ! "$_sif" =~ ^[0-9]+$ ]]; then
-                _sif=$(nb_add_interface "$dev_id" "mgmt0" "other" "" \
-                    "Management (auto)" 2>/dev/null)
-            fi
-            [[ -n "$_sif" && "$_sif" =~ ^[0-9]+$ ]] \
-                && nb_add_ip "$_sip" "" "$_sif" >/dev/null 2>&1 || true
-        done < <(echo "$host" | jq -c '.secondary_ips[]?' 2>/dev/null || true)
-
         local nbr
         while IFS= read -r nbr; do
-            local n_local n_rname n_rmac n_rport
-            n_local=$(echo "$nbr" | jq -r '.local_port  // ""')
-            n_rname=$(echo "$nbr" | jq -r '.remote_name // ""')
-            n_rmac=$(echo  "$nbr" | jq -r '.remote_mac  // ""')
-            n_rport=$(echo "$nbr" | jq -r '.remote_port // ""')
-
-            # --- Resolve the REMOTE device (by name, short name, then MAC) ---
-            local rdev="" rif=""
-            if [[ -n "$n_rname" ]]; then
-                rdev=$(nb_get "dcim/devices/?name=$(nb_urlencode "$n_rname")" \
-                    | jq -r '.results[0].id // empty' 2>/dev/null || echo "")
-                if [[ -z "$rdev" && "$n_rname" == *.* ]]; then
-                    rdev=$(nb_get "dcim/devices/?name=$(nb_urlencode "${n_rname%%.*}")" \
-                        | jq -r '.results[0].id // empty' 2>/dev/null || echo "")
-                fi
-            fi
-            if [[ -z "$rdev" && "$n_rmac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
-                local _dm; _dm=$(nb_device_by_mac "$n_rmac")
-                rdev=$(echo "$_dm" | awk '{print $1}'); rif=$(echo "$_dm" | awk '{print $2}')
-            fi
-            if [[ -z "$rdev" && "$n_rport" =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]]; then
-                local _dm2; _dm2=$(nb_device_by_mac "$n_rport")
-                rdev=$(echo "$_dm2" | awk '{print $1}'); rif=$(echo "$_dm2" | awk '{print $2}')
-            fi
-            [[ -z "$rdev" || ! "$rdev" =~ ^[0-9]+$ ]] && continue
-            [[ "$rdev" == "$dev_id" ]] && continue   # never cable a device to itself
-
-            # --- LOCAL interface (on THIS device): the local port when known,
-            #     otherwise a descriptive uplink -- NEVER the remote port. ---
-            local lif=""
-            if [[ -n "$n_local" && "$n_local" != "null" ]]; then
-                lif=$(nb_add_interface "$dev_id" "$n_local" "other" "" \
-                    "LLDP/CDP uplink" 2>/dev/null) || true
-            else
-                lif=$(nb_add_interface "$dev_id" \
-                    "uplink-${n_rname:-dev$rdev}" "other" "" \
-                    "Topology link to ${n_rname:-device $rdev}" 2>/dev/null) || true
-            fi
-
-            # --- REMOTE interface (on the neighbor): the remote port, unless a
-            #     MAC lookup already pinned the exact interface. ---
-            if [[ -z "$rif" || ! "$rif" =~ ^[0-9]+$ ]]; then
-                if [[ -n "$n_rport" \
-                      && ! "$n_rport" =~ ^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$ ]]; then
-                    rif=$(nb_add_interface "$rdev" "$n_rport" "other" "" \
-                        "Link to $hn" 2>/dev/null) || true
-                else
-                    rif=$(nb_add_interface "$rdev" "link-to-$hn" "other" "" \
-                        "Link to $hn" 2>/dev/null) || true
-                fi
-            fi
-            [[ -z "$lif" || ! "$lif" =~ ^[0-9]+$ ]] && continue
-            [[ -z "$rif" || ! "$rif" =~ ^[0-9]+$ ]] && continue
-            nb_create_cable "$lif" "$rif" \
-                "$hn <-> ${n_rname:-dev$rdev}" >/dev/null 2>&1 || true
-            log_info "Cable: $hn[${n_local:-?}] <-> ${n_rname:-mac}[${n_rport:-?}]"
-        done < <(echo "$host" | jq -c '
-            # Normalize every topology source into {local_port, remote_name,
-            # remote_mac, remote_port}. Sources that know the local port
-            # (host-side lldpd over SSH, and the SNMP LLDP-MIB walk) come first;
-            # the container LLDP/CDP lists (remote-only) are the fallback.
-              ((.host_lldp  // []) | map({local_port:(.local_port//""),
-                  remote_name:(.remote_name//""), remote_mac:(.remote_mac//""),
-                  remote_port:(.remote_port//"")}))
-            + ((.lldp_local // []) | map({local_port:(.local_port//""),
-                  remote_name:(.remote_name//""), remote_mac:(.remote_mac//""),
-                  remote_port:(.remote_port//"")}))
-            + ((.lldp_neighbors // []) | map({local_port:"",
-                  remote_name:(.sys_name//""), remote_mac:"",
-                  remote_port:(.port_id//.port_desc//"")}))
-            + ((.cdp_neighbors // []) | map({local_port:"",
-                  remote_name:(.device_id//""), remote_mac:"",
-                  remote_port:(.remote_port//"")}))
-            | map(select(.remote_name != "" or .remote_mac != ""))
-            | unique | .[]' 2>/dev/null || true)
+            local nbr_name nbr_remote_port
+            nbr_name=$(echo "$nbr" | jq -r '.sys_name // .device_id // empty')
+            # The port advertised by an LLDP/CDP neighbor (port_id/port_desc) is
+            # the NEIGHBOR's (remote) port -- NOT ours. It must terminate on the
+            # remote device. The container does not give us our own local port,
+            # so the local side is named descriptively rather than mislabeled
+            # with the remote port (which previously put e.g. laundry-sw's "g4"
+            # onto mancave-sw).
+            nbr_remote_port=$(echo "$nbr" | jq -r '.port_id // .port_desc // .remote_port // empty')
+            [[ -z "$nbr_name" ]] && continue
+            local nbr_enc nbr_dev_id
+            nbr_enc=$(nb_urlencode "$nbr_name")
+            nbr_dev_id=$(nb_get "dcim/devices/?name=${nbr_enc}" \
+                | jq -r '.results[0].id // empty' 2>/dev/null || echo "")
+            [[ -z "$nbr_dev_id" || ! "$nbr_dev_id" =~ ^[0-9]+$ ]] && continue
+            [[ "$nbr_dev_id" == "$dev_id" ]] && continue
+            local local_if_id nbr_if_id
+            # LOCAL side on THIS device: descriptive uplink (local port unknown).
+            local_if_id=$(nb_add_interface "$dev_id" \
+                "uplink-${nbr_name}" "other" "" \
+                "Topology link to $nbr_name" 2>/dev/null) || true
+            # REMOTE side on the neighbor: the advertised port is theirs.
+            nbr_if_id=$(nb_add_interface "$nbr_dev_id" \
+                "${nbr_remote_port:-to-$hn}" "other" "" \
+                "Topology link to $hn" 2>/dev/null) || true
+            [[ -z "$local_if_id" || ! "$local_if_id" =~ ^[0-9]+$ ]] && continue
+            [[ -z "$nbr_if_id"   || ! "$nbr_if_id"   =~ ^[0-9]+$ ]] && continue
+            nb_create_cable "$local_if_id" "$nbr_if_id" \
+                "$hn <-> $nbr_name" >/dev/null 2>&1 || true
+            log_info "Cable: $hn <-> $nbr_name[${nbr_remote_port:-?}]"
+        done < <({
+            echo "$host" | jq -c '.lldp_neighbors[]?' 2>/dev/null
+            echo "$host" | jq -c '.cdp_neighbors[]?'  2>/dev/null
+        } 2>/dev/null || true)
 
         # Populate custom fields: open ports + discovery methods
         local _ports_cf _dmethods_cf
@@ -3954,57 +3463,27 @@ print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
         _dmethods_cf=$(echo "$host" | jq -r \
             '.discovery_methods | join(", ")' 2>/dev/null || echo "")
         if [[ -n "$_ports_cf" || -n "$_dmethods_cf" ]]; then
-            local _cfr
-            _cfr=$(nb_patch "dcim/devices/${dev_id}/" \
+            nb_patch "dcim/devices/${dev_id}/" \
                 "$(jq -n --arg p "$_ports_cf" --arg d "$_dmethods_cf" \
-                    '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')")
-            if echo "$_cfr" | jq -e '.id' >/dev/null 2>&1; then
-                local _dm_stored
-                _dm_stored=$(echo "$_cfr" | jq -r '.custom_fields.discovery_methods // ""')
-                [[ -n "$_dmethods_cf" && -z "$_dm_stored" ]] \
-                    && log_error "Device $hn: discovery_methods did not persist; stored CF=$(echo "$_cfr" | jq -c '.custom_fields' 2>/dev/null | head -c 200)"
-            else
-                log_error "Device CF patch failed for $hn: $(echo "$_cfr" \
-                    | jq -c '.custom_fields // .detail // .' 2>/dev/null | head -c 200)"
-            fi
-        fi
-
-        # Host hardware custom fields (vcpus/memory/disk_*/os/cpu) for devices
-        # that reported WinRM hardware. Disks are capped at 8 (disk_0..disk_7).
-        local _hw_dcount
-        _hw_dcount=$(echo "$host" | jq -r '(.hw_physical_disks // []) | length' 2>/dev/null || echo 0)
-        local _hw_vcpus _hw_cpu
-        _hw_vcpus=$(echo "$host" | jq -r '.hw_vcpus // 0' 2>/dev/null || echo 0)
-        _hw_cpu=$(echo "$host" | jq -r '.hw_cpu_model // ""' 2>/dev/null || echo "")
-        if [[ "$_hw_vcpus" != "0" || -n "$_hw_cpu" || "$_hw_dcount" -gt 0 ]]; then
-            local _hwcf
-            _hwcf=$(echo "$host" | jq -c '
-                (.hw_physical_disks // []) as $d
-                | {vcpus:(.hw_vcpus // 0), memory_mb:(.hw_memory_mb // 0),
-                   memory_gb:(.hw_memory_gb // 0), os_version:(.hw_os_version // ""),
-                   cpu_model:(.hw_cpu_model // ""),
-                   disk_total_gb:([$d[].size_gb] | add // 0),
-                   disk_count:($d | length)}
-                + (reduce range(0; ([$d|length,8]|min)) as $i ({};
-                    . + {("disk_\($i)_size_gb"):  ($d[$i].size_gb // 0),
-                         ("disk_\($i)_media"):     ($d[$i].media // "Unknown"),
-                         ("disk_\($i)_interface"): ($d[$i].interface // "Unknown")}))
-            ' 2>/dev/null || echo "")
-            if [[ -n "$_hwcf" && "$_hwcf" != "null" ]]; then
-                local _hwr
-                _hwr=$(nb_patch "dcim/devices/${dev_id}/" \
-                    "{\"custom_fields\":$_hwcf}")
-                echo "$_hwr" | jq -e '.id' >/dev/null 2>&1 \
-                    || log_error "Device HW CF patch failed for $hn: $(echo "$_hwr" \
-                        | jq -c '.custom_fields // .detail // .' 2>/dev/null | head -c 200)"
-            fi
+                    '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')" \
+                >/dev/null 2>&1 || true
         fi
 
         printf "${G}OK${NC}\n"; (( ok++ ))
 
-        # Phase C: the NetBox-writing Hyper-V PS1 is retired. VM creation now
-        # happens centrally from the reconciled model (sync_as=vm branch above),
-        # so we no longer upload a script that writes to NetBox from the host.
+        # Auto-run full Hyper-V PS1 sync when discovery found a WinRM
+        # host with Hyper-V available and stored credentials exist
+        local _tier _is_hv
+        _tier=$(echo "$host" | jq -r '.scan_tier // 4' 2>/dev/null || echo 4)
+        _is_hv=$(echo "$host" | jq -r '.is_hyperv // false' 2>/dev/null || echo false)
+        if [[ "$_tier" == "1" && "$_is_hv" == "true" ]]; then
+            local _wcc
+            _wcc=$(get_windows_creds_for "$ip" | jq 'length' 2>/dev/null || echo 0)
+            if [[ "${_wcc:-0}" -gt 0 ]]; then
+                log_info "Auto-running Hyper-V PS1 sync for $ip (Hyper-V detected)"
+                import_hyperv_powershell "$ip" "auto"
+            fi
+        fi
 
     done < <(jq -c '.hosts[]' "$results_file")
 
@@ -4189,10 +3668,1412 @@ deploy_agents_to_discovered() {
 # WINDOWS HYPER-V IMPORT (WinRM / PowerShell)
 # For Linux Hyper-V hosts: use deploy_agent_remote() with virtual.hypervisor=true
 # -----------------------------------------------------------------------------
+import_hyperv_powershell() {
+    # Runs the Hyper-V -> NetBox sync PS1 on a Windows host.
+    # $2=auto: non-interactive mode -- uses first stored credential,
+    #          executes via WinRM, no prompts, no pause at end.
+    local host_ip="$1" _auto_mode="${2:-}"
+    log_step "Hyper-V PowerShell Sync: $host_ip"
+
+    local win_user="" win_pass="" win_port="5985" win_proto="http" _wp=""
+    local win_creds; win_creds=$(get_windows_creds_for "$host_ip")
+    local win_cred_count; win_cred_count=$(echo "$win_creds" | jq 'length' 2>/dev/null || echo 0)
+
+    if [[ -n "$_auto_mode" ]]; then
+        # Non-interactive: use first available stored credential
+        if [[ "${win_cred_count:-0}" -eq 0 ]]; then
+            log_warn "No Windows credentials for $host_ip -- skipping auto Hyper-V sync"
+            return
+        fi
+        local _sel; _sel=$(echo "$win_creds" | jq -c '.[0]' 2>/dev/null)
+        local _su _sd
+        _su=$(echo "$_sel" | jq -r '.username // ""' 2>/dev/null)
+        _sd=$(echo "$_sel" | jq -r '.domain   // ""' 2>/dev/null)
+        win_pass=$(echo "$_sel" | jq -r '.password // ""' 2>/dev/null)
+        win_user="${_sd:+$_sd\\}${_su}"
+    else
+        # Interactive: show stored credential list
+        if [[ "${win_cred_count:-0}" -gt 0 ]]; then
+            printf "\n  ${W}Stored Windows credentials:${NC}\n"
+            local _idx=0
+            while IFS= read -r _c; do
+                local _u _d
+                _u=$(echo "$_c" | jq -r '.username // ""' 2>/dev/null)
+                _d=$(echo "$_c" | jq -r '.domain   // ""' 2>/dev/null)
+                if [[ -n "$_d" ]]; then
+                    printf "   %d) %s\\%s\n" "$(( _idx + 1 ))" "$_d" "$_u"
+                else
+                    printf "   %d) .\\%s\n" "$(( _idx + 1 ))" "$_u"
+                fi
+                (( _idx++ )) || true
+            done < <(echo "$win_creds" | jq -c '.[]'  2>/dev/null)
+            printf "   0) Enter credentials manually\n"
+            local _pick
+            read -rp $'\n  Select [1]: ' _pick; _pick="${_pick:-1}"
+            if [[ "$_pick" =~ ^[1-9][0-9]*$ && "$_pick" -le "$win_cred_count" ]]; then
+                local _sel; _sel=$(echo "$win_creds" \
+                    | jq -c ".[$(( _pick - 1 ))]" 2>/dev/null)
+                local _su _sd
+                _su=$(echo "$_sel" | jq -r '.username // ""' 2>/dev/null)
+                _sd=$(echo "$_sel" | jq -r '.domain   // ""' 2>/dev/null)
+                win_pass=$(echo "$_sel" | jq -r '.password // ""' 2>/dev/null)
+                win_user="${_sd:+$_sd\\}${_su}"
+            fi
+        fi
+        # Fall back to manual entry if nothing selected
+        [[ -z "$win_user" ]] && read -rp  "  Windows username (domain\user): " win_user
+        [[ -z "$win_pass" ]] && { read -rsp "  Windows password: " win_pass; echo; }
+        read -rp "  WinRM port [5985]: " _wp
+        [[ -n "${_wp:-}" ]] && win_port="$_wp"
+    fi
+
+    # Resolve NetBox IDs for cluster type and VM role ----------------------
+    local site_id; site_id=$(nb_get_or_create_site)
+    local ct_id;   ct_id=$(nb_get_or_create_cluster_type "Microsoft Hyper-V")
+    local role_id; role_id=$(nb_get_or_create_role "Server" "2196f3")
+    if [[ -z "$ct_id"   || ! "$ct_id"   =~ ^[0-9]+$ ]]; then
+        log_error "Cannot get/create cluster type"; pause; return 1; fi
+    if [[ -z "$role_id" || ! "$role_id" =~ ^[0-9]+$ ]]; then
+        log_error "Cannot get/create VM role";       pause; return 1; fi
+
+    log_info "Cluster type ID: $ct_id  |  Role ID: $role_id"
+
+    # Generate the PS1 script with substituted settings --------------------
+    local ps1_file; ps1_file=$(mktemp --suffix=.ps1)
+    python3 - "$ps1_file" \
+        "$NETBOX_API_TOKEN" "${NETBOX_API_URL}/api" \
+        "$host_ip" "$ct_id" "$role_id" "$site_id" <<'GENEOF'
+import sys, textwrap
+
+out_path   = sys.argv[1]
+nb_token   = sys.argv[2]
+nb_uri     = sys.argv[3]
+hv_host    = sys.argv[4]
+ct_id      = sys.argv[5]
+role_id    = sys.argv[6]
+site_id    = sys.argv[7]
+
+ps1 = textwrap.dedent(rf"""
+$token      = "{nb_token}"
+$uri        = "{nb_uri}"
+$hyperVHost = "{hv_host}"
+$NetboxHyperVClusterType = {ct_id}
+$NetboxServerRoleID      = {role_id}
+$SiteId                  = {site_id}
+
+############################################################
+# Hyper-V to NetBox Sync  --  Host Device + Cluster + VMs
+############################################################
+
+if ($PSVersionTable.PSVersion.Major -ge 6) {{
+    $global:PSDefaultParameterValues['Invoke-WebRequest:SkipCertificateCheck'] = $true
+}} else {{
+    Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {{
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) {{
+        return true;
+    }}
+}}
+"@
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+}}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$InformationPreference = "SilentlyContinue"
+$ProgressPreference    = "SilentlyContinue"
+$VerbosePreference     = "SilentlyContinue"
+$DebugPreference       = "SilentlyContinue"
+
+$uri = $uri.TrimEnd("/")
+$cs = Get-CimInstance Win32_ComputerSystem
+
+if ($cs.Domain -and $cs.Domain -ne "WORKGROUP") {{
+    $hostName = "$($cs.DNSHostName).$($cs.Domain)"
+}} else {{
+    try {{
+        $hostName = ([System.Net.Dns]::GetHostEntry($env:COMPUTERNAME)).HostName
+    }} catch {{
+        $hostName = $env:COMPUTERNAME
+    }}
+}}
+$clusterName = "$env:COMPUTERNAME"
+
+$headers = $null
+function New-AuthHeaders {{
+    $h = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+    $h.Add("Authorization", "Token $token")
+    $h.Add("Content-Type",  "application/json")
+    $h.Add("Accept",        "application/json")
+    return $h
+}}
+$headers = New-AuthHeaders
+
+function Invoke-NB {{
+    param([string]$Uri,[string]$Method="GET",[string]$Body=$null)
+    $p = @{{Uri=$Uri;Method=$Method;Headers=$headers;UseBasicParsing=$true}}
+    if ($Body) {{ $p.Body = $Body }}
+    return Invoke-WebRequest @p
+}}
+
+function Get-NBErrorBody {{
+    param($Exception)
+    try {{
+        $r = $Exception.Response
+        if ($r -and $r.GetResponseStream()) {{
+            return (New-Object System.IO.StreamReader($r.GetResponseStream())).ReadToEnd()
+        }}
+    }} catch {{}}
+    return $null
+}}
+
+############################################################
+# MAC helpers
+############################################################
+
+function Normalize-MacRaw {{
+    param([string]$Mac)
+    if (-not $Mac) {{ return $null }}
+    return ($Mac -replace '[^0-9A-Fa-f]','').ToLower()
+}}
+
+function Normalize-MacPretty {{
+    param([string]$Mac)
+    $raw = Normalize-MacRaw $Mac
+    if (-not $raw -or $raw.Length -ne 12) {{ return $null }}
+    return (($raw -split '(.{{2}})' | Where-Object {{ $_ -ne '' }}) -join ':').ToUpper()
+}}
+
+############################################################
+# Subnet helpers
+############################################################
+
+function Get-MaskFromPrefix {{
+    param([string]$Prefix)
+    $ml = [int]($Prefix.Split("/")[1])
+    $mb = @([byte]0,[byte]0,[byte]0,[byte]0)
+    for ($i=0;$i -lt 4;$i++) {{
+        $bits=[Math]::Max(0,[Math]::Min(8,$ml-($i*8)))
+        $mb[$i] = switch ($bits) {{
+            8 {{ [byte]255 }}
+            0 {{ [byte]0 }}
+            default {{ [byte](256-[Math]::Pow(2,8-$bits)) }}
+        }}
+    }}
+    return [System.Net.IPAddress]::new([byte[]]$mb)
+}}
+
+function Test-IPInSubnet {{
+    param([System.Net.IPAddress]$Subnet,[System.Net.IPAddress]$Mask,[System.Net.IPAddress]$IPAddress)
+    $mk=$Mask.GetAddressBytes(); $sk=$Subnet.GetAddressBytes(); $ik=$IPAddress.GetAddressBytes()
+    for ($i=0;$i -lt 4;$i++) {{
+        if (($ik[$i] -band $mk[$i]) -ne $sk[$i]) {{ return $false }}
+    }}
+    return $true
+}}
+
+############################################################
+# Pre-flight checks
+############################################################
+
+function Test-NetboxConnectivity {{
+    Write-Host "Running pre-flight checks..."
+    $eps = @(
+        "$uri/dcim/devices/",
+        "$uri/dcim/device-types/",
+        "$uri/dcim/manufacturers/",
+        "$uri/dcim/device-roles/",
+        "$uri/virtualization/clusters/",
+        "$uri/virtualization/virtual-machines/",
+        "$uri/virtualization/interfaces/",
+        "$uri/dcim/mac-addresses/",
+        "$uri/ipam/prefixes/",
+        "$uri/ipam/ip-addresses/"
+    )
+    $ok=$true
+    foreach ($ep in $eps) {{
+        try {{
+            Invoke-NB -Uri "${{ep}}?limit=1" | Out-Null
+            Write-Host "  [OK]   $ep"
+        }} catch {{
+            Write-Host "  [FAIL] $ep -- $($_.Exception.Message)"
+            $eb = Get-NBErrorBody $_.Exception
+            if ($eb) {{ Write-Host "         $eb" }}
+            $ok=$false
+        }}
+    }}
+    if (-not $ok) {{
+        Write-Host "[ABORT] Fix the above errors first."
+        exit 1
+    }}
+    Write-Host "Pre-flight checks passed.`n"
+}}
+
+############################################################
+# Manufacturer / Device Type / Device Role helpers
+############################################################
+
+function Get-OrCreateManufacturer {{
+    param([string]$Name)
+    if (-not $Name) {{ $Name = "Unknown" }}
+    $slug = ($Name.ToLower() -replace '[^a-z0-9]+','-').Trim('-')
+    # GET by name first
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/manufacturers/?name=$([uri]::EscapeDataString($Name))"
+        $res  = ($resp.Content | ConvertFrom-Json).results
+        if ($res.Count -gt 0) {{ return $res[0] }}
+    }} catch {{}}
+    # Try POST
+    $body = @{{ name = $Name; slug = $slug }} | ConvertTo-Json
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/manufacturers/" -Method POST -Body $body
+        $obj  = $resp.Content | ConvertFrom-Json
+        if ($obj.id) {{ return $obj }}
+    }} catch {{}}
+    # POST failed (slug collision) -- fall back to GET by slug
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/manufacturers/?slug=$([uri]::EscapeDataString($slug))"
+        $res  = ($resp.Content | ConvertFrom-Json).results
+        if ($res.Count -gt 0) {{ return $res[0] }}
+    }} catch {{}}
+    Write-Host "  [ERROR] Cannot get or create manufacturer: $Name"
+    return $null
+}}
+
+function Get-OrCreateDeviceType {{
+    param([int]$ManufacturerId,[string]$Model)
+    if (-not $Model) {{ $Model = "Unknown" }}
+    $slug = ($Model.ToLower() -replace '[^a-z0-9]+','-').Trim('-')
+    if ($slug.Length -gt 64) {{ $slug = $slug.Substring(0,64).TrimEnd('-') }}
+    # GET by model + manufacturer
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/device-types/?model=$([uri]::EscapeDataString($Model))&manufacturer_id=$ManufacturerId"
+        $res  = ($resp.Content | ConvertFrom-Json).results
+        if ($res.Count -gt 0) {{ return $res[0] }}
+    }} catch {{}}
+    # Try POST
+    $body = @{{ model = $Model; slug = $slug; manufacturer = $ManufacturerId; u_height = 1 }} | ConvertTo-Json
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/device-types/" -Method POST -Body $body
+        $obj  = $resp.Content | ConvertFrom-Json
+        if ($obj.id) {{ return $obj }}
+    }} catch {{}}
+    # POST failed (slug collision) -- fall back to GET by slug
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/device-types/?slug=$([uri]::EscapeDataString($slug))"
+        $res  = ($resp.Content | ConvertFrom-Json).results
+        if ($res.Count -gt 0) {{ return $res[0] }}
+    }} catch {{}}
+    # Last resort: search by model name only (ignore manufacturer)
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/device-types/?model=$([uri]::EscapeDataString($Model))"
+        $res  = ($resp.Content | ConvertFrom-Json).results
+        if ($res.Count -gt 0) {{ return $res[0] }}
+    }} catch {{}}
+    Write-Host "  [ERROR] Cannot get or create device type: $Model"
+    return $null
+}}
+
+function Get-DeviceRoleByName {{
+    param([string]$Name)
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/device-roles/?name=$([uri]::EscapeDataString($Name))"
+        $res  = ($resp.Content | ConvertFrom-Json).results
+        if ($res.Count -gt 0) {{ return $res[0] }}
+    }} catch {{}}
+    Write-Host "[ERROR] Device role '$Name' not found in NetBox. Create it first."
+    exit 1
+}}
+
+############################################################
+# Cluster helpers
+############################################################
+
+function Get-NetboxCluster {{
+    param([string]$Name)
+    try {{
+        $resp = Invoke-NB -Uri "$uri/virtualization/clusters/?name=$([uri]::EscapeDataString($Name))"
+        return (($resp.Content | ConvertFrom-Json).results)[0]
+    }} catch {{ return $null }}
+}}
+
+function Add-NetboxCluster {{
+    param([string]$Name,[int]$NetboxHyperVClusterType)
+    $b=@{{name=$Name;type=$NetboxHyperVClusterType}}|ConvertTo-Json
+    $resp = Invoke-NB -Uri "$uri/virtualization/clusters/" -Method POST -Body $b
+    return ($resp.Content|ConvertFrom-Json)
+}}
+
+function Set-NetboxCluster {{
+    param([string]$Name,[int]$NetboxHyperVClusterType)
+    $c=Get-NetboxCluster -Name $Name
+    if (-not $c) {{ $c=Add-NetboxCluster -Name $Name -NetboxHyperVClusterType $NetboxHyperVClusterType }}
+    return [int]$c.id
+}}
+
+############################################################
+# Device helpers (Hyper-V host)
+############################################################
+
+function Get-NetboxDevice {{
+    param([string]$Name)
+    try {{
+        $resp = Invoke-NB -Uri "$uri/dcim/devices/?name=$([uri]::EscapeDataString($Name))"
+        return (($resp.Content | ConvertFrom-Json).results)[0]
+    }} catch {{ return $null }}
+}}
+
+function Add-NetboxDevice {{
+    param([string]$Name,[int]$ClusterId,[int]$SiteId,[int]$DeviceTypeId,[int]$DeviceRoleId)
+    $b = @{{
+        name=$Name; device_type=$DeviceTypeId; role=$DeviceRoleId
+        site=$SiteId; status="active"; cluster=$ClusterId
+    }} | ConvertTo-Json
+    $resp = Invoke-NB -Uri "$uri/dcim/devices/" -Method POST -Body $b
+    return ($resp.Content | ConvertFrom-Json)
+}}
+
+function Find-DeviceByShortName {{
+    # Normalized-name dedup: match by short hostname, case-insensitive, so the
+    # Hyper-V FQDN (server01.certifiedgeeks.net) merges with a discovered
+    # NetBIOS name (SERVER01) instead of creating a duplicate device.
+    param([string]$Name)
+    if (-not $Name) {{ return $null }}
+    $short = ($Name -split '\.')[0].ToLower()
+    if (-not $short) {{ return $null }}
+    try {{
+        $enc = [uri]::EscapeDataString($short)
+        $r = ((Invoke-NB -Uri "$uri/dcim/devices/?name__ic=$enc&limit=50").Content | ConvertFrom-Json).results
+        foreach ($d in $r) {{
+            if ((($d.name -split '\.')[0].ToLower()) -eq $short) {{ return $d }}
+        }}
+    }} catch {{}}
+    return $null
+}}
+
+function Find-DeviceByHostIP {{
+    # IP-first dedup: find an existing device that owns this host IP.
+    # Prevents a second device being created when a device was previously
+    # created by an nmap scan using an auto-generated name.
+    param([string]$HostIP)
+    if (-not $HostIP) {{ return $null }}
+    foreach ($cidr in @("$HostIP/32", $HostIP)) {{
+        try {{
+            $enc = [uri]::EscapeDataString($cidr)
+            $r = ((Invoke-NB -Uri "$uri/ipam/ip-addresses/?address=$enc&limit=1").Content | ConvertFrom-Json).results
+            if ($r.Count -gt 0 -and $r[0].assigned_object_type -eq "dcim.interface" -and $r[0].assigned_object_id) {{
+                $ifId = [int]$r[0].assigned_object_id
+                $iface = ((Invoke-NB -Uri "$uri/dcim/interfaces/$ifId/").Content | ConvertFrom-Json)
+                if ($iface.device -and $iface.device.id) {{ return [int]$iface.device.id }}
+            }}
+        }} catch {{}}
+    }}
+    return $null
+}}
+
+function Set-NetboxDevice {{
+    param([string]$Name,[int]$ClusterId,[int]$SiteId,[int]$DeviceTypeId,[int]$DeviceRoleId)
+    $devId = $null
+    # IP-first dedup using the SAME management IP the bash discovery used
+    # ($hyperVHost). Get-NetIPAddress | Select -First 1 was unreliable on a
+    # Hyper-V host (it could return an internal vSwitch / mshome.net address),
+    # which made this fail to find the already-created discovered device and
+    # produced a duplicate (e.g. SERVER01 vs server01.fqdn). Prefer $hyperVHost,
+    # fall back to the first non-virtual local IPv4.
+    $localIP = $hyperVHost
+    if (-not $localIP) {{
+        $localIP = (Get-NetIPAddress -AddressFamily IPv4 |
+                    Where-Object {{ $_.IPAddress -notlike "169.254*" -and
+                                    $_.IPAddress -notlike "172.2*" -and
+                                    $_.IPAddress -ne "127.0.0.1" -and
+                                    $_.IPAddress -ne "0.0.0.0" }} |
+                    Select-Object -First 1).IPAddress
+    }}
+    if ($localIP) {{ $devId = Find-DeviceByHostIP -HostIP $localIP }}
+    if ($devId) {{
+        Write-Host "  Found existing device by IP $localIP (ID $devId)"
+        # Smart rename: upgrade auto-gen placeholder to real hostname
+        $curName = ((Invoke-NB -Uri "$uri/dcim/devices/$devId/").Content | ConvertFrom-Json).name
+        if ($curName -match "^device-\d+-\d+-\d+-\d+$" -and $Name -notmatch "^device-\d+-\d+-\d+-\d+$") {{
+            Write-Host "  Renaming $curName -> $Name"
+        }} elseif ($curName -notmatch "^device-\d+-\d+-\d+-\d+$" -and $Name -match "^device-\d+-\d+-\d+-\d+$") {{
+            Write-Host "  Keeping richer name $curName"
+            $Name = $curName
+        }}
+        $patch = @{{
+            name=$Name; cluster=$ClusterId; site=$SiteId
+            device_type=$DeviceTypeId; role=$DeviceRoleId; status="active"
+        }} | ConvertTo-Json
+        try {{ Invoke-NB -Uri "$uri/dcim/devices/$devId/" -Method PATCH -Body $patch | Out-Null }}
+        catch {{ Write-Host "  [WARN] Update device $Name : $($_.Exception.Message)" }}
+        return $devId
+    }}
+    # Fall back to name lookup (exact, then normalized short-name)
+    $dev = Get-NetboxDevice -Name $Name
+    if (-not $dev) {{ $dev = Find-DeviceByShortName -Name $Name }}
+    if ($dev) {{
+        # Reuse the existing device (e.g. discovered "SERVER01") instead of
+        # creating a duplicate "server01.fqdn". Keep whichever name is richer:
+        # a non-auto-generated existing name is preserved over the FQDN so the
+        # discovered device (with its ports/interfaces) remains the canonical one.
+        $keepName = $dev.name
+        if ($dev.name -match "^device-\d+-\d+-\d+-\d+$" -and $Name -notmatch "^device-\d+-\d+-\d+-\d+$") {{
+            $keepName = $Name
+        }}
+        $patch = @{{
+            name=$keepName; cluster=$ClusterId; site=$SiteId
+            device_type=$DeviceTypeId; role=$DeviceRoleId; status="active"
+        }} | ConvertTo-Json
+        try {{ Invoke-NB -Uri "$uri/dcim/devices/$($dev.id)/" -Method PATCH -Body $patch | Out-Null }}
+        catch {{ Write-Host "  [WARN] Failed to update device $keepName : $($_.Exception.Message)" }}
+        return [int]$dev.id
+    }} else {{
+        $dev = Add-NetboxDevice -Name $Name -ClusterId $ClusterId -SiteId $SiteId -DeviceTypeId $DeviceTypeId -DeviceRoleId $DeviceRoleId
+    }}
+    return [int]$dev.id
+}}
+
+############################################################
+# Custom field helpers (dcim.device)
+############################################################
+
+function Ensure-CustomField {{
+    param([string]$Name,[string]$Label,[string]$Type)
+    try {{
+        $resp = Invoke-NB -Uri "$uri/extras/custom-fields/?name=$([uri]::EscapeDataString($Name))"
+        $res  = ($resp.Content | ConvertFrom-Json).results
+        if ($res.Count -gt 0) {{ return $res[0] }}
+    }} catch {{}}
+    $body = @{{
+        name=$Name; label=$Label; type=$Type; object_types=@("dcim.device")
+    }} | ConvertTo-Json
+    try {{
+        $resp = Invoke-NB -Uri "$uri/extras/custom-fields/" -Method POST -Body $body
+        return ($resp.Content | ConvertFrom-Json)
+    }} catch {{
+        Write-Host "  [WARN] Failed to create custom field $Name : $($_.Exception.Message)"
+        return $null
+    }}
+}}
+
+function Ensure-HostCustomFields {{
+    param([int]$MaxDiskIndex)
+    Ensure-CustomField -Name "vcpus"         -Label "vCPUs"           -Type "integer" | Out-Null
+    Ensure-CustomField -Name "memory_mb"     -Label "Memory (MB)"     -Type "integer" | Out-Null
+    Ensure-CustomField -Name "memory_gb"     -Label "Memory (GB)"     -Type "integer" | Out-Null
+    Ensure-CustomField -Name "disk_total_gb" -Label "Disk Total (GB)" -Type "integer" | Out-Null
+    Ensure-CustomField -Name "disk_count"    -Label "Disk Count"      -Type "integer" | Out-Null
+    Ensure-CustomField -Name "os_version"    -Label "OS Version"      -Type "text"    | Out-Null
+    Ensure-CustomField -Name "cpu_model"     -Label "CPU Model"       -Type "text"    | Out-Null
+    for ($i=0; $i -le $MaxDiskIndex; $i++) {{
+        Ensure-CustomField -Name ("disk_{{0}}_size_gb"   -f $i) -Label ("Disk {{0}} Size (GB)"   -f $i) -Type "integer" | Out-Null
+        Ensure-CustomField -Name ("disk_{{0}}_media"     -f $i) -Label ("Disk {{0}} Media"       -f $i) -Type "text"    | Out-Null
+        Ensure-CustomField -Name ("disk_{{0}}_interface" -f $i) -Label ("Disk {{0}} Interface"   -f $i) -Type "text"    | Out-Null
+    }}
+}}
+
+############################################################
+# IPAM prefix helpers
+############################################################
+
+function Get-NetboxIPAMPrefixes {{
+    $all=@(); $next="$uri/ipam/prefixes/?limit=1000"
+    while ($next) {{
+        try {{
+            $r=(Invoke-NB -Uri $next).Content|ConvertFrom-Json
+            $all+=$r.results
+            $next=if($r.next){{$r.next}}else{{$null}}
+        }} catch {{ break }}
+    }}
+    Write-Host "  Loaded $($all.Count) IPAM prefix(es)"
+    return $all
+}}
+
+function Get-NetboxPrefixFromIP {{
+    param([System.Net.IPAddress]$IP,$Prefixes)
+    if ($IP.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {{ return $null }}
+    foreach ($p in $Prefixes) {{
+        if ($p.prefix -notmatch '^\d+\.\d+\.\d+\.\d+/') {{ continue }}
+        $mask=Get-MaskFromPrefix -Prefix $p.prefix
+        $sip=[System.Net.IPAddress]::Parse($p.prefix.Split("/")[0])
+        if (Test-IPInSubnet -IPAddress $IP -Subnet $sip -Mask $mask) {{
+            return $p.prefix.Split("/")[1]
+        }}
+    }}
+    return $null
+}}
+
+############################################################
+# VM helpers
+############################################################
+
+function Find-NetboxVM {{
+    param([string]$Name)
+    try {{
+        return (((Invoke-NB -Uri "$uri/virtualization/virtual-machines/?name=$([uri]::EscapeDataString($Name))").Content|ConvertFrom-Json).results)
+    }} catch {{ return @() }}
+}}
+
+function Get-VMTotalDiskBytes {{
+    param([string]$VmName)
+    $total = 0
+    $drives = Get-VMHardDiskDrive -VMName $VmName -ErrorAction SilentlyContinue
+    foreach ($d in $drives) {{
+        try {{
+            if (Test-Path $d.Path) {{
+                $vhd = Get-VHD -Path $d.Path -ErrorAction Stop
+                if ($vhd -and $vhd.Size) {{ $total += $vhd.Size }}
+            }}
+        }} catch {{}}
+    }}
+    return [int64]$total
+}}
+
+function Sync-NetboxVM {{
+    param([Microsoft.HyperV.PowerShell.VirtualMachine]$VM,[int]$RoleId,[int]$ClusterId)
+    $nm=$VM.VMName
+    $existing=Find-NetboxVM -Name $nm
+    $tid=$null
+    foreach ($m in $existing) {{
+        if ($m.cluster -and $m.cluster.id -eq $ClusterId) {{ $tid=$m.id }}
+    }}
+    $diskGB=[int][Math]::Ceiling((Get-VMTotalDiskBytes -VmName $nm)/1GB)
+    $memMB=if($VM.DynamicMemoryEnabled){{[int]($VM.MemoryMaximum/1MB)}}else{{[int]($VM.MemoryStartup/1MB)}}
+    $status=if($VM.State -eq "Running"){{"active"}}else{{"offline"}}
+    $b=@{{
+        name=$nm; cluster=$ClusterId; status=$status; role=$RoleId
+        vcpus=[int]$VM.ProcessorCount; memory=$memMB; disk=$diskGB
+    }} | ConvertTo-Json
+    try {{
+        if ($tid) {{$r=Invoke-NB -Uri "$uri/virtualization/virtual-machines/$tid/" -Method PATCH -Body $b}}
+        else       {{$r=Invoke-NB -Uri "$uri/virtualization/virtual-machines/" -Method POST -Body $b}}
+        return [int]($r.Content|ConvertFrom-Json).id
+    }} catch {{
+        Write-Host "  [ERROR] VM sync failed for $nm : $($_.Exception.Message)"
+        $eb=Get-NBErrorBody $_.Exception
+        if($eb){{Write-Host "  $eb"}}
+        return $null
+    }}
+}}
+
+############################################################
+# MAC object helpers
+############################################################
+
+function Get-NetboxMac {{
+    param([string]$MacPretty)
+    try {{
+        $r=((Invoke-NB -Uri "$uri/dcim/mac-addresses/?mac_address=$MacPretty").Content|ConvertFrom-Json).results
+        if($r.Count -gt 0){{return $r[0]}}
+    }} catch {{}}
+    return $null
+}}
+
+function Create-NetboxMac {{
+    param([string]$MacPretty,[int]$NicId)
+    $b=@{{
+        mac_address=$MacPretty
+        assigned_object_type="virtualization.vminterface"
+        assigned_object_id=$NicId
+    }} | ConvertTo-Json
+    try {{
+        $r=(Invoke-NB -Uri "$uri/dcim/mac-addresses/" -Method POST -Body $b).Content|ConvertFrom-Json
+        Write-Host "  Created MAC $MacPretty (ID $($r.id))"
+        return $r
+    }} catch {{
+        $ex=Get-NetboxMac -MacPretty $MacPretty
+        if($ex){{Write-Host "  MAC $MacPretty exists (ID $($ex.id))"; return $ex}}
+        Write-Host "  [ERROR] MAC create failed $MacPretty : $($_.Exception.Message)"
+        return $null
+    }}
+}}
+
+function Ensure-NetboxMac {{
+    param([string]$MacPretty,[int]$NicId)
+    $m=Get-NetboxMac -MacPretty $MacPretty
+    if($m){{return $m}}
+    return (Create-NetboxMac -MacPretty $MacPretty -NicId $NicId)
+}}
+
+############################################################
+# NIC helpers (VM)
+############################################################
+
+function Test-NetboxInterfaceExists {{
+    param([int]$NicId)
+    try {{
+        return ((Invoke-NB -Uri "$uri/virtualization/interfaces/$NicId/").StatusCode -eq 200)
+    }} catch {{ return $false }}
+}}
+
+function Get-NetboxNIC {{
+    param([string]$VmId,[string]$MacAddress)
+    $mp=Normalize-MacPretty $MacAddress
+    $mr=Normalize-MacRaw $MacAddress
+    if ($mp) {{
+        try {{
+            $mo=Get-NetboxMac -MacPretty $mp
+            if ($mo -and $mo.assigned_object_type -eq "virtualization.vminterface" -and $mo.assigned_object_id) {{
+                $cid=[int]$mo.assigned_object_id
+                if (Test-NetboxInterfaceExists -NicId $cid) {{ return $cid }}
+                Write-Host "  [WARN] MAC points to deleted interface $cid -- will recreate"
+            }}
+        }} catch {{}}
+    }}
+    try {{
+        $r=((Invoke-NB -Uri "$uri/virtualization/interfaces/?virtual_machine_id=$VmId").Content|ConvertFrom-Json).results
+        foreach ($n in $r) {{
+            $nr=Normalize-MacRaw $n.mac_address
+            if ($nr -and $nr -eq $mr) {{ return [int]$n.id }}
+            if ($mp -and $n.name -like "*($mp)") {{ return [int]$n.id }}
+        }}
+    }} catch {{}}
+    return $null
+}}
+
+function Set-NetboxNICMac {{
+    param([int]$NicId,[string]$MacPretty)
+    $mo=Ensure-NetboxMac -MacPretty $MacPretty -NicId $NicId
+    if (-not $mo) {{ return }}
+    if ($mo.assigned_object_id -ne $NicId -or $mo.assigned_object_type -ne "virtualization.vminterface") {{
+        $mp=@{{assigned_object_type="virtualization.vminterface";assigned_object_id=$NicId}}|ConvertTo-Json
+        try {{Invoke-NB -Uri "$uri/dcim/mac-addresses/$($mo.id)/" -Method PATCH -Body $mp|Out-Null}}
+        catch {{Write-Host "  [WARN] MAC reassign failed: $($_.Exception.Message)"}}
+    }}
+    $pp=@{{primary_mac_address=$mo.id}}|ConvertTo-Json
+    try {{Invoke-NB -Uri "$uri/virtualization/interfaces/$NicId/" -Method PATCH -Body $pp|Out-Null}}
+    catch {{Write-Host "  [WARN] primary_mac_address set failed: $($_.Exception.Message)"}}
+}}
+
+function Create-NetboxNIC {{
+    param([Microsoft.HyperV.PowerShell.VMNetworkAdapter]$NetworkAdapter,[int]$VirtualMachineId)
+    $mr=Normalize-MacRaw $NetworkAdapter.MacAddress
+    $mp=Normalize-MacPretty $NetworkAdapter.MacAddress
+    if (-not $mr -or -not $mp) {{
+        Write-Host "  [WARN] Invalid MAC for $($NetworkAdapter.Name)"
+        return $null
+    }}
+    $nm="$($NetworkAdapter.Name) ($mp)"
+    $b=@{{name=$nm;virtual_machine=$VirtualMachineId}}|ConvertTo-Json
+    $nic=$null
+    try {{
+        $nic=((Invoke-NB -Uri "$uri/virtualization/interfaces/" -Method POST -Body $b).Content|ConvertFrom-Json)
+        Write-Host "  Created NIC: $nm (ID $($nic.id))"
+    }} catch {{
+        Write-Host "  [ERROR] NIC create failed $($NetworkAdapter.Name): $($_.Exception.Message)"
+        return $null
+    }}
+    Set-NetboxNICMac -NicId ([int]$nic.id) -MacPretty $mp
+    return [int]$nic.id
+}}
+
+function Update-NetboxNIC {{
+    param([int]$NicId,[string]$MacPretty,[string]$AdapterName)
+    $nm="$AdapterName ($MacPretty)"
+    try {{Invoke-NB -Uri "$uri/virtualization/interfaces/$NicId/" -Method PATCH -Body (@{{name=$nm}}|ConvertTo-Json)|Out-Null}}
+    catch {{Write-Host "  [WARN] NIC update $NicId failed: $($_.Exception.Message)"; return $false}}
+    Set-NetboxNICMac -NicId $NicId -MacPretty $MacPretty
+    return $true
+}}
+
+function Remove-StaleNetboxNICs {{
+    param([string]$VmId,[array]$CurrentMacsRaw)
+    try {{$r=((Invoke-NB -Uri "$uri/virtualization/interfaces/?virtual_machine_id=$VmId").Content|ConvertFrom-Json).results}}
+    catch {{return}}
+    foreach ($n in $r) {{
+        $nr=$null
+        try {{
+            $mr=((Invoke-NB -Uri "$uri/dcim/mac-addresses/?assigned_object_type=virtualization.vminterface&assigned_object_id=$($n.id)").Content|ConvertFrom-Json).results
+            if($mr.Count -gt 0){{$nr=Normalize-MacRaw $mr[0].mac_address}}
+        }} catch {{}}
+        if (-not $nr){{$nr=Normalize-MacRaw $n.mac_address}}
+        if (-not $nr -and $n.name -match '\(([0-9a-fA-F:]{{17}})\)\s*$'){{$nr=Normalize-MacRaw $Matches[1]}}
+        if (-not $nr -or $CurrentMacsRaw -notcontains $nr) {{
+            Write-Host "  Removing stale NIC: $($n.name)"
+            try {{Invoke-NB -Uri "$uri/virtualization/interfaces/$($n.id)/" -Method DELETE|Out-Null}} catch {{}}
+        }}
+    }}
+}}
+
+############################################################
+# Virtual disk helpers
+############################################################
+
+function Get-NetboxVirtualDisks {{
+    param([string]$VmId)
+    try {{
+        return ((Invoke-NB -Uri "$uri/virtualization/virtual-disks/?virtual_machine_id=$VmId").Content|ConvertFrom-Json).results
+    }} catch {{ return @() }}
+}}
+
+function Sync-NetboxVirtualDisk {{
+    param([string]$VmId,[string]$VmName,[string]$DiskPath,[int64]$DiskBytes,[int]$Index,$ExistingDisks)
+    $dn=($VmName+"-disk$Index") -replace '[^a-zA-Z0-9\-]','-'
+    $sg=[int][Math]::Ceiling($DiskBytes/1GB)
+    $ex=$ExistingDisks|Where-Object{{$_.name -eq $dn}}|Select-Object -First 1
+    $b=@{{name=$dn;size=$sg;virtual_machine=$VmId}}|ConvertTo-Json
+    try {{
+        if ($ex) {{Invoke-NB -Uri "$uri/virtualization/virtual-disks/$($ex.id)/" -Method PATCH -Body $b|Out-Null; Write-Host "  Updated disk $dn ($sg GB)"}}
+        else      {{Invoke-NB -Uri "$uri/virtualization/virtual-disks/" -Method POST -Body $b|Out-Null; Write-Host "  Created disk $dn ($sg GB)"}}
+    }} catch {{Write-Host "  [ERROR] Disk sync $dn : $($_.Exception.Message)"}}
+}}
+
+function Remove-ObsoleteNetboxVirtualDisks {{
+    param([string]$VmId,[string]$VmName,[int]$CurrentDiskCount)
+    foreach ($d in (Get-NetboxVirtualDisks -VmId $VmId)) {{
+        if ($d.name -match '-disk(\d+)$' -and [int]$Matches[1] -ge $CurrentDiskCount) {{
+            Write-Host "  Removing obsolete disk: $($d.name)"
+            try {{Invoke-NB -Uri "$uri/virtualization/virtual-disks/$($d.id)/" -Method DELETE|Out-Null}} catch {{}}
+        }}
+    }}
+}}
+
+############################################################
+# IP helpers
+############################################################
+
+function Get-NetboxIPFull {{
+    param([string]$Cidr)
+    # Try exact CIDR, then IP-only -- handles existing entries with a
+    # different prefix length (e.g. /24 stored, /32 queried)
+    foreach ($q in @($Cidr, $Cidr.Split("/")[0])) {{
+        try {{
+            $enc=[uri]::EscapeDataString($q)
+            $r=((Invoke-NB -Uri "$uri/ipam/ip-addresses/?address=$enc").Content|ConvertFrom-Json).results
+            if($r.Count -gt 0){{return $r[0]}}
+        }} catch {{}}
+    }}
+    return $null
+}}
+
+function Create-NetboxIP {{
+    param([System.Net.IPAddress]$IP,[string]$Mask)
+    $cidr="$($IP.IPAddressToString)/$Mask"
+    $b=@{{address=$cidr;shared=$true}}|ConvertTo-Json
+    try {{return ((Invoke-NB -Uri "$uri/ipam/ip-addresses/" -Method POST -Body $b).Content|ConvertFrom-Json)}}
+    catch {{Write-Host "  [ERROR] IP create $cidr : $($_.Exception.Message)"; return $null}}
+}}
+
+function Ensure-IPShared {{
+    param([int]$IpId)
+    try {{Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body (@{{shared=$true}}|ConvertTo-Json)|Out-Null}}
+    catch {{Write-Host "  [WARN] shared=true failed on IP $IpId"}}
+}}
+
+function Assign-IPToNIC {{
+    param([int]$IpId,[int]$NicId)
+    # Fetch the current IP object so we can no-op when it is already correct and
+    # preserve its address in the reassign payload (NetBox 4.x validates it).
+    $cur = $null
+    try {{ $cur = (Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/").Content | ConvertFrom-Json }}
+    catch {{ Write-Host "  [WARN] IP $IpId fetch failed: $($_.Exception.Message)"; return $false }}
+    if ($cur -and $cur.assigned_object_type -eq "virtualization.vminterface" `
+            -and [int]$cur.assigned_object_id -eq $NicId) {{
+        return $true   # already assigned to this VM NIC
+    }}
+    $addr = $cur.address   # keep the existing CIDR (e.g. 192.168.0.14/32)
+
+    # Step 1: clear any existing assignment. NetBox 400s on a direct cross-type
+    # reassignment (dcim.interface -> vminterface), so clear first and VERIFY.
+    if ($cur.assigned_object_id) {{
+        $clearBody=(@{{assigned_object_type=$null;assigned_object_id=$null}}|ConvertTo-Json)
+        try {{ Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $clearBody|Out-Null }}
+        catch {{
+            $eb = Get-NBErrorBody $_.Exception
+            Write-Host "  [WARN] IP $IpId clear failed: $($_.Exception.Message) $eb"
+        }}
+        # verify the clear actually committed before reassigning
+        try {{
+            $chk = (Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/").Content | ConvertFrom-Json
+            if ($chk.assigned_object_id) {{
+                Write-Host "  [WARN] IP $IpId still assigned after clear (object $($chk.assigned_object_type)/$($chk.assigned_object_id)); skipping reassign to avoid 400"
+                return $false
+            }}
+        }} catch {{}}
+    }}
+
+    # Step 2: assign to the VM NIC, re-sending the address so validation passes.
+    $body=@{{assigned_object_type="virtualization.vminterface"
+            assigned_object_id=$NicId}}
+    if ($addr) {{ $body.address=$addr }}
+    $b=$body|ConvertTo-Json
+    try {{
+        Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $b|Out-Null
+        return $true
+    }} catch {{
+        $eb = Get-NBErrorBody $_.Exception
+        Write-Host "  [WARN] IP $IpId assign to NIC $NicId failed: $($_.Exception.Message) -- $eb"
+        return $false
+    }}
+}}
+
+function Set-NetboxVMPrimaryIP {{
+    param([int]$VmId,[int]$IpId)
+    if (-not $VmId -or -not $IpId) {{ return $false }}
+    try {{
+        Invoke-NB -Uri "$uri/virtualization/virtual-machines/$VmId/" -Method PATCH -Body (@{{primary_ip4=$IpId}}|ConvertTo-Json)|Out-Null
+        return $true
+    }} catch {{
+        Write-Host "  [ERROR] Primary IP $IpId on VM $VmId failed: $($_.Exception.Message)"
+        return $false
+    }}
+}}
+
+############################################################
+# Host MAC / IP helpers (DCIM)
+############################################################
+
+function Ensure-HostMac {{
+    param([string]$MacPretty,[int]$InterfaceId)
+    try {{
+        $r=((Invoke-NB -Uri "$uri/dcim/mac-addresses/?mac_address=$MacPretty").Content|ConvertFrom-Json).results
+        if ($r.Count -gt 0) {{ return $r[0] }}
+    }} catch {{}}
+    $b=@{{
+        mac_address=$MacPretty
+        assigned_object_type="dcim.interface"
+        assigned_object_id=$InterfaceId
+    }} | ConvertTo-Json
+    try {{
+        $r=(Invoke-NB -Uri "$uri/dcim/mac-addresses/" -Method POST -Body $b).Content|ConvertFrom-Json
+        Write-Host "  Created host MAC $MacPretty (ID $($r.id))"
+        return $r
+    }} catch {{
+        Write-Host "  [ERROR] Host MAC create failed $MacPretty : $($_.Exception.Message)"
+        return $null
+    }}
+}}
+
+function Assign-HostIPToNIC {{
+    param([int]$IpId,[int]$NicId)
+    # Clear any existing assignment first to avoid cross-type 400 errors
+    try {{
+        $clearBody=(@{{assigned_object_type=$null;assigned_object_id=$null}}|ConvertTo-Json)
+        Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $clearBody|Out-Null
+    }} catch {{}}
+    $b=@{{assigned_object_type="dcim.interface";assigned_object_id=$NicId}}|ConvertTo-Json
+    try {{Invoke-NB -Uri "$uri/ipam/ip-addresses/$IpId/" -Method PATCH -Body $b|Out-Null}}
+    catch {{Write-Host "  [WARN] Host IP $IpId assign to NIC $NicId failed: $($_.Exception.Message)"}}
+}}
+
+############################################################
+# MAIN
+############################################################
+
+Write-Host "Starting Hyper-V to NetBox sync"
+Write-Host ""
+Test-NetboxConnectivity
+
+$bios= Get-CimInstance Win32_BIOS
+$os  = Get-CimInstance Win32_OperatingSystem
+
+$manufacturerName = $cs.Manufacturer
+$modelName        = $cs.Model
+
+Write-Host "Host hardware: $manufacturerName $modelName"
+$manufacturer = Get-OrCreateManufacturer -Name $manufacturerName
+if (-not $manufacturer -or -not $manufacturer.id) {{
+    Write-Host "[ERROR] Cannot resolve manufacturer -- aborting sync"
+    exit 1
+}}
+$deviceType = Get-OrCreateDeviceType -ManufacturerId ([int]$manufacturer.id) -Model $modelName
+if (-not $deviceType -or -not $deviceType.id) {{
+    Write-Host "[ERROR] Cannot resolve device type -- aborting sync"
+    exit 1
+}}
+$deviceRole   = Get-DeviceRoleByName -Name "Server"
+
+$clusterId = Set-NetboxCluster -Name $clusterName -NetboxHyperVClusterType $NetboxHyperVClusterType
+$deviceId  = Set-NetboxDevice -Name $hostName -ClusterId $clusterId -SiteId $SiteId -DeviceTypeId ([int]$deviceType.id) -DeviceRoleId ([int]$deviceRole.id)
+
+$serial = $bios.SerialNumber
+$asset  = $cs.IdentifyingNumber
+$hostPatch = @{{ serial=$serial; asset_tag=$asset }} | ConvertTo-Json
+try {{
+    Invoke-NB -Uri "$uri/dcim/devices/$deviceId/" -Method PATCH -Body $hostPatch | Out-Null
+    Write-Host "  Updated host serial + asset tag"
+}} catch {{ Write-Host "  [WARN] Failed to update host serial/asset: $($_.Exception.Message)" }}
+
+$vcpus       = [int]$cs.NumberOfLogicalProcessors
+$memoryBytes = [int64]$cs.TotalPhysicalMemory
+$memoryMB    = [int][Math]::Round($memoryBytes / 1MB)
+$memoryGB    = [int][Math]::Round($memoryBytes / 1GB)
+
+$diskInfo=@()
+try {{
+    if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {{ $diskInfo=Get-PhysicalDisk }}
+    else {{ $diskInfo=Get-CimInstance Win32_DiskDrive }}
+}} catch {{}}
+
+$diskCount=0; $diskTotalGB=0; $diskDetails=@(); $idx=0
+foreach ($d in $diskInfo) {{
+    $sizeBytes=0; $media="Unknown"; $iface="Unknown"
+    if ($d.PSObject.Properties.Name -contains "Size") {{$sizeBytes=[int64]$d.Size}}
+    if ($d.PSObject.Properties.Name -contains "MediaType" -and $d.MediaType) {{$media=[string]$d.MediaType}}
+    if ($d.PSObject.Properties.Name -contains "BusType" -and $d.BusType) {{$iface=[string]$d.BusType}}
+    elseif ($d.PSObject.Properties.Name -contains "InterfaceType" -and $d.InterfaceType) {{$iface=[string]$d.InterfaceType}}
+    if ($sizeBytes -gt 0) {{
+        $sizeGB=[int][Math]::Ceiling($sizeBytes/1GB); $diskTotalGB+=$sizeGB
+        $diskDetails+=[PSCustomObject]@{{Index=$idx;SizeGB=$sizeGB;Media=$media;Interface=$iface}}; $idx++
+    }}
+}}
+$diskCount=$diskDetails.Count
+$maxDiskIndex=if($diskCount -gt 0){{$diskCount-1}}else{{0}}
+Ensure-HostCustomFields -MaxDiskIndex $maxDiskIndex
+
+$cf=@{{
+    vcpus=$vcpus; memory_mb=$memoryMB; memory_gb=$memoryGB
+    disk_total_gb=$diskTotalGB; disk_count=$diskCount
+    os_version=$os.Caption; cpu_model=$cs.Model
+}}
+foreach ($d in $diskDetails) {{
+    $i=$d.Index
+    $cf["disk_{{0}}_size_gb" -f $i]      = $d.SizeGB
+    $cf["disk_{{0}}_media"   -f $i]      = $d.Media
+    $cf["disk_{{0}}_interface" -f $i]    = $d.Interface
+}}
+$cfPatch=@{{custom_fields=$cf}}|ConvertTo-Json
+try {{
+    Invoke-NB -Uri "$uri/dcim/devices/$deviceId/" -Method PATCH -Body $cfPatch | Out-Null
+    Write-Host "  Updated host custom fields (CPU/RAM/Disks/OS)"
+}} catch {{ Write-Host "  [WARN] Failed to update host custom fields: $($_.Exception.Message)" }}
+
+Write-Host ""
+Write-Host "=== Host NIC Sync ==="
+
+$hostNics=Get-NetAdapter | Where-Object {{$_.Status -eq "Up" -and $_.MacAddress}}
+$HostNicMap=@{{}}
+
+function Set-HostInterfacePrimaryMac {{
+    param([int]$InterfaceId,[int]$MacId)
+    $body=@{{primary_mac_address=$MacId}}|ConvertTo-Json
+    try {{
+        Invoke-NB -Uri "$uri/dcim/interfaces/$InterfaceId/" -Method PATCH -Body $body|Out-Null
+        Write-Host "  Set primary MAC on host interface ID $InterfaceId (MAC ID $MacId)"
+    }} catch {{Write-Host "  [WARN] Failed to set primary MAC on host interface $InterfaceId : $($_.Exception.Message)"}}
+}}
+
+foreach ($hn in $hostNics) {{
+    $raw   =Normalize-MacRaw $hn.MacAddress
+    $pretty=Normalize-MacPretty $hn.MacAddress
+    if (-not $pretty) {{Write-Host "  [WARN] Invalid MAC for host NIC $($hn.Name)"; continue}}
+    $existing=$null
+    try {{
+        $resp=Invoke-NB -Uri "$uri/dcim/interfaces/?device_id=$deviceId&mac_address=$pretty"
+        $existing=(($resp.Content|ConvertFrom-Json).results)[0]
+    }} catch {{}}
+    if ($existing) {{
+        Write-Host "  Updating host NIC $($hn.Name) ($pretty)"
+        $patch=@{{name=$hn.Name;mac_address=$pretty}}|ConvertTo-Json
+        try {{Invoke-NB -Uri "$uri/dcim/interfaces/$($existing.id)/" -Method PATCH -Body $patch|Out-Null}} catch {{}}
+        $nicId=[int]$existing.id
+    }} else {{
+        Write-Host "  Creating host NIC $($hn.Name) ($pretty)"
+        $body=@{{device=$deviceId;name=$hn.Name;type="1000base-t";mac_address=$pretty}}|ConvertTo-Json
+        $nicId=$null
+        try {{
+            $resp=Invoke-NB -Uri "$uri/dcim/interfaces/" -Method POST -Body $body
+            $nic=($resp.Content|ConvertFrom-Json); $nicId=[int]$nic.id
+        }} catch {{Write-Host "  [ERROR] Failed to create host NIC $($hn.Name)"; continue}}
+    }}
+    if ($nicId) {{
+        $hostMac=Ensure-HostMac -MacPretty $pretty -InterfaceId $nicId
+        if ($hostMac -and $hostMac.id) {{
+            Set-HostInterfacePrimaryMac -InterfaceId $nicId -MacId ([int]$hostMac.id)
+        }}
+        $HostNicMap[$hn.ifIndex]=$nicId
+    }}
+}}
+
+Write-Host ""
+Write-Host "=== Host IP Sync ==="
+
+$hostIPs=Get-NetIPAddress -AddressFamily IPv4 | Where-Object {{
+    $_.IPAddress -notlike "169.254*" -and $_.IPAddress -ne "127.0.0.1" -and $_.IPAddress -ne "0.0.0.0"
+}}
+$hostPrimaryIpId=$null
+
+foreach ($ip in $hostIPs) {{
+    $ipObj=[System.Net.IPAddress]::Parse($ip.IPAddress)
+    # Use the interface prefix length directly for host IPs
+    $mask=$ip.PrefixLength; if (-not $mask) {{$mask=32}}
+    $cidr="$($ip.IPAddress)/$mask"
+    $existing=Get-NetboxIPFull -Cidr $cidr
+    if ($existing) {{
+        Write-Host "  IP exists: $cidr"
+        Ensure-IPShared -IpId $existing.id
+        $ipId=[int]$existing.id
+    }} else {{
+        Write-Host "  Creating host IP $cidr"
+        $newIP=Create-NetboxIP -IP $ipObj -Mask $mask
+        if (-not $newIP) {{continue}}
+        $ipId=[int]$newIP.id
+    }}
+    $nicId=$null
+    if ($HostNicMap.ContainsKey($ip.InterfaceIndex)) {{$nicId=$HostNicMap[$ip.InterfaceIndex]}}
+    else {{
+        try {{
+            $firstNic=((Invoke-NB -Uri "$uri/dcim/interfaces/?device_id=$deviceId").Content|ConvertFrom-Json).results[0]
+            if($firstNic){{$nicId=[int]$firstNic.id}}
+        }} catch {{}}
+    }}
+    if ($nicId) {{
+        Assign-HostIPToNIC -IpId $ipId -NicId $nicId
+        Write-Host "  Assigned $cidr to NIC ID $nicId"
+        if (-not $hostPrimaryIpId) {{$hostPrimaryIpId=$ipId}}
+    }}
+}}
+
+if ($hostPrimaryIpId) {{
+    try {{
+        Invoke-NB -Uri "$uri/dcim/devices/$deviceId/" -Method PATCH -Body (@{{primary_ip4=$hostPrimaryIpId}}|ConvertTo-Json)|Out-Null
+        Write-Host "  Host primary IP set (ID $hostPrimaryIpId)"
+    }} catch {{Write-Host "  [WARN] Failed to set host primary IP: $($_.Exception.Message)"}}
+}} else {{ Write-Host "  [WARN] No primary IP for host" }}
+
+$prefixes=Get-NetboxIPAMPrefixes
+$vms=Get-VM
+
+foreach ($vm in $vms) {{
+    $vmName=$vm.VMName
+    Write-Host ""
+    Write-Host "=== $vmName ==="
+    $vmId=Sync-NetboxVM -VM $vm -ClusterId $clusterId -RoleId $NetboxServerRoleID
+    if (-not $vmId) {{continue}}
+
+    $nics=Get-VMNetworkAdapter -VMName $vmName
+    $curMacs=@()
+    foreach ($n in $nics) {{$mr=Normalize-MacRaw $n.MacAddress; if($mr){{$curMacs+=$mr}}}}
+    Remove-StaleNetboxNICs -VmId $vmId -CurrentMacsRaw $curMacs
+
+    $exDisks=Get-NetboxVirtualDisks -VmId $vmId
+    $drives=Get-VMHardDiskDrive -VMName $vmName
+    $di=0
+    foreach ($d in $drives) {{
+        try {{
+            if (Test-Path $d.Path) {{
+                $vhd=Get-VHD -Path $d.Path -ErrorAction Stop
+                Sync-NetboxVirtualDisk -VmId $vmId -VmName $vmName -DiskPath $d.Path -DiskBytes $vhd.Size -Index $di -ExistingDisks $exDisks
+                $di++
+            }} else {{Write-Host "  [WARN] VHD path not found: $($d.Path)"}}
+        }} catch {{Write-Host "  [ERROR] VHD read $vmName $($d.Path): $($_.Exception.Message)"}}
+    }}
+    Remove-ObsoleteNetboxVirtualDisks -VmId $vmId -VmName $vmName -CurrentDiskCount $di
+
+    $mgmtIpId=$null
+    foreach ($nic in $nics) {{
+        $mr=Normalize-MacRaw $nic.MacAddress; $mp=Normalize-MacPretty $nic.MacAddress
+        if (-not $mr -or -not $mp) {{Write-Host "  Skipping $($nic.Name) -- invalid MAC"; continue}}
+        $nicId=Get-NetboxNIC -VmId $vmId -MacAddress $nic.MacAddress
+        if ($nicId) {{
+            Write-Host "  Updating NIC $($nic.Name) ($mp)"
+            if (-not (Update-NetboxNIC -NicId $nicId -MacPretty $mp -AdapterName $nic.Name)) {{$nicId=$null}}
+        }}
+        if (-not $nicId) {{
+            Write-Host "  Creating NIC $($nic.Name) ($mp)"
+            $nicId=Create-NetboxNIC -NetworkAdapter $nic -VirtualMachineId $vmId
+        }}
+        if (-not $nicId) {{Write-Host "  [ERROR] NIC create failed $($nic.Name)"; continue}}
+
+        $candidates=$nic.IPAddresses|Where-Object{{$_ -and ($_ -notlike "fe80*") -and ($_ -notlike "*:*")}}
+        foreach ($ipStr in $candidates) {{
+            $ipObj=$null
+            try {{$ipObj=[System.Net.IPAddress]::Parse($ipStr)}} catch {{continue}}
+            if ($ipObj.IPAddressToString -eq "0.0.0.0") {{continue}}
+            if ($ipObj.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {{continue}}
+            $mask=Get-NetboxPrefixFromIP -IP $ipObj -Prefixes $prefixes
+            if (-not $mask) {{ Write-Host "  [WARN] No IPAM prefix for $($ipObj.IPAddressToString) -- assigning as /32"; $mask = "32" }}
+            $cidr="$($ipObj.IPAddressToString)/$mask"
+            $exIP=Get-NetboxIPFull -Cidr $cidr
+            if ($exIP) {{
+                $ipId=[int]$exIP.id
+                Ensure-IPShared -IpId $ipId
+                if (Assign-IPToNIC -IpId $ipId -NicId $nicId) {{
+                    Write-Host "  Assigned/reassigned $cidr to NIC $nicId"
+                    if (-not $mgmtIpId) {{$mgmtIpId=$ipId}}
+                }}
+            }} else {{
+                $newIP=Create-NetboxIP -IP $ipObj -Mask $mask
+                if (-not $newIP) {{continue}}
+                $ipId=[int]$newIP.id
+                if (Assign-IPToNIC -IpId $ipId -NicId $nicId) {{
+                    Write-Host "  Created and assigned $cidr to NIC $nicId"
+                    if (-not $mgmtIpId) {{$mgmtIpId=$ipId}}
+                }}
+            }}
+        }}
+    }}
+    if ($mgmtIpId) {{
+        if (Set-NetboxVMPrimaryIP -VmId $vmId -IpId $mgmtIpId) {{
+            Write-Host "  Primary IP set (ID $mgmtIpId)"
+        }}
+    }} else {{Write-Host "  [WARN] No primary IP for $vmName"}}
+}}
+
+Write-Host ""
+Write-Host "Sync complete"
+""").lstrip('\n')
+
+with open(out_path, 'w') as f:
+    f.write(ps1)
+print("OK")
+
+GENEOF
+
+    if ! grep -q 'Sync complete' "$ps1_file" 2>/dev/null; then
+        log_error "PS1 generation failed"; rm -f "$ps1_file"; pause; return 1
+    fi
+    log_ok "PS1 script generated: $ps1_file  ($(wc -l < "$ps1_file") lines)"
+
+    # Execution mode -------------------------------------------------------
+    local run_mode
+    if [[ -n "$_auto_mode" ]]; then
+        run_mode="1"  # always execute via WinRM in auto mode
+    else
+        printf "\n  ${W}How to run the sync?${NC}\n"
+        echo "   1) Execute now via WinRM (pywinrm)"
+        echo "   2) Save PS1 to file for manual execution"
+        echo "   0) Cancel"
+        read -rp $'\n  Choice: ' run_mode
+    fi
+
+    case "$run_mode" in
+    1)  if ! python3 -c "import winrm" 2>/dev/null; then
+            log_error "pywinrm not installed: pip3 install pywinrm --break-system-packages"
+            rm -f "$ps1_file"; pause; return 1
+        fi
+        log_info "Connecting to $host_ip:$win_port as $win_user and running PS1..."
+        python3 - "$host_ip" "$win_user" "$win_pass" \
+                  "$win_port" "$win_proto" "$ps1_file" <<'RUNEOF'
+import sys, winrm, base64, uuid
+
+host, user, passwd, port, proto, ps1_path = sys.argv[1:7]
+
+# WinRM rejects large scripts sent as a single run_ps() call with HTTP 500
+# (error 2147942606 "filename or extension is too long").
+# Fix: base64-encode the PS1, upload in 1800-char chunks, decode on the
+# remote host, execute the saved file, then clean up.
+try:
+    ps1_bytes = open(ps1_path, "rb").read()
+    ps1_b64   = base64.b64encode(ps1_bytes).decode("ascii")
+    chunks    = [ps1_b64[i:i+1800] for i in range(0, len(ps1_b64), 1800)]
+
+    session = winrm.Session(
+        f"{proto}://{host}:{port}/wsman",
+        auth=(user, passwd),
+        transport="ntlm",
+        server_cert_validation="ignore",
+        operation_timeout_sec=600,
+        read_timeout_sec=620
+    )
+
+    uid     = uuid.uuid4().hex[:10]
+    tmp_b64 = f"C:\\Windows\\Temp\\nbs_{uid}.b64"
+    tmp_ps1 = f"C:\\Windows\\Temp\\nbs_{uid}.ps1"
+
+    print(f"Uploading PS1 ({len(ps1_bytes)} bytes, {len(chunks)} chunks) to {host}...")
+    for i, chunk in enumerate(chunks):
+        safe = chunk.replace('"', '`"')
+        cmd  = (f'Set-Content -Path "{tmp_b64}" -Value "{safe}" -NoNewline -Encoding ASCII'
+                if i == 0 else
+                f'Add-Content -Path "{tmp_b64}" -Value "{safe}" -NoNewline -Encoding ASCII')
+        r = session.run_ps(cmd)
+        if r.status_code != 0:
+            print(f"Chunk {i} failed: {r.std_err.decode("utf-8","replace")}", file=sys.stderr)
+            sys.exit(1)
+        if i % 20 == 0:
+            print(f"  chunk {i+1}/{len(chunks)}...")
+
+    decode_cmd = (
+        f'$b=(Get-Content "{tmp_b64}" -Raw -Encoding ASCII).Trim();'
+        f'$x=[System.Convert]::FromBase64String($b);'
+        f'[System.IO.File]::WriteAllBytes("{tmp_ps1}",$x);'
+        f'Remove-Item "{tmp_b64}" -Force -ErrorAction SilentlyContinue'
+    )
+    r = session.run_ps(decode_cmd)
+    if r.status_code != 0:
+        print("Decode failed: " + r.std_err.decode("utf-8","replace"), file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Executing on {host}...")
+    r = session.run_ps(
+        f'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; & "{tmp_ps1}"'
+    )
+    if r.std_out:
+        print(r.std_out.decode("utf-8","replace"))
+    if r.std_err:
+        txt = r.std_err.decode("utf-8","replace").strip()
+        if txt:
+            print("STDERR:", txt[:3000])
+    session.run_ps(f'Remove-Item "{tmp_ps1}" -Force -ErrorAction SilentlyContinue')
+    sys.exit(r.status_code)
+except Exception as e:
+    print(f"WinRM error: {e}", file=sys.stderr)
+    sys.exit(1)
+RUNEOF
+        log_info "WinRM execution complete (exit $?)" ;;
+    2)  read -rp "  Save PS1 to path [/tmp/hyperv_netbox_sync.ps1]: " save_path
+        save_path="${save_path:-/tmp/hyperv_netbox_sync.ps1}"
+        cp "$ps1_file" "$save_path"
+        log_ok "Saved: $save_path"
+        printf "\n  ${W}Manual run steps:${NC}\n"
+        printf "  1. Copy %s to the Hyper-V Windows host\n" "$save_path"
+        printf "  2. Open PowerShell as Administrator\n"
+        printf "  3. Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass\n"
+        printf "  4. .\\hyperv_netbox_sync.ps1\n\n" ;;
+    0)  log_info "Cancelled" ;;
+    esac
+    rm -f "$ps1_file"
+    [[ -z "$_auto_mode" ]] && pause
+}
 
 # -----------------------------------------------------------------------------
 # IMPORT / AGENT DEPLOYMENT MENU
 # -----------------------------------------------------------------------------
+generate_collector_script() {
+    # Emit a standalone, read-only collector that runs on ANY Windows machine
+    # (workstation or Hyper-V host) WITHOUT WinRM or NetBox access. It writes a
+    # single JSON file that this tool ingests via the reconciler. Same
+    # collection logic as the WinRM PS_BASE/PS_HYPERV probes, so output is
+    # identical whether gathered over WinRM or run by hand on a closed host.
+    local dest="${1:-$DISCOVERY_DIR/netbox-collector.ps1}"
+    mkdir -p "$(dirname "$dest")" 2>/dev/null
+    cat > "$dest" <<'COLLECTEOF'
+<#
+  netbox-collector.ps1  --  standalone, read-only inventory collector.
+  Runs on ANY Windows machine (workstation or Hyper-V host). Requires NO WinRM
+  and NO NetBox connectivity. Emits one JSON file that netbox-discovery.sh
+  ingests via its reconciler. Collect-only: it writes nothing to the system
+  and makes no network calls.
+
+  Usage (local, no admin needed for most fields):
+    powershell -ExecutionPolicy Bypass -File .\netbox-collector.ps1
+    powershell -ExecutionPolicy Bypass -File .\netbox-collector.ps1 -OutFile C:\temp\out.json
+#>
+param([string]$OutFile = "")
+$ErrorActionPreference = "SilentlyContinue"
+
+# ---- Host hardware + physical NICs (identical to the WinRM PS_BASE probe) ----
+$cs   = Get-CimInstance Win32_ComputerSystem  2>$null
+$os   = Get-CimInstance Win32_OperatingSystem 2>$null
+$bios = Get-CimInstance Win32_BIOS            2>$null
+$cpu  = Get-CimInstance Win32_Processor 2>$null | Select-Object -First 1
+$nics = Get-NetAdapter -Physical 2>$null | Where-Object { $_.Status -eq "Up" } |
+        ForEach-Object {
+            $if = $_
+            $v4 = Get-NetIPAddress -InterfaceIndex $if.ifIndex 2>$null |
+                  Where-Object { $_.AddressFamily -eq "IPv4" -and $_.IPAddress -ne "127.0.0.1" }
+            [ordered]@{ Name=$if.Name; Description=$if.InterfaceDescription;
+                        MacAddress=($if.MacAddress -replace "-",":").ToUpper();
+                        IPAddresses=@($v4.IPAddress); PrefixLens=@([int[]]$v4.PrefixLength) }
+        }
+$isHyperV = $false
+try { $isHyperV = ($null -ne (Get-Command Get-VM -ErrorAction SilentlyContinue)) } catch {}
+$pdisks = @()
+try {
+    if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
+        $pd = Get-PhysicalDisk 2>$null
+    } else { $pd = Get-CimInstance Win32_DiskDrive 2>$null }
+    foreach ($d in $pd) {
+        $sz = [int64]0; $md = "Unknown"; $ifc = "Unknown"
+        if ($d.Size) { $sz = [int64]$d.Size }
+        if ($d.MediaType)        { $md  = [string]$d.MediaType }
+        if ($d.BusType)          { $ifc = [string]$d.BusType }
+        elseif ($d.InterfaceType){ $ifc = [string]$d.InterfaceType }
+        if ($sz -gt 0) {
+            $pdisks += [ordered]@{ SizeGB=[int][Math]::Ceiling($sz/1GB);
+                                   Media=$md; Interface=$ifc }
+        }
+    }
+} catch {}
+$hostObj = [ordered]@{ Hostname=$cs.Name; Domain=$cs.Domain; Manufacturer=$cs.Manufacturer;
+            Model=$cs.Model; SerialNumber=$bios.SerialNumber; OS=$os.Caption;
+            OSVersion=$os.Version; IsServer=($os.ProductType -ne 1);
+            IsHyperV=$isHyperV;
+            CPUName=$cpu.Name; CPUCores=[int]$cpu.NumberOfCores;
+            LogicalProcessors=[int]$cs.NumberOfLogicalProcessors;
+            MemoryGB=[math]::Round($cs.TotalPhysicalMemory/1GB,2);
+            PhysicalDisks=@($pdisks);
+            NetworkAdapters=@($nics) }
+
+# ---- Hyper-V VMs + disks + neighbors (identical to the WinRM PS_HYPERV probe) ----
+$hvVMs = @()
+$neighbors = @()
+if ($isHyperV) {
+    $adByVm = @{}
+    Get-VMNetworkAdapter -VMName * 2>$null | ForEach-Object {
+        $k = "$($_.VMName)"
+        $m = ($_.MacAddress -replace "(..)(?=.)",'$1:').ToUpper()
+        if (-not $adByVm.ContainsKey($k)) { $adByVm[$k] = @() }
+        $adByVm[$k] += [ordered]@{ Name=$_.Name; MacAddress=$m;
+                                   SwitchName=$_.SwitchName;
+                                   IPAddresses=@($_.IPAddresses) }
+    }
+    $hvVMs = Get-VM 2>$null | ForEach-Object {
+        $vm = $_
+        $dbytes = [int64]0
+        $dlist = @()
+        foreach ($dd in (Get-VMHardDiskDrive -VMName $vm.Name 2>$null)) {
+            try {
+                if ($dd.Path -and (Test-Path $dd.Path)) {
+                    $vh = Get-VHD -Path $dd.Path -ErrorAction Stop
+                    if ($vh -and $vh.Size) { $dbytes += [int64]$vh.Size; $dlist += [int64]$vh.Size }
+                }
+            } catch {}
+        }
+        if ($vm.DynamicMemoryEnabled) { $memB = [int64]$vm.MemoryMaximum }
+        else                          { $memB = [int64]$vm.MemoryStartup }
+        [ordered]@{ Name=$vm.Name; State="$($vm.State)";
+                    Generation=$vm.Generation;
+                    ProcessorCount=[int]$vm.ProcessorCount;
+                    MemoryStartupBytes=$memB;
+                    DiskBytes=$dbytes;
+                    Disks=@($dlist);
+                    VMId="$($vm.VMId)";
+                    NetworkAdapters=@($adByVm["$($vm.Name)"]) }
+    }
+    $neighbors = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.State -in 'Reachable','Stale','Permanent' -and
+                       $_.LinkLayerAddress -match '^([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$' } |
+        ForEach-Object {
+            [ordered]@{ IP="$($_.IPAddress)";
+                        MAC=($_.LinkLayerAddress -replace '-',':').ToLower() }
+        }
+}
+
+# ---- Merge + emit (single JSON; no NetBox, no WinRM) ----
+$payload = [ordered]@{
+    CollectorVersion = "1.0"
+    CollectedAt      = (Get-Date).ToString("o")
+    Host             = $hostObj
+    HyperVVMs        = @($hvVMs)
+    NeighborTable    = @($neighbors)
+}
+$json = $payload | ConvertTo-Json -Depth 8
+if (-not $OutFile) {
+    $base = "netbox-collect-$($cs.Name).json"
+    $desk = [Environment]::GetFolderPath("Desktop")
+    if ($desk -and (Test-Path $desk)) { $OutFile = Join-Path $desk $base }
+    else { $OutFile = Join-Path $env:TEMP $base }
+}
+$json | Out-File -FilePath $OutFile -Encoding UTF8
+Write-Host ""
+Write-Host "NetBox collector JSON written to:"
+Write-Host "  $OutFile"
+Write-Host ""
+Write-Host "Copy this file back to the netbox-discovery host and import it."
+COLLECTEOF
+    chmod 0644 "$dest" 2>/dev/null
+    log_ok "Standalone collector written: $dest"
+    printf "\n  ${W}Copy it to any Windows machine and run (no WinRM needed):${NC}\n"
+    printf "    powershell -ExecutionPolicy Bypass -File .\\netbox-collector.ps1\n\n"
+    printf "  ${D}It writes netbox-collect-<HOST>.json to the Desktop (or %%TEMP%%).${NC}\n"
+    printf "  ${D}Bring that JSON back here to import (single coordinated writer).${NC}\n"
+}
+
 menu_import() {
     while true; do
         banner
@@ -4202,10 +5083,11 @@ menu_import() {
         echo "   1) Register THIS machine via netbox-agent"
         echo "   2) Deploy agent to a specific host (SSH)"
         echo "   3) Deploy agent to ALL discovered Linux hosts"
-        echo "   4) Hyper-V VM sync info (now automatic via reconcile)"
+        echo "   4) Import Windows Hyper-V host (WinRM)"
         echo "   5) Generate agent config file (netbox_agent.yaml)"
         echo "   6) Show agent config for manual install"
         echo "   7) Sync NetBox Device Type Library (community YAML)"
+        echo "   8) Generate standalone collector script (JSON, runs anywhere)"
         echo "   0) Back"
         read -rp $'\nChoice: ' c
         local tip
@@ -4222,12 +5104,9 @@ menu_import() {
            fi
            confirm "Deploy to all Linux hosts in $(basename "$latest")?" \
                && deploy_agents_to_discovered "$latest" ;;
-        4) printf "${C}  Hyper-V VMs are now synced automatically.${NC}\n"
-           printf "  Run a scan, then 'Sync Last Results to NetBox' -- the\n"
-           printf "  reconciler collects each Hyper-V host's VM inventory and\n"
-           printf "  creates the VMs (with cluster, vCPU/memory and IPs) centrally.\n"
-           printf "  The old NetBox-writing PowerShell upload has been retired.\n"
-           pause ;;
+        4) read -rp "  Hyper-V host IP: " tip
+           valid_ip "$tip" && import_hyperv_powershell "$tip" \
+               || { printf "${R}  Invalid IP${NC}\n"; pause; } ;;
         5) read -rp "  Output path [/etc/netbox_agent.yaml]: " dest
            dest="${dest:-/etc/netbox_agent.yaml}"
            generate_agent_config "$dest" && pause ;;
@@ -4239,6 +5118,9 @@ menu_import() {
            printf "netbox_agent -c /etc/netbox_agent.yaml --register\n\n"
            pause ;;
         7) import_device_type_library ;;
+        8) read -rp "  Output path [$DISCOVERY_DIR/netbox-collector.ps1]: " dest
+           generate_collector_script "${dest:-$DISCOVERY_DIR/netbox-collector.ps1}"
+           pause ;;
         0) return ;;
         esac
     done
