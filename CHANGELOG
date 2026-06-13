@@ -1,3 +1,12 @@
+#  Changelog v2.5.14 (hardware identity fallback to baseboard):
+#   - INTEL-NUC returned blank Manufacturer/Model/Serial because NUCs (and many
+#     whitebox/desktop boards) leave Win32_ComputerSystem + Win32_BIOS empty but
+#     populate Win32_BaseBoard. Added a fallback chain: Manufacturer <-
+#     ComputerSystem else BaseBoard.Manufacturer; Model <- ComputerSystem else
+#     BaseBoard.Product; Serial <- BIOS else BaseBoard.SerialNumber. Hosts that
+#     populate the primary classes (e.g. SERVER01/HP) are unchanged.
+#   CollectorVersion -> 1.2.
+#
 #  Changelog v2.5.13 (collector data-quality fixes from first live JSON):
 #   Verified against real SERVER01 + INTEL-NUC collector output; fixed:
 #   - UTF-8 BOM: Out-File -Encoding UTF8 prepended a BOM that breaks strict
