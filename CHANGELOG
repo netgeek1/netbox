@@ -1,3 +1,18 @@
+#  Changelog v2.5.20 (fix: selectors re-grabbing their own derived output):
+#   - Bug: every 'newest results file' selector globbed results_*.json and
+#     filtered with 'grep -v reconciled'. The writer writes results_<ts>.plan.json
+#     and results_<ts>.reconciled.json back into the SAME directory, and
+#     .plan.json is NOT excluded by that grep -- and it's newer than the raw
+#     scan. So ls -t | head -1 picked the plan file; feeding a plan back into
+#     the reconciler yields 0 devices / 0 VMs / 0 clusters. This surfaced after
+#     a second option-9 run (the first run created the .plan.json).
+#   - Fix: one latest_scan_file() helper that excludes our derived outputs
+#     (\.(plan|reconciled)\.json$), used by ALL ten selectors (scan/sync
+#     options, reconcile preview, single writer, etc.). Raw scans only.
+#   - Note: derived files now living in the discovery dir from earlier runs are
+#     harmless -- they're filtered out. To unclutter: mkdir derived && mv
+#     results_*.plan.json results_*.reconciled.json derived/
+#
 #  Changelog v2.5.19 (fix regression: device custom fields + disks; VM keying):
 #   - ROOT CAUSE of missing device custom fields: the single writer ensured
 #     memory_gb as 'text' but sent the raw float (e.g. 31.92), while NetBox
