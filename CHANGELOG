@@ -1,3 +1,24 @@
+#  Changelog v2.5.21 (WinRM hardware parity + VM virtual disks):
+#   - WHY custom fields were empty: merge_host_data extracted Hyper-V VM
+#     inventory from WinRM but NOT host hardware, so WinRM-scanned hosts had no
+#     'hardware' for the single writer to populate cpu/ram/os/disk fields from
+#     (only collector-imported hosts had it). Fixed: merge_host_data now pulls
+#     CPUName/CPUCores/LogicalProcessors/MemoryGB/PhysicalDisks into
+#     host['hardware'] in the SAME shape the collector import uses, and the
+#     reconciler's merge carries 'hardware' onto the surviving record (dual-NIC
+#     Hyper-V hosts). After a WinRM scan, device custom fields now populate.
+#   - VM virtual disks restored: the PS1 created per-VM NetBox VirtualDisk
+#     objects (virtualization/virtual-disks/); the single writer only set the
+#     aggregate disk field. Added nb_sync_vm_disk() + a per-VM loop that creates
+#     one VirtualDisk per VHD (name '<vm>-disk<N>', size GB) from the hyperv_vms
+#     Disks[] data the plan now carries. NetBox 4.x aggregates VM.disk from
+#     these; VMs with no per-disk detail still get the aggregate disk field.
+#     Validated: all 28 VMs carry per-disk sizing (e.g. FortiManager -> [5,40]).
+#   - NOTE: to populate this you must run a WinRM scan (or collector import) so
+#     the hosts carry hardware + per-VM disks; a pure SNMP/network scan has
+#     neither. Obsolete-disk cleanup (removing shrunk VMs' extra disks) is a
+#     deliberate follow-up -- this change only creates/updates, never deletes.
+#
 #  Changelog v2.5.20 (fix: selectors re-grabbing their own derived output):
 #   - Bug: every 'newest results file' selector globbed results_*.json and
 #     filtered with 'grep -v reconciled'. The writer writes results_<ts>.plan.json
