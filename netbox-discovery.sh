@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.21
+#  Version: 2.5.22
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.21"
+SCRIPT_VERSION="2.5.22"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -838,6 +838,19 @@ nb_ensure_custom_field() {
                 --argjson ot "[\"$obj_types\"]" \
                 '{name:$n,label:$l,type:$t,object_types:$ot}')" \
             >/dev/null 2>&1 || true
+    else
+        # Reconcile the type of a pre-existing field. An earlier build created
+        # some fields with the wrong type (e.g. memory_gb as 'text'); since this
+        # was get-or-create, the wrong type persisted. Sending an integer to a
+        # text field 400s the ENTIRE custom_fields PATCH, silently dropping every
+        # device field. Upgrade the type to match (best-effort; harmless if the
+        # field has no incompatible existing values, which is our case).
+        local cur; cur=$(echo "$res" \
+            | jq -r '(.results[0].type|objects|.value) // (.results[0].type|strings) // empty' 2>/dev/null)
+        if [[ -n "$cur" && "$cur" != "$type" ]]; then
+            nb_patch "extras/custom-fields/${id}/" \
+                "$(jq -n --arg t "$type" '{type:$t}')" >/dev/null 2>&1 || true
+        fi
     fi
 }
 
