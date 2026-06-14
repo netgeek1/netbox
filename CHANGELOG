@@ -1,3 +1,21 @@
+#  Changelog v2.5.23 (fix: custom fields STILL partial -- memory_gb + resilient patch):
+#   - Symptom: only cpu_model/cpu_cores/memory_gb populated (the 3 fields the
+#     old 2.5.16-2.5.18 writer set, with memory_gb='31.41' as TEXT); every field
+#     added in 2.5.19 stayed blank -> the full custom_fields PATCH was STILL
+#     failing. Cause: memory_gb already holds a text value, so NetBox refuses to
+#     recast it to integer; the 2.5.22 type-reconcile couldn't change it, the
+#     writer kept sending an integer, and the whole PATCH 400'd (one bad field
+#     drops them all).
+#   - Fix 1: memory_gb is now a TEXT field and the value is sent as a string
+#     (e.g. '31.92'). This matches the existing type everywhere -- no risky
+#     type change, always populates. memory_mb stays an integer for precision.
+#   - Fix 2 (defensive, permanent): the device custom_fields PATCH is now
+#     resilient. If the bundled PATCH is rejected, each field is applied
+#     individually so the rest still land, and the offending field is logged by
+#     name. No single bad field can ever blank the whole set again.
+#   - nb_api returns the response body (exit 0 even on HTTP 400); success is
+#     detected by the presence of .id in the response.
+#
 #  Changelog v2.5.22 (fix: empty device custom fields on hardware-bearing hosts):
 #   - THE actual cause of empty custom fields (even with collector hardware
 #     present): nb_ensure_custom_field was get-or-create and never reconciled
