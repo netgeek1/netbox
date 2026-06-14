@@ -1,3 +1,20 @@
+#  Changelog v2.5.22 (fix: empty device custom fields on hardware-bearing hosts):
+#   - THE actual cause of empty custom fields (even with collector hardware
+#     present): nb_ensure_custom_field was get-or-create and never reconciled
+#     an existing field's TYPE. The 2.5.16-2.5.18 writer created memory_gb as
+#     'text'; testing against that same NetBox, 2.5.19's 'ensure integer' was a
+#     no-op (field already existed), so memory_gb stayed 'text'. The writer then
+#     sent an integer to it, which 400s the ENTIRE custom_fields PATCH -- and
+#     the error was swallowed (|| true) -- so EVERY device custom field silently
+#     dropped. (Not a data problem; the collector hardware was there.)
+#   - Fix: nb_ensure_custom_field now PATCHes an existing field's type to match
+#     when it differs (best-effort; safe because the failed patches meant the
+#     field had no values to conflict). On the next option-9 run it self-heals
+#     memory_gb text->integer, and the full custom_fields PATCH then lands.
+#   - Confirmed the collector script emits per-VM DiskBytes + Disks[] and the
+#     importer carries them as hyperv_vms, so 2.5.21's VirtualDisk creation has
+#     data on the collector-import flow (no WinRM required).
+#
 #  Changelog v2.5.21 (WinRM hardware parity + VM virtual disks):
 #   - WHY custom fields were empty: merge_host_data extracted Hyper-V VM
 #     inventory from WinRM but NOT host hardware, so WinRM-scanned hosts had no
