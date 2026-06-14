@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.9
+#  Version: 2.5.17
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.16"
+SCRIPT_VERSION="2.5.17"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -5230,6 +5230,41 @@ def vm_status(state):
     return 'active'
 
 
+ROLE_KEYWORDS = [
+    (('opnsense', 'pfsense', 'fortigate', 'fgt', 'firewall', 'fortinet'), 'Firewall'),
+    (('pihole', 'pi-hole', 'adguard', 'unbound', 'bind9'), 'DNS'),
+    (('plex', 'jellyfin', 'emby', 'kodi'), 'Media'),
+    (('veeam', 'goodsync', 'backup', 'bacula', 'restic', 'duplicati'), 'Backup'),
+    (('prometheus', 'grafana', 'prtg', 'zabbix', 'nagios', 'librenms', 'netdata'), 'Monitoring'),
+    (('syslog', 'graylog', 'fortianalyzer', 'faz', 'loki'), 'Logging'),
+    (('tailscale', 'zerotier', 'wireguard', 'openvpn'), 'VPN'),
+    (('docker', 'raspidocker', 'kubernetes', 'k8s', 'portainer', 'container'), 'Container Host'),
+    (('kali', 'sophos', 'suricata', 'snort', 'pentest'), 'Security'),
+    (('fortiauthenticator', 'radius', 'freeradius', 'authentik', 'keycloak'), 'Authentication'),
+    (('iventoy', 'pxe', 'tftp', 'foreman', 'provision'), 'Provisioning'),
+    (('fortimanager', 'fmg', 'vcenter'), 'Management'),
+]
+PORT_ROLES = {53: 'DNS', 32400: 'Media', 514: 'Logging', 9090: 'Monitoring'}
+
+
+def vm_role(name, ports, fallback):
+    n = (name or '').lower()
+    for kws, role in ROLE_KEYWORDS:
+        if any(k in n for k in kws):
+            return role
+    for p in (ports or []):
+        try:
+            pn = int(str(p.get('port') if isinstance(p, dict) else p).split('/')[0])
+        except Exception:
+            continue
+        if pn in PORT_ROLES:
+            return PORT_ROLES[pn]
+    fb = (fallback or '').strip()
+    if fb and fb not in ('Unknown', 'Workstation', 'Endpoint'):
+        return fb
+    return 'Server'
+
+
 def build(reconciled):
     hosts = reconciled['hosts']
 
@@ -5321,6 +5356,7 @@ def build(reconciled):
             vms.append({
                 'name': name,
                 'cluster': cluster,
+                'role': vm_role(name, h.get('ports'), h.get('device_role')),
                 'status': vm_status(h.get('vm_state')),
                 'vcpus': int(vcpus) if vcpus else None,
                 'memory_mb': int(round(mem_b / 1048576)) if mem_b else None,
@@ -5355,9 +5391,9 @@ def dry_run(plan):
     out.append('VMs (%d):' % len(plan['vms']))
     for v in plan['vms']:
         ipf = v['primary_ip'] or ('NO-IP' + ('!' if v['no_ip_flag'] else ''))
-        out.append('  %-26s @%-14s %-8s vcpu=%s mem=%sMB disk=%sGB ip=%s' % (
-            v['name'][:26], (v['cluster'] or '')[:14], v['status'],
-            v['vcpus'], v['memory_mb'], v['disk_gb'], ipf))
+        out.append('  %-26s @%-12s %-10s %-8s vcpu=%s mem=%sMB disk=%sGB ip=%s' % (
+            v['name'][:26], (v['cluster'] or '')[:12], (v.get('role') or '')[:10],
+            v['status'], v['vcpus'], v['memory_mb'], v['disk_gb'], ipf))
     out.append('')
     out.append('TOT:  %d devices, %d VMs, %d clusters' % (
         len(plan['devices']), len(plan['vms']), len(plan['clusters'])))
@@ -5446,8 +5482,9 @@ PLANEOF
     done < <(jq -c '.devices[]' "$plan")
 
     while IFS= read -r v; do
-        local vname vcl status vcpus vmem vdisk vip vmac cid vm_id vif
+        local vname vcl vrole status vcpus vmem vdisk vip vmac cid vm_id vif role_id
         vname=$(jq -r '.name' <<<"$v");   vcl=$(jq -r '.cluster' <<<"$v")
+        vrole=$(jq -r '.role // "Server"' <<<"$v")
         status=$(jq -r '.status' <<<"$v")
         vcpus=$(jq -r '.vcpus // ""' <<<"$v");  vmem=$(jq -r '.memory_mb // ""' <<<"$v")
         vdisk=$(jq -r '.disk_gb // ""' <<<"$v"); vip=$(jq -r '.primary_ip // ""' <<<"$v")
@@ -5459,6 +5496,12 @@ PLANEOF
         vm_id=$(nb_upsert_vm "$vname" "$cid" "$status" "$vcpus" "$vmem" "$site_id" 2>>"$LOG_FILE")
         if [[ -z "$vm_id" || ! "$vm_id" =~ ^[0-9]+$ ]]; then
             log_warn "VM upsert failed: $vname"; continue
+        fi
+        if [[ -n "$vrole" && "$vrole" != "null" ]]; then
+            role_id=$(nb_get_or_create_role "$vrole" 2>>"$LOG_FILE")
+            [[ "$role_id" =~ ^[0-9]+$ ]] && nb_patch \
+                "virtualization/virtual-machines/$vm_id/" \
+                "{\"role\":$role_id}" >/dev/null 2>&1 || true
         fi
         if [[ -n "$vdisk" && "$vdisk" =~ ^[0-9]+$ ]]; then
             nb_patch "virtualization/virtual-machines/$vm_id/" \
