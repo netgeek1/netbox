@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.14
+#  Version: 2.5.15
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.14"
+SCRIPT_VERSION="2.5.15"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -4933,6 +4933,211 @@ RUNEOF
 # -----------------------------------------------------------------------------
 # IMPORT / AGENT DEPLOYMENT MENU
 # -----------------------------------------------------------------------------
+import_collector_json() {
+    # Ingest a hand-collected (or auto-captured) netbox-collector.ps1 JSON and
+    # MERGE it into a scan results file: matched to an existing scan-created
+    # host by IP -> NIC MAC -> hostname (enriched in place, never duplicated),
+    # else added as a new host. Hyper-V VMs + the neighbor table ride along so
+    # the reconciler folds nmap-discovered IPs that are really VMs into
+    # sync_as="vm" (no device+VM duplication). Accepts a single .json or a
+    # directory of them.
+    local src="$1" results_file="${2:-}"
+    [[ -z "$results_file" ]] && results_file=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null | head -1)
+    if [[ -z "$src" ]]; then log_err "No collector JSON path given"; return 1; fi
+    if [[ -z "$results_file" || ! -f "$results_file" ]]; then
+        log_err "No scan results to merge into -- run a scan first (or pass a results file)."
+        return 1
+    fi
+    local files=()
+    if [[ -d "$src" ]]; then
+        while IFS= read -r f; do files+=("$f"); done \
+            < <(find "$src" -maxdepth 1 -type f -name "*.json" | sort)
+    elif [[ -f "$src" ]]; then files=("$src")
+    else log_err "Not found: $src"; return 1; fi
+    [[ ${#files[@]} -eq 0 ]] && { log_err "No .json files in $src"; return 1; }
+    log_info "Merging ${#files[@]} collector file(s) into $(basename "$results_file")"
+    local f rc=0
+    for f in "${files[@]}"; do
+        python3 /dev/stdin "$f" "$results_file" <<'IMPORTEOF'
+import json, sys, re
+
+# IPs that are never the management identity of a host.
+SKIP_PREFIXES = ('127.', '169.254.', '172.27.')  # 172.27 = Hyper-V Default Switch NAT
+
+
+def load_json(path):
+    with open(path, encoding='utf-8-sig') as f:
+        return json.load(f)
+
+
+def norm_mac(m):
+    m = (m or '').strip().lower().replace('-', ':')
+    return m if re.match(r'^([0-9a-f]{2}:){5}[0-9a-f]{2}$', m) else ''
+
+
+def short(h):
+    h = (h or '').strip().lower()
+    return h.split('.')[0] if h else ''
+
+
+def real_ips(ips):
+    return [ip for ip in ips
+            if ip and ':' not in ip and not any(ip.startswith(p) for p in SKIP_PREFIXES)]
+
+
+def collector_to_host(c):
+    H = c.get('Host', {}) or {}
+    ipv4 = real_ips(H.get('IPv4Addresses') or [])
+    nics, nic_macs = [], []
+    for n in (H.get('NetworkAdapters') or []):
+        mac = norm_mac(n.get('MacAddress'))
+        if mac:
+            nic_macs.append(mac)
+        nics.append({'name': n.get('Name', 'eth'),
+                     'description': n.get('Description', ''),
+                     'mac': mac,
+                     'ips': [i for i in (n.get('IPAddresses') or []) if i]})
+    disks = [{'size_gb': d.get('SizeGB'), 'media': d.get('Media'),
+              'interface': d.get('Interface')}
+             for d in (H.get('PhysicalDisks') or [])]
+    neigh = c.get('NeighborTable') or []
+    arp = [{'ip': e.get('IP'), 'mac': norm_mac(e.get('MAC'))}
+           for e in neigh if norm_mac(e.get('MAC'))]
+    return {
+        'hostname': H.get('Hostname', ''),
+        'manufacturer': H.get('Manufacturer', ''),
+        'model': H.get('Model', ''),
+        'serial': H.get('SerialNumber', ''),
+        'os': H.get('OS', ''),
+        'is_hyperv': bool(H.get('IsHyperV')),
+        'is_server': bool(H.get('IsServer')),
+        'winrm_nics': nics,
+        'interfaces': [{'name': n['name'], 'mac': n['mac'], 'type': 'other'}
+                       for n in nics if n['mac']],
+        'hardware': {'cpu_model': H.get('CPUName', ''), 'cpu_cores': H.get('CPUCores'),
+                     'logical_procs': H.get('LogicalProcessors'),
+                     'memory_gb': H.get('MemoryGB'), 'physical_disks': disks},
+        'hyperv_vms': c.get('HyperVVMs') or [],
+        'neighbor_table': neigh,
+        'arp_table': arp,
+        'ipv4_addresses': ipv4,
+        'nic_macs': nic_macs,
+    }
+
+
+def host_macs(h):
+    macs = set()
+    m = norm_mac(h.get('mac'))
+    if m:
+        macs.add(m)
+    for i in (h.get('interfaces') or []):
+        mm = norm_mac(i.get('mac'))
+        if mm:
+            macs.add(mm)
+    for n in (h.get('winrm_nics') or []):
+        mm = norm_mac(n.get('mac'))
+        if mm:
+            macs.add(mm)
+    return macs
+
+
+def find_match(rec, hosts):
+    rec_ips = set(rec['ipv4_addresses'])
+    for h in hosts:                                   # 1) same IP (strongest)
+        if h.get('ip') in rec_ips:
+            return h, 'ip'
+    rec_macs = set(rec['nic_macs'])
+    for h in hosts:                                   # 2) shared NIC MAC
+        if rec_macs & host_macs(h):
+            return h, 'mac'
+    sn = short(rec['hostname'])                        # 3) hostname
+    if sn:
+        for h in hosts:
+            if short(h.get('hostname')) == sn:
+                return h, 'hostname'
+    return None, None
+
+
+def apply_identity(h, rec):
+    if rec['hostname']:
+        h['hostname'] = rec['hostname']
+    for k in ('manufacturer', 'model', 'serial', 'os'):
+        if rec.get(k) and str(rec[k]).strip():
+            h[k] = rec[k]
+    h['is_hyperv'] = rec['is_hyperv']
+    h['winrm_nics'] = rec['winrm_nics']
+    h['hardware'] = rec['hardware']
+    h['hyperv_vms'] = rec['hyperv_vms']
+    h['neighbor_table'] = rec['neighbor_table']
+    # union arp_table
+    arp = {e['ip']: e['mac'] for e in (h.get('arp_table') or []) if e.get('ip')}
+    for e in rec['arp_table']:
+        arp.setdefault(e['ip'], e['mac'])
+    h['arp_table'] = [{'ip': k, 'mac': v} for k, v in arp.items()]
+    # union interfaces by mac
+    seen = {norm_mac(i.get('mac')) for i in (h.get('interfaces') or [])}
+    for i in rec['interfaces']:
+        if i['mac'] and i['mac'] not in seen:
+            h.setdefault('interfaces', []).append(i)
+            seen.add(i['mac'])
+    if not norm_mac(h.get('mac')) and rec['nic_macs']:
+        h['mac'] = rec['nic_macs'][0]
+    if h.get('device_role') in (None, '', 'Unknown'):
+        h['device_role'] = 'Server' if rec['is_server'] else 'Workstation'
+    dm = h.setdefault('discovery_methods', [])
+    if 'import' not in dm:
+        dm.append('import')
+    h['imported'] = True
+    h['os_accuracy'] = 'import'
+
+
+def new_host(rec):
+    ip = rec['ipv4_addresses'][0] if rec['ipv4_addresses'] else None
+    h = {'ip': ip, 'hostname': rec['hostname'] or None,
+         'mac': rec['nic_macs'][0] if rec['nic_macs'] else None,
+         'vendor': '', 'os': rec['os'], 'os_accuracy': 'import',
+         'device_role': 'Server' if rec['is_server'] else 'Workstation',
+         'manufacturer': rec['manufacturer'], 'model': rec['model'],
+         'serial': rec['serial'], 'is_hyperv': rec['is_hyperv'],
+         'winrm_nics': rec['winrm_nics'], 'interfaces': rec['interfaces'],
+         'hardware': rec['hardware'], 'hyperv_vms': rec['hyperv_vms'],
+         'neighbor_table': rec['neighbor_table'], 'arp_table': rec['arp_table'],
+         'ports': [], 'discovery_methods': ['import'], 'imported': True}
+    return h
+
+
+def main():
+    coll_file, results_file = sys.argv[1], sys.argv[2]
+    rec = collector_to_host(load_json(coll_file))
+    if not rec['ipv4_addresses'] and not rec['nic_macs'] and not short(rec['hostname']):
+        print('ERROR: collector JSON has no IP, MAC, or hostname to key on', file=sys.stderr)
+        sys.exit(2)
+    results = load_json(results_file)
+    hosts = results.setdefault('hosts', [])
+    h, how = find_match(rec, hosts)
+    if h:
+        apply_identity(h, rec)
+        action = 'merged into existing %s (matched by %s)' % (h.get('ip'), how)
+    else:
+        nh = new_host(rec)
+        hosts.append(nh)
+        action = 'added as new host %s' % nh.get('ip')
+    with open(results_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    print('%s: %s; %d VM(s) attached, %d neighbor entries' %
+          (rec['hostname'], action, len(rec['hyperv_vms']), len(rec['neighbor_table'])))
+
+
+main()
+IMPORTEOF
+        [[ $? -ne 0 ]] && rc=1
+    done
+    if [[ $rc -eq 0 ]]; then
+        log_ok "Import complete. Preview with reconcile (menu) or run sync to apply."
+    else log_err "One or more imports failed."; fi
+    return $rc
+}
+
 generate_collector_script() {
     # Emit a standalone, read-only collector that runs on ANY Windows machine
     # (workstation or Hyper-V host) WITHOUT WinRM or NetBox access. It writes a
@@ -5115,6 +5320,7 @@ menu_import() {
         echo "   6) Show agent config for manual install"
         echo "   7) Sync NetBox Device Type Library (community YAML)"
         echo "   8) Generate standalone collector script (JSON, runs anywhere)"
+        echo "   9) Import collector JSON (merge into latest scan results)"
         echo "   0) Back"
         read -rp $'\nChoice: ' c
         local tip
@@ -5147,6 +5353,9 @@ menu_import() {
         7) import_device_type_library ;;
         8) read -rp "  Output path [$DISCOVERY_DIR/netbox-collector.ps1]: " dest
            generate_collector_script "${dest:-$DISCOVERY_DIR/netbox-collector.ps1}"
+           pause ;;
+        9) read -rp "  Collector JSON file or directory: " src
+           import_collector_json "$src"
            pause ;;
         0) return ;;
         esac
