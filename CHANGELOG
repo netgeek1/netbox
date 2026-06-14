@@ -1,3 +1,24 @@
+#  Changelog v2.5.15 (import path: ingest collector JSON with dedup):
+#   - New import_collector_json() + Import menu option 9. Ingests a hand-
+#     collected (or auto-captured) netbox-collector JSON and MERGES it into a
+#     scan results file rather than creating duplicates:
+#       * matches an existing scan-created host by IP -> NIC MAC -> hostname and
+#         enriches it in place (identity/hardware from the import win; scan
+#         ports/services/discovery_methods are kept); else adds a new host.
+#       * the host's Hyper-V VM inventory + neighbor (ARP) table ride along, so
+#         the existing reconciler folds nmap-discovered IPs that are actually
+#         VMs (e.g. .31 FortiAnalyzer, .214 CentOS-PXE, .235 via ARP) into
+#         sync_as="vm" on their host -- a device created by the scan is never
+#         duplicated as both a device and a VM.
+#     Accepts a single .json or a directory (batch import of many workstations).
+#     Reads BOM-tolerant (utf-8-sig); ignores Default-Switch (172.27/169.254/
+#     127) IPs and whitespace-only identity fields. Validated against real
+#     SERVER01 + INTEL-NUC collector output end-to-end through the reconciler.
+#   - This is the ingest half of the single-writer plan. Still pending: point
+#     sync_to_netbox at the reconciled model (sync_as + secondary_ips) and
+#     retire the PS1's direct writes; mirror the v2.5.13/14 collector fixes into
+#     the WinRM PS_BASE/PS_HYPERV probes for auto-capture parity.
+#
 #  Changelog v2.5.14 (hardware identity fallback to baseboard):
 #   - INTEL-NUC returned blank Manufacturer/Model/Serial because NUCs (and many
 #     whitebox/desktop boards) leave Win32_ComputerSystem + Win32_BIOS empty but
