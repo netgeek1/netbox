@@ -1,3 +1,19 @@
+#  Changelog v2.5.17 (VM roles: reconciler role + name/port heuristics):
+#   - The single writer now assigns a role to each VM. Priority: name keyword
+#     match -> port hint -> the reconciler's device_role -> 'Server'. Examples
+#     from the live model: PiHole->DNS, OPNsense/pfSense->Firewall,
+#     FortiAnalyzer/Syslog->Logging, FortiManager->Management, Plex->Media,
+#     RaspiDocker/Docker->Container Host, Prometheus/PRTG->Monitoring,
+#     Veeam/GoodSync->Backup, Tailscale/ZeroTier->VPN, kali/Sophos->Security,
+#     FortiAuthenticator->Authentication, CentOS-PXE/iVentoy->Provisioning.
+#   - Role is resolved in the plan generator (so --dry-run shows it) and applied
+#     via nb_get_or_create_role + a PATCH of the VM's role field after upsert
+#     (nb_upsert_vm has no role arg). Device roles are unchanged (already well
+#     classified by the reconciler).
+#   - PENDING (next step): switch cabling. Some LLDP/CDP cables are correct and
+#     some are not; fixing the wrong ones needs the SNMP LLDP-MIB local-port
+#     walk (resolves THIS device's port, which the container LLDP data omits).
+#
 #  Changelog v2.5.16 (single coordinated writer -- the payoff):
 #   - New sync_reconciled_to_netbox() + scan/sync menu option 9 (dry-run first,
 #     then confirm). Writes the RECONCILED model -- not raw results -- so the
