@@ -1,3 +1,27 @@
+#  Changelog v2.5.19 (fix regression: device custom fields + disks; VM keying):
+#   - ROOT CAUSE of missing device custom fields: the single writer ensured
+#     memory_gb as 'text' but sent the raw float (e.g. 31.92), while NetBox
+#     already had memory_gb as 'integer' (created by the PS1). A float in an
+#     integer field 400s the ENTIRE custom_fields PATCH, so cpu_model/cpu_cores/
+#     memory all silently vanished. Fixed: integer types + integer values
+#     (memory_gb rounded; memory_mb added).
+#   - The single writer now writes the FULL PS1 host hardware set, computed in
+#     the plan generator: cpu_model, cpu_cores, vcpus, memory_mb, memory_gb,
+#     disk_total_gb, disk_count, os_version, and disk_N_size_gb/media/interface
+#     per disk (CFs ensured up to the max disk count across devices, capped 8).
+#   - RAID/Storage-Spaces virtual disks (media 'Unspecified') are filtered, so
+#     SERVER01 no longer reports a phantom 22352 GB disk (disk_count 2, not 3).
+#   - VM keying fix: nb_upsert_vm matched existing VMs by NAME only, collapsing
+#     same-named VMs across clusters (e.g. 'Plex Primary' on SERVER03 AND
+#     SERVER04 became one). It now matches on (name, cluster), so duplicates
+#     are kept distinct and each gets its own specs/disk/IP.
+#   - VM vcpus/memory/disk were already correct (native fields via nb_upsert_vm
+#     + disk PATCH); verified all 28 VMs carry them.
+#   - NOTE: WinRM-scanned hosts still need merge_host_data to extract hardware
+#     (cpu/mem/disks) into the record; that parity is a follow-up. Hosts brought
+#     in via the collector JSON import already carry full hardware, so this fix
+#     restores custom fields + disks for the import-based flow in use now.
+#
 #  Changelog v2.5.18 (per-interface device IPs incl. FortiLink/169.254):
 #   - 169.254 is NOT junk here: FortiLink uses it as a managed, routable block.
 #     Confirmed it is not filtered in discovery, the reconciler, or the new
