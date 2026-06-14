@@ -1,3 +1,28 @@
+#  Changelog v2.5.16 (single coordinated writer -- the payoff):
+#   - New sync_reconciled_to_netbox() + scan/sync menu option 9 (dry-run first,
+#     then confirm). Writes the RECONCILED model -- not raw results -- so the
+#     two long-standing bugs are fixed at the source:
+#       * .2 folds into .253 as a secondary IP (and .245->.243, .246->.244);
+#         secondary_ips are added to the device's mgmt0 interface.
+#       * VMs are created under a per-host cluster with vCPU/memory/disk
+#         resolved from the Hyper-V inventory, keyed on (cluster, vm_name) so
+#         duplicate names across hosts (e.g. Plex Primary on SERVER03+SERVER04)
+#         don't collide, and a scanned IP that is really a VM is written ONCE,
+#         as a VM (sync_as=vm), never as both a device and a VM.
+#   - VM IPs now assign correctly: new nb_add_vm_ip() targets
+#     virtualization.vminterface (nb_add_ip only does dcim.interface, which is
+#     what broke VM IP assignment before) and sets the VM primary_ip4.
+#   - A Python plan generator turns the reconciled model into a normalized
+#     device/VM/cluster plan; --dry-run prints the exact plan with no NetBox
+#     writes. Validated end-to-end against a real 51-record reconcile
+#     (-> 20 devices, 28 VMs, 5 clusters).
+#   - ADDITIVE/REVERSIBLE: the legacy raw sync (option 6) and the host-side PS1
+#     (import_hyperv_powershell) are left intact as the current default. Once
+#     option 9 is confirmed correct against live NetBox, the next step retires
+#     the PS1's direct writes and makes the single writer the default.
+#   - Simple host hardware custom fields (cpu_model/cpu_cores/memory_gb) are set
+#     where present; per-disk fields + WinRM hardware parity are a follow-up.
+#
 #  Changelog v2.5.15 (import path: ingest collector JSON with dedup):
 #   - New import_collector_json() + Import menu option 9. Ingests a hand-
 #     collected (or auto-captured) netbox-collector JSON and MERGES it into a
