@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.22
+#  Version: 2.5.23
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.22"
+SCRIPT_VERSION="2.5.23"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -5342,7 +5342,10 @@ def device_custom_fields(hw, os_str):
     mg = hw.get('memory_gb')
     if mg is not None:
         try:
-            cf['memory_gb'] = int(round(float(mg)))
+            # memory_gb is a TEXT field (see writer): a numeric field can't be
+            # recast once it holds a value, and earlier builds wrote text here.
+            # Sending a string matches the type everywhere and always populates.
+            cf['memory_gb'] = ('%.2f' % float(mg)).rstrip('0').rstrip('.')
             cf['memory_mb'] = int(round(float(mg) * 1024))
         except (TypeError, ValueError):
             pass
@@ -5568,7 +5571,7 @@ PLANEOF
     nb_ensure_custom_field "cpu_cores"     "CPU Cores"       "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "vcpus"         "vCPUs"           "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "memory_mb"     "Memory (MB)"     "integer" "dcim.device" >/dev/null 2>&1 || true
-    nb_ensure_custom_field "memory_gb"     "Memory (GB)"     "integer" "dcim.device" >/dev/null 2>&1 || true
+    nb_ensure_custom_field "memory_gb"     "Memory (GB)"     "text"    "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "disk_total_gb" "Disk Total (GB)" "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "disk_count"    "Disk Count"      "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "os_version"    "OS Version"      "text"    "dcim.device" >/dev/null 2>&1 || true
@@ -5639,7 +5642,21 @@ PLANEOF
         local cf
         cf=$(jq -c '.custom_fields // {}' <<<"$d")
         if [[ -n "$cf" && "$cf" != "{}" && "$cf" != "null" ]]; then
-            nb_patch "dcim/devices/$dev_id/" "{\"custom_fields\":$cf}" >/dev/null 2>&1 || true
+            local _cfresp
+            _cfresp=$(nb_patch "dcim/devices/$dev_id/" "{\"custom_fields\":$cf}")
+            if ! echo "$_cfresp" | jq -e '.id' >/dev/null 2>&1; then
+                # The bundled PATCH was rejected (one bad field 400s the whole
+                # request). Apply each field on its own so the rest still land,
+                # and surface exactly which field NetBox refused.
+                local _k _v _one
+                while IFS= read -r _k; do
+                    _v=$(jq -c --arg k "$_k" '.[$k]' <<<"$cf")
+                    _one=$(jq -nc --arg k "$_k" --argjson v "$_v" '{custom_fields:{($k):$v}}')
+                    echo "$(nb_patch "dcim/devices/$dev_id/" "$_one")" \
+                        | jq -e '.id' >/dev/null 2>&1 \
+                        || log_warn "Custom field '\''$_k'\'' rejected for device ID $dev_id"
+                done < <(jq -r 'keys[]' <<<"$cf")
+            fi
         fi
         dcount=$((dcount+1))
     done < <(jq -c '.devices[]' "$plan")
