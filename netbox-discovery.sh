@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.23
+#  Version: 2.5.24
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.23"
+SCRIPT_VERSION="2.5.24"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -5349,9 +5349,10 @@ def device_custom_fields(hw, os_str):
             cf['memory_mb'] = int(round(float(mg) * 1024))
         except (TypeError, ValueError):
             pass
-    disks = [d for d in (hw.get('physical_disks') or [])
-             if (str(d.get('media') or '').strip().lower() != 'unspecified')
-             and d.get('size_gb')]
+    # Include every physical disk with a real size (matches 2.5.9/PS1, which
+    # filtered only size>0). RAID/Storage-Spaces volumes are real capacity and
+    # are kept -- do not second-guess the host's reported disks.
+    disks = [d for d in (hw.get('physical_disks') or []) if d.get('size_gb')]
     if disks:
         cf['disk_count'] = len(disks)
         cf['disk_total_gb'] = sum(int(d['size_gb']) for d in disks)
@@ -5447,6 +5448,16 @@ def build(reconciled):
             dcf, ndisks = device_custom_fields(hw, (h.get('os') or '').strip())
             if ndisks > max_disks:
                 max_disks = ndisks
+            # discovered_ports + discovery_methods (parity with the legacy sync):
+            # text fields, same formatting as before.
+            _ports = h.get('ports') or []
+            if _ports:
+                dcf['discovered_ports'] = ', '.join(
+                    '%s/%s' % (p.get('port'), p.get('service') or p.get('proto') or 'tcp')
+                    for p in _ports if p.get('port'))
+            _dm = h.get('discovery_methods') or []
+            if _dm:
+                dcf['discovery_methods'] = ', '.join(str(m) for m in _dm)
             devices.append({
                 'name': h.get('hostname') or ('device-' + (ip or '').replace('.', '-')),
                 'role': h.get('device_role') or 'Unknown',
@@ -5575,6 +5586,8 @@ PLANEOF
     nb_ensure_custom_field "disk_total_gb" "Disk Total (GB)" "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "disk_count"    "Disk Count"      "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "os_version"    "OS Version"      "text"    "dcim.device" >/dev/null 2>&1 || true
+    nb_ensure_custom_field "discovered_ports" "Discovered Ports" "text" "dcim.device" >/dev/null 2>&1 || true
+    nb_ensure_custom_field "discovery_methods" "Discovery Methods" "text" "dcim.device" >/dev/null 2>&1 || true
     local _maxd _di; _maxd=$(jq -r '.max_disks // 0' "$plan" 2>/dev/null || echo 0)
     for (( _di=0; _di<_maxd; _di++ )); do
         nb_ensure_custom_field "disk_${_di}_size_gb"   "Disk ${_di} Size (GB)" "integer" "dcim.device" >/dev/null 2>&1 || true
