@@ -1,3 +1,20 @@
+#  Changelog v2.5.18 (per-interface device IPs incl. FortiLink/169.254):
+#   - 169.254 is NOT junk here: FortiLink uses it as a managed, routable block.
+#     Confirmed it is not filtered in discovery, the reconciler, or the new
+#     writer; removed the stale 169.254 drop in the legacy interface sync too.
+#     (APIPA exclusion stays on the Windows collector/WinRM host-IP paths only,
+#     where a 169.254 is a failed-DHCP address and FortiGates aren't collected.)
+#   - The single writer now syncs a device's FULL L3 footprint per-interface:
+#     each SNMP ip_table entry is attached to its real interface, resolving
+#     if_index to a name directly (e.g. 'fortilink') or via the ifTable for
+#     numeric indexes (25->wqt.root, 1->wan1). The primary IP lands on its
+#     actual interface (e.g. home_internal) and sets primary_ip4; only
+#     loopback/0.0.0.0 are skipped. Example: the FortiGate now writes all 21
+#     interface IPs incl. fortilink=169.254.1.1 and quarantine=169.254.11.1.
+#     Devices without an ip_table (Windows/printers) keep the mgmt0 fallback
+#     (primary + folded secondaries). Validated against the live model:
+#     FortiGate 21, Cloud-Gateway 13, TrueNAS 4 per-interface IPs.
+#
 #  Changelog v2.5.17 (VM roles: reconciler role + name/port heuristics):
 #   - The single writer now assigns a role to each VM. Priority: name keyword
 #     match -> port hint -> the reconciler's device_role -> 'Server'. Examples
