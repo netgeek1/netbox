@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.19
+#  Version: 2.5.20
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.19"
+SCRIPT_VERSION="2.5.20"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -19,6 +19,15 @@ CONFIG_FILE="$BASE_DIR/config.conf"
 CREDS_FILE="$BASE_DIR/.credentials.enc"
 CREDS_KEY_FILE="$BASE_DIR/.creds.key"
 DISCOVERY_DIR="$BASE_DIR/discovery"
+
+# Newest RAW scan results file, excluding our own derived outputs
+# (results_*.plan.json / *.reconciled.json / *.plan.reconciled.json). Without
+# this, ls -t would re-select the plan/reconciled files the writer just wrote
+# back into the same directory, feeding a plan file into the reconciler (0/0/0).
+latest_scan_file() {
+    ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
+        | grep -vE '\.(plan|reconciled)\.json$' | head -1
+}
 NETBOX_DIR="/opt/netbox-docker"
 DOCKER_COMPOSE="docker compose"    # updated by detect_docker_compose()
 
@@ -2719,8 +2728,7 @@ PYEOF
 reconcile_results() {
     local results_file="${1:-}"
     [[ -z "$results_file" ]] \
-        && results_file=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
-            | grep -v reconciled | head -1)
+        && results_file=$(latest_scan_file)
     if [[ ! -f "$results_file" ]]; then
         log_error "No results file to reconcile"; return 1
     fi
@@ -3197,7 +3205,7 @@ PYEOF
 sync_to_netbox() {
     local results_file="${1:-}"
     [[ -z "$results_file" ]] \
-        && results_file=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null | head -1)
+        && results_file=$(latest_scan_file)
     [[ ! -f "$results_file" ]] \
         && { log_error "No results file found"; pause; return 1; }
 
@@ -3619,7 +3627,7 @@ deploy_agent_remote() {
 deploy_agents_to_discovered() {
     local results_file="${1:-}"
     [[ -z "$results_file" ]] \
-        && results_file=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null | head -1)
+        && results_file=$(latest_scan_file)
     [[ ! -f "$results_file" ]] \
         && { log_error "No results file found"; pause; return 1; }
 
@@ -4946,7 +4954,7 @@ import_collector_json() {
     # sync_as="vm" (no device+VM duplication). Accepts a single .json or a
     # directory of them.
     local src="$1" results_file="${2:-}"
-    [[ -z "$results_file" ]] && results_file=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null | head -1)
+    [[ -z "$results_file" ]] && results_file=$(latest_scan_file)
     if [[ -z "$src" ]]; then log_err "No collector JSON path given"; return 1; fi
     if [[ -z "$results_file" || ! -f "$results_file" ]]; then
         log_err "No scan results to merge into -- run a scan first (or pass a results file)."
@@ -5176,8 +5184,7 @@ sync_reconciled_to_netbox() {
     # vminterface. sync_as=skip records are dropped. Pass --dry-run to print the
     # plan without touching NetBox.
     local results_file="${1:-}" mode="${2:-}"
-    [[ -z "$results_file" ]] && results_file=$(ls -t "$DISCOVERY_DIR"/results_*.json \
-        2>/dev/null | grep -v reconciled | head -1)
+    [[ -z "$results_file" ]] && results_file=$(latest_scan_file)
     if [[ -z "$results_file" || ! -f "$results_file" ]]; then
         log_error "No results file to sync -- run a scan first."; return 1
     fi
@@ -5814,7 +5821,7 @@ menu_import() {
            valid_ip "$tip" && deploy_agent_remote "$tip" \
                || { printf "${R}  Invalid IP${NC}\n"; pause; } ;;
         3) local latest
-           latest=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null | head -1)
+           latest=$(latest_scan_file)
            if [[ -z "$latest" ]]; then
                printf "${Y}  No discovery results -- run a scan first${NC}\n"
                pause; continue
@@ -6184,7 +6191,7 @@ menu_logs() {
         3) ls -lh "$LOG_DIR"/*.log 2>/dev/null || echo "  (none)" ;;
         4) ls -lh "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
                | awk '{print NR") "$NF" "$5}' || echo "  (none)" ;;
-        5) latest=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null | head -1)
+        5) latest=$(latest_scan_file)
            [[ -z "$latest" ]] && { echo "  No results"; pause; continue; }
            cnt=$(jq '.hosts | length' "$latest")
            printf "\n${W}%s${NC}  (hosts: %s)\n\n" "$latest" "$cnt"
@@ -6285,7 +6292,7 @@ menu_discovery() {
         4)  read -rp "  Switch IP: " swip
             valid_ip "$swip" && map_switchports "$swip" \
                 || printf "${R}  Invalid IP${NC}\n" ;;
-        5)  latest=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null | head -1)
+        5)  latest=$(latest_scan_file)
             [[ -z "$latest" ]] && { echo "  No results"; pause; continue; }
             cnt=$(jq '.hosts | length' "$latest")
             printf "\n${W}%s  (%s hosts)${NC}\n\n" "$latest" "$cnt"
@@ -6297,8 +6304,7 @@ menu_discovery() {
                         "$i" "${h:0:27}" "${r:0:15}" "${m:0:15}" "${o:0:26}"
                   done | head -80 ;;
         6)  sync_to_netbox ;;
-        8)  latest=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
-                | grep -v reconciled | head -1)
+        8)  latest=$(latest_scan_file)
             if [[ -z "$latest" ]]; then
                 printf "${Y}  No discovery results -- run a scan first${NC}\n"
             else
@@ -6307,8 +6313,7 @@ menu_discovery() {
                 printf "\n${D}  (dry-run only -- nothing written to NetBox)${NC}\n"
             fi
             pause ;;
-        9)  latest=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
-                | grep -v reconciled | head -1)
+        9)  latest=$(latest_scan_file)
             if [[ -z "$latest" ]]; then
                 printf "${Y}  No discovery results -- run a scan first${NC}\n"; pause; continue
             fi
