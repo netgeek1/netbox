@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.15
+#  Version: 2.5.9
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.15"
+SCRIPT_VERSION="2.5.16"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -5138,6 +5138,342 @@ IMPORTEOF
     return $rc
 }
 
+nb_add_vm_ip() {
+    # Assign an IP to a VM interface (virtualization.vminterface) and set it as
+    # the VM's primary_ip4. nb_add_ip only targets dcim.interface, which is what
+    # broke VM IP assignment before.
+    local ip="$1" vm_id="$2" vif_id="$3"
+    [[ "$ip" != */* ]] && ip="${ip}/32"
+    local enc; enc=$(nb_urlencode "$ip")
+    local existing; existing=$(nb_get "ipam/ip-addresses/?address=${enc}")
+    local ip_id; ip_id=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
+    local payload
+    payload=$(jq -n --arg a "$ip" --argjson vif "$vif_id" \
+        '{address:$a,status:"active",
+          assigned_object_type:"virtualization.vminterface",
+          assigned_object_id:$vif}')
+    if [[ -z "$ip_id" ]]; then
+        ip_id=$(nb_post "ipam/ip-addresses/" "$payload" | jq -r '.id // empty' 2>/dev/null)
+    else
+        nb_patch "ipam/ip-addresses/${ip_id}/" "$payload" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$vm_id" && "$vm_id" =~ ^[0-9]+$ && -n "$ip_id" && "$ip_id" =~ ^[0-9]+$ ]]; then
+        nb_patch "virtualization/virtual-machines/${vm_id}/" \
+            "{\"primary_ip4\":$ip_id}" >/dev/null 2>&1 || true
+    fi
+    echo "$ip_id"
+}
+
+sync_reconciled_to_netbox() {
+    # SINGLE COORDINATED WRITER. Reconciles the scan results, then writes the
+    # reconciled model to NetBox: devices (sync_as=device) with primary +
+    # secondary IPs and interfaces; clusters per Hyper-V host; VMs (sync_as=vm)
+    # with vCPU/memory/disk resolved from inventory and their IP on a
+    # vminterface. sync_as=skip records are dropped. Pass --dry-run to print the
+    # plan without touching NetBox.
+    local results_file="${1:-}" mode="${2:-}"
+    [[ -z "$results_file" ]] && results_file=$(ls -t "$DISCOVERY_DIR"/results_*.json \
+        2>/dev/null | grep -v reconciled | head -1)
+    if [[ -z "$results_file" || ! -f "$results_file" ]]; then
+        log_error "No results file to sync -- run a scan first."; return 1
+    fi
+    reconcile_results "$results_file" >/dev/null 2>&1 || true
+    local recon="${results_file%.json}.reconciled.json"
+    [[ -f "$recon" ]] || { log_error "Reconcile produced no $recon"; return 1; }
+
+    local pyf; pyf=$(mktemp --suffix=.py)
+    cat > "$pyf" <<'PLANEOF'
+import json, sys, re
+
+# Resolve the writer's view of the reconciled model into a normalized plan:
+#   devices[] (sync_as==device), vms[] (sync_as==vm), clusters[].
+# VM hardware is resolved from each host's hyperv_vms inventory by (cluster,name)
+# because discovered-VM records don't carry cpu/mem themselves.
+
+DEF_MASK = 24
+
+
+def norm_mac(m):
+    m = (m or '').strip().lower().replace('-', ':')
+    return m if re.match(r'^([0-9a-f]{2}:){5}[0-9a-f]{2}$', m) else ''
+
+
+def mask_to_prefix(mask):
+    if not mask:
+        return DEF_MASK
+    if isinstance(mask, int):
+        return mask
+    m = str(mask).strip()
+    if m.isdigit() and 0 <= int(m) <= 32:
+        return int(m)
+    try:
+        return sum(bin(int(o)).count('1') for o in m.split('.'))
+    except Exception:
+        return DEF_MASK
+
+
+def host_prefix(h, ip):
+    for e in (h.get('ip_table') or []):
+        if e.get('ip') == ip and e.get('mask'):
+            return mask_to_prefix(e.get('mask'))
+    return DEF_MASK
+
+
+def vm_status(state):
+    s = (state or '').strip().lower()
+    if s == 'running':
+        return 'active'
+    if s in ('off', 'offcritical'):
+        return 'offline'
+    if s in ('paused', 'saved'):
+        return 'staged'
+    return 'active'
+
+
+def build(reconciled):
+    hosts = reconciled['hosts']
+
+    # Inventory index: (cluster-or-host-key, vm_name) -> hardware detail.
+    inv = {}
+    for h in hosts:
+        if h.get('sync_as') == 'skip':
+            continue
+        keys = [h.get('hostname'), h.get('ip')]
+        for vm in (h.get('hyperv_vms') or []):
+            nm = vm.get('Name', '')
+            macs = [norm_mac(a.get('MacAddress'))
+                    for a in (vm.get('NetworkAdapters') or []) if norm_mac(a.get('MacAddress'))]
+            detail = {
+                'vcpus': vm.get('ProcessorCount'),
+                'mem_b': vm.get('MemoryStartupBytes'),
+                'disk_b': vm.get('DiskBytes'),
+                'macs': macs,
+            }
+            for k in keys:
+                if k:
+                    inv[(k, nm)] = detail
+
+    site = reconciled.get('site') or 'Home Lab'
+    clusters = set()
+    devices, vms = [], []
+
+    for h in hosts:
+        sa = h.get('sync_as')
+        if sa == 'skip':
+            continue
+
+        if sa == 'device':
+            ip = h.get('ip')
+            ifaces = []
+            seen = set()
+            for n in (h.get('winrm_nics') or []):
+                mac = norm_mac(n.get('mac') or n.get('MacAddress'))
+                nm = n.get('name') or n.get('Name') or 'eth'
+                if (nm, mac) not in seen:
+                    ifaces.append({'name': nm, 'mac': mac})
+                    seen.add((nm, mac))
+            for n in (h.get('interfaces') or []):
+                mac = norm_mac(n.get('mac'))
+                nm = n.get('name') or 'if'
+                if (nm, mac) not in seen:
+                    ifaces.append({'name': nm, 'mac': mac})
+                    seen.add((nm, mac))
+            hw = h.get('hardware') or None
+            is_hv = bool(h.get('is_hyperv'))
+            cluster = h.get('hostname') if is_hv else None
+            if cluster:
+                clusters.add(cluster)
+            sec = []
+            for s in (h.get('secondary_ips') or []):
+                sip = s.get('ip')
+                if sip:
+                    sec.append('%s/%d' % (sip, mask_to_prefix(s.get('mask'))))
+            devices.append({
+                'name': h.get('hostname') or ('device-' + (ip or '').replace('.', '-')),
+                'role': h.get('device_role') or 'Unknown',
+                'manufacturer': (h.get('manufacturer') or '').strip(),
+                'model': (h.get('model') or '').strip(),
+                'serial': (h.get('serial') or '').strip(),
+                'os': (h.get('os') or '').strip(),
+                'primary_ip': ('%s/%d' % (ip, host_prefix(h, ip))) if ip else None,
+                'secondary_ips': sec,
+                'interfaces': ifaces,
+                'is_hyperv': is_hv,
+                'cluster': cluster,
+                'hardware': hw,
+            })
+
+        elif sa == 'vm':
+            name = h.get('vm_name') or h.get('hostname')
+            cluster = h.get('vm_cluster') or h.get('vm_host')
+            clusters.add(cluster)
+            det = inv.get((cluster, name)) or inv.get((h.get('vm_host'), name)) or {}
+            vcpus = det.get('vcpus')
+            if vcpus is None:
+                vcpus = h.get('vm_cpu')
+            mem_b = det.get('mem_b')
+            if mem_b is None:
+                mem_b = h.get('vm_mem_bytes') or h.get('vm_mem')
+            disk_b = det.get('disk_b')
+            macs = det.get('macs') or []
+            ip = h.get('ip')
+            ip = ip if (ip and re.match(r'^\d+\.\d+\.\d+\.\d+$', ip)) else None
+            vms.append({
+                'name': name,
+                'cluster': cluster,
+                'status': vm_status(h.get('vm_state')),
+                'vcpus': int(vcpus) if vcpus else None,
+                'memory_mb': int(round(mem_b / 1048576)) if mem_b else None,
+                'disk_gb': int(round(disk_b / 1073741824)) if disk_b else None,
+                'primary_ip': ('%s/%d' % (ip, DEF_MASK)) if ip else None,
+                'mac': macs[0] if macs else None,
+                'no_ip_flag': bool(h.get('vm_no_ip_flag')),
+            })
+
+    return {'site': site, 'clusters': sorted(clusters), 'devices': devices, 'vms': vms}
+
+
+def dry_run(plan):
+    out = []
+    out.append('SITE: %s' % plan['site'])
+    out.append('CLUSTERS (%d): %s' % (len(plan['clusters']), ', '.join(plan['clusters'])))
+    out.append('')
+    out.append('DEVICES (%d):' % len(plan['devices']))
+    for d in plan['devices']:
+        hw = d.get('hardware')
+        hws = ''
+        if hw:
+            hws = ' hw[cpu=%s cores=%s mem=%sGB disks=%d]' % (
+                (hw.get('cpu_model') or '')[:14], hw.get('cpu_cores'),
+                hw.get('memory_gb'), len(hw.get('physical_disks') or []))
+        cl = (' cluster=%s' % d['cluster']) if d['cluster'] else ''
+        sec = (' +sec%s' % d['secondary_ips']) if d['secondary_ips'] else ''
+        out.append('  %-22s %-11s %-16s ip=%s%s ifaces=%d%s%s' % (
+            d['name'][:22], d['role'][:11], (d['manufacturer'] + '/' + d['model'])[:16],
+            d['primary_ip'], sec, len(d['interfaces']), cl, hws))
+    out.append('')
+    out.append('VMs (%d):' % len(plan['vms']))
+    for v in plan['vms']:
+        ipf = v['primary_ip'] or ('NO-IP' + ('!' if v['no_ip_flag'] else ''))
+        out.append('  %-26s @%-14s %-8s vcpu=%s mem=%sMB disk=%sGB ip=%s' % (
+            v['name'][:26], (v['cluster'] or '')[:14], v['status'],
+            v['vcpus'], v['memory_mb'], v['disk_gb'], ipf))
+    out.append('')
+    out.append('TOT:  %d devices, %d VMs, %d clusters' % (
+        len(plan['devices']), len(plan['vms']), len(plan['clusters'])))
+    return '\n'.join(out)
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else 'dryrun'
+    path = sys.argv[2]
+    plan = build(json.load(open(path)))
+    if mode == 'plan':
+        out = sys.argv[3] if len(sys.argv) > 3 else path.replace('.json', '.plan.json')
+        json.dump(plan, open(out, 'w'), indent=2)
+        print(out)
+    else:
+        print(dry_run(plan))
+
+
+main()
+PLANEOF
+    if [[ "$mode" == "--dry-run" ]]; then
+        python3 "$pyf" dryrun "$recon"; rm -f "$pyf"; return 0
+    fi
+    local plan="${results_file%.json}.plan.json"
+    python3 "$pyf" plan "$recon" "$plan" >/dev/null 2>&1; rm -f "$pyf"
+    [[ -s "$plan" ]] || { log_error "Plan generation failed"; return 1; }
+
+    log_info "Single-writer sync from $(basename "$plan")"
+    local site_id ctype_id
+    site_id=$(nb_get_or_create_site "$(jq -r '.site' "$plan")")
+    ctype_id=$(nb_get_or_create_cluster_type "Hyper-V")
+    declare -A CLU=()
+    local cl
+    while IFS= read -r cl; do
+        [[ -z "$cl" || "$cl" == "null" ]] && continue
+        CLU["$cl"]=$(nb_get_or_create_cluster "$cl" "$ctype_id" "$site_id")
+    done < <(jq -r '.clusters[]' "$plan")
+
+    nb_ensure_custom_field "cpu_model" "CPU Model"   "text"    "dcim.device" >/dev/null 2>&1 || true
+    nb_ensure_custom_field "cpu_cores" "CPU Cores"   "integer" "dcim.device" >/dev/null 2>&1 || true
+    nb_ensure_custom_field "memory_gb" "Memory (GB)" "text"    "dcim.device" >/dev/null 2>&1 || true
+
+    local dcount=0 vcount=0 d v
+    while IFS= read -r d; do
+        local name role mfr model serial pip pip_bare dev_id mgmt
+        name=$(jq -r '.name' <<<"$d");      role=$(jq -r '.role' <<<"$d")
+        mfr=$(jq -r '.manufacturer // ""' <<<"$d"); model=$(jq -r '.model // ""' <<<"$d")
+        serial=$(jq -r '.serial // ""' <<<"$d");    pip=$(jq -r '.primary_ip // ""' <<<"$d")
+        [[ -z "$mfr"   ]] && mfr="Unknown"
+        [[ -z "$model" ]] && model="Unknown"
+        pip_bare="${pip%/*}"
+        dev_id=$(nb_upsert_device "$name" "$role" "$mfr" "$model" "$site_id" \
+            "$serial" "" "$pip_bare" 2>>"$LOG_FILE")
+        if [[ -z "$dev_id" || ! "$dev_id" =~ ^[0-9]+$ ]]; then
+            log_warn "device upsert failed: $name"; continue
+        fi
+        mgmt=$(nb_add_interface "$dev_id" "mgmt0" "other" "" "Management" 2>>"$LOG_FILE")
+        if [[ -n "$pip" && "$mgmt" =~ ^[0-9]+$ ]]; then
+            nb_add_ip "$pip" "$dev_id" "$mgmt" >/dev/null 2>&1 || true
+        fi
+        local sip
+        while IFS= read -r sip; do
+            [[ -z "$sip" || ! "$mgmt" =~ ^[0-9]+$ ]] && continue
+            nb_add_ip "$sip" "" "$mgmt" >/dev/null 2>&1 || true
+        done < <(jq -r '.secondary_ips[]?' <<<"$d")
+        local ifc ifn ifm
+        while IFS= read -r ifc; do
+            ifn=$(jq -r '.name' <<<"$ifc"); ifm=$(jq -r '.mac // ""' <<<"$ifc")
+            [[ -z "$ifn" || "$ifn" == "mgmt0" ]] && continue
+            nb_add_interface "$dev_id" "$ifn" "other" "$ifm" "" >/dev/null 2>&1 || true
+        done < <(jq -c '.interfaces[]?' <<<"$d")
+        local hw cpu cores mem cf
+        hw=$(jq -c '.hardware // empty' <<<"$d")
+        if [[ -n "$hw" && "$hw" != "null" ]]; then
+            cpu=$(jq -r '.cpu_model // ""' <<<"$hw")
+            cores=$(jq -r '.cpu_cores // empty' <<<"$hw")
+            mem=$(jq -r '.memory_gb // ""' <<<"$hw")
+            cf=$(jq -n --arg c "$cpu" --arg co "$cores" --arg m "$mem" \
+                '{custom_fields:(
+                    (if $c!=""  then {cpu_model:$c} else {} end)
+                  + (if $co!="" then {cpu_cores:($co|tonumber)} else {} end)
+                  + (if $m!=""  then {memory_gb:$m} else {} end))}')
+            nb_patch "dcim/devices/$dev_id/" "$cf" >/dev/null 2>&1 || true
+        fi
+        dcount=$((dcount+1))
+    done < <(jq -c '.devices[]' "$plan")
+
+    while IFS= read -r v; do
+        local vname vcl status vcpus vmem vdisk vip vmac cid vm_id vif
+        vname=$(jq -r '.name' <<<"$v");   vcl=$(jq -r '.cluster' <<<"$v")
+        status=$(jq -r '.status' <<<"$v")
+        vcpus=$(jq -r '.vcpus // ""' <<<"$v");  vmem=$(jq -r '.memory_mb // ""' <<<"$v")
+        vdisk=$(jq -r '.disk_gb // ""' <<<"$v"); vip=$(jq -r '.primary_ip // ""' <<<"$v")
+        vmac=$(jq -r '.mac // ""' <<<"$v")
+        cid="${CLU[$vcl]:-}"
+        if [[ -z "$cid" || ! "$cid" =~ ^[0-9]+$ ]]; then
+            log_warn "no cluster for VM $vname ($vcl)"; continue
+        fi
+        vm_id=$(nb_upsert_vm "$vname" "$cid" "$status" "$vcpus" "$vmem" "$site_id" 2>>"$LOG_FILE")
+        if [[ -z "$vm_id" || ! "$vm_id" =~ ^[0-9]+$ ]]; then
+            log_warn "VM upsert failed: $vname"; continue
+        fi
+        if [[ -n "$vdisk" && "$vdisk" =~ ^[0-9]+$ ]]; then
+            nb_patch "virtualization/virtual-machines/$vm_id/" \
+                "{\"disk\":$vdisk}" >/dev/null 2>&1 || true
+        fi
+        vif=$(nb_add_vm_interface "$vm_id" "eth0" "$vmac" "" 2>>"$LOG_FILE")
+        if [[ -n "$vip" && "$vif" =~ ^[0-9]+$ ]]; then
+            nb_add_vm_ip "$vip" "$vm_id" "$vif" >/dev/null 2>&1 || true
+        fi
+        vcount=$((vcount+1))
+    done < <(jq -c '.vms[]' "$plan")
+
+    log_ok "Single-writer sync complete: $dcount device(s), $vcount VM(s) -> NetBox."
+}
+
 generate_collector_script() {
     # Emit a standalone, read-only collector that runs on ANY Windows machine
     # (workstation or Hyper-V host) WITHOUT WinRM or NetBox access. It writes a
@@ -5738,6 +6074,7 @@ menu_discovery() {
         echo "  6) Sync Last Results to NetBox"
         echo "  7) Full Auto: Discover + Sync"
         echo "  8) Preview Reconciliation (dry-run, no NetBox writes)"
+        echo "  9) Sync RECONCILED model to NetBox (single writer)"
         echo "  0) Back"
         read -rp $'\nChoice: ' c
         local input sip hf swip latest cnt
@@ -5820,6 +6157,20 @@ menu_discovery() {
                 printf "\n${C}Reconciliation plan for $(basename "$latest"):${NC}\n\n"
                 reconcile_results "$latest" --preview
                 printf "\n${D}  (dry-run only -- nothing written to NetBox)${NC}\n"
+            fi
+            pause ;;
+        9)  latest=$(ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
+                | grep -v reconciled | head -1)
+            if [[ -z "$latest" ]]; then
+                printf "${Y}  No discovery results -- run a scan first${NC}\n"; pause; continue
+            fi
+            printf "\n${C}Single-writer plan for $(basename "$latest"):${NC}\n\n"
+            sync_reconciled_to_netbox "$latest" --dry-run
+            echo ""
+            if confirm "  Write this reconciled model to NetBox now?"; then
+                sync_reconciled_to_netbox "$latest"
+            else
+                printf "${D}  Skipped -- nothing written.${NC}\n"
             fi
             pause ;;
         7)  printf "  Enter target(s) (CIDR, comma-separated, or file):\n"
