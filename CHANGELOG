@@ -1,3 +1,18 @@
+#  Changelog v2.5.24 (restore discovered_ports/discovery_methods; un-filter disks):
+#   - REVERTED a bad call from 2.5.19: it filtered out physical disks with
+#     media 'Unspecified', which silently dropped SERVER01's ~22 TB Storage
+#     Spaces/RAID volume. 2.5.9/the PS1 only ever filtered size>0. The single
+#     writer now keeps every disk with a real size; SERVER01 reports all 3
+#     disks again (disk_total_gb includes the RAID volume).
+#   - Restored discovered_ports + discovery_methods custom fields on devices
+#     (the legacy sync set these; the single writer never did). Same text
+#     format as before: 'discovered_ports' = '22/ssh, 80/http, ...',
+#     'discovery_methods' = 'nmap, snmp, ssh'. Computed in the plan and ensured
+#     by the writer.
+#   - Systematic parity check done this round: device serial, VM interface MACs,
+#     and VM primary IPs were already handled; ports/methods were the only
+#     remaining device-field gap vs the PS1/legacy path.
+#
 #  Changelog v2.5.23 (fix: custom fields STILL partial -- memory_gb + resilient patch):
 #   - Symptom: only cpu_model/cpu_cores/memory_gb populated (the 3 fields the
 #     old 2.5.16-2.5.18 writer set, with memory_gb='31.41' as TEXT); every field
