@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.20
+#  Version: 2.5.21
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.20"
+SCRIPT_VERSION="2.5.21"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -27,6 +27,25 @@ DISCOVERY_DIR="$BASE_DIR/discovery"
 latest_scan_file() {
     ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
         | grep -vE '\.(plan|reconciled)\.json$' | head -1
+}
+
+nb_sync_vm_disk() {
+    # Create/update a NetBox virtual disk for a VM (size in GB). NetBox 4.x
+    # aggregates the VM's total disk from these objects.
+    local vm_id="$1" name="$2" size_gb="$3"
+    [[ "$vm_id" =~ ^[0-9]+$ && "$size_gb" =~ ^[0-9]+$ ]] || return 0
+    local enc; enc=$(nb_urlencode "$name")
+    local existing; existing=$(nb_get \
+        "virtualization/virtual-disks/?virtual_machine_id=${vm_id}&name=${enc}")
+    local did; did=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
+    local payload; payload=$(jq -n --arg n "$name" \
+        --argjson s "$size_gb" --argjson vm "$vm_id" \
+        '{name:$n,size:$s,virtual_machine:$vm}')
+    if [[ -n "$did" && "$did" =~ ^[0-9]+$ ]]; then
+        nb_patch "virtualization/virtual-disks/${did}/" "$payload" >/dev/null 2>&1 || true
+    else
+        nb_post "virtualization/virtual-disks/" "$payload" >/dev/null 2>&1 || true
+    fi
 }
 NETBOX_DIR="/opt/netbox-docker"
 DOCKER_COMPOSE="docker compose"    # updated by detect_docker_compose()
@@ -2164,6 +2183,19 @@ if winrm.get('available'):
         'prefix_lens':n.get('PrefixLens',[]) or []}
         for n in (winrm.get('NetworkAdapters') or [])]
     host['is_hyperv']=bool(winrm.get('IsHyperV',False))
+    # WinRM host hardware -> SAME shape the collector JSON import produces, so the
+    # single writer can populate device custom fields (CPU/RAM/OS/disks) and create
+    # host disks for WinRM-scanned hosts, not only collector-imported ones.
+    if any(k in winrm for k in ('CPUName','CPUCores','MemoryGB','PhysicalDisks')):
+        host['hardware']={
+            'cpu_model':winrm.get('CPUName','') or '',
+            'cpu_cores':winrm.get('CPUCores'),
+            'logical_procs':winrm.get('LogicalProcessors'),
+            'memory_gb':winrm.get('MemoryGB'),
+            'physical_disks':[{'size_gb':d.get('SizeGB'),'media':d.get('Media'),
+                               'interface':d.get('Interface')}
+                              for d in (winrm.get('PhysicalDisks') or [])],
+        }
     # Read-only Hyper-V VM inventory (name/state/cpu/mem + per-adapter MAC/IPs).
     # Used by the reconciler to map discovered devices to VMs and to create VMs
     # that were not independently IP-scanned. No NetBox writes happen here.
@@ -2910,6 +2942,8 @@ def reconcile(data):
             winner["hyperv_vms"] = loser["hyperv_vms"]
         if not winner.get("winrm_nics") and loser.get("winrm_nics"):
             winner["winrm_nics"] = loser["winrm_nics"]
+        if not winner.get("hardware") and loser.get("hardware"):
+            winner["hardware"] = loser["hardware"]
         # Strongest role wins.
         if _role_rank.get(loser.get("device_role"), 0) > \
                 _role_rank.get(winner.get("device_role"), 0):
@@ -5329,6 +5363,7 @@ def build(reconciled):
                 'vcpus': vm.get('ProcessorCount'),
                 'mem_b': vm.get('MemoryStartupBytes'),
                 'disk_b': vm.get('DiskBytes'),
+                'disks': vm.get('Disks') or [],
                 'macs': macs,
             }
             for k in keys:
@@ -5425,6 +5460,8 @@ def build(reconciled):
             if mem_b is None:
                 mem_b = h.get('vm_mem_bytes') or h.get('vm_mem')
             disk_b = det.get('disk_b')
+            disks_gb = [ (int(b) + 1073741823) // 1073741824
+                         for b in (det.get('disks') or []) if b ]
             macs = det.get('macs') or []
             ip = h.get('ip')
             ip = ip if (ip and re.match(r'^\d+\.\d+\.\d+\.\d+$', ip)) else None
@@ -5436,6 +5473,7 @@ def build(reconciled):
                 'vcpus': int(vcpus) if vcpus else None,
                 'memory_mb': int(round(mem_b / 1048576)) if mem_b else None,
                 'disk_gb': int(round(disk_b / 1073741824)) if disk_b else None,
+                'disks_gb': disks_gb,
                 'primary_ip': ('%s/%d' % (ip, DEF_MASK)) if ip else None,
                 'mac': macs[0] if macs else None,
                 'no_ip_flag': bool(h.get('vm_no_ip_flag')),
@@ -5595,6 +5633,7 @@ PLANEOF
 
     while IFS= read -r v; do
         local vname vcl vrole status vcpus vmem vdisk vip vmac cid vm_id vif role_id
+        local _nd _i _dsz _dname
         vname=$(jq -r '.name' <<<"$v");   vcl=$(jq -r '.cluster' <<<"$v")
         vrole=$(jq -r '.role // "Server"' <<<"$v")
         status=$(jq -r '.status' <<<"$v")
@@ -5615,7 +5654,17 @@ PLANEOF
                 "virtualization/virtual-machines/$vm_id/" \
                 "{\"role\":$role_id}" >/dev/null 2>&1 || true
         fi
-        if [[ -n "$vdisk" && "$vdisk" =~ ^[0-9]+$ ]]; then
+        # Per-VM virtual disks (NetBox 4.x aggregates VM.disk from these). Fall
+        # back to the single aggregate disk field only when no per-disk data.
+        _nd=$(jq '.disks_gb | length' <<<"$v" 2>/dev/null || echo 0)
+        if [[ "$_nd" =~ ^[0-9]+$ && "$_nd" -gt 0 ]]; then
+            _i=0
+            while IFS= read -r _dsz; do
+                _dname=$(printf '%s-disk%d' "$vname" "$_i" | tr -c 'A-Za-z0-9-' '-')
+                nb_sync_vm_disk "$vm_id" "$_dname" "$_dsz"
+                _i=$((_i+1))
+            done < <(jq -r '.disks_gb[]' <<<"$v")
+        elif [[ -n "$vdisk" && "$vdisk" =~ ^[0-9]+$ ]]; then
             nb_patch "virtualization/virtual-machines/$vm_id/" \
                 "{\"disk\":$vdisk}" >/dev/null 2>&1 || true
         fi
