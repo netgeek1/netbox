@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.24
+#  Version: 2.5.26
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.24"
+SCRIPT_VERSION="2.5.26"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -568,6 +568,7 @@ nb_api() {
 nb_get()   { nb_api GET   "$1"; }
 nb_post()  { nb_api POST  "$1" "${2:-}"; }
 nb_patch() { nb_api PATCH "$1" "${2:-}"; }
+nb_delete(){ nb_api DELETE "$1"; }
 
 nb_get_or_create_site() {
     local name="$DEFAULT_SITE_NAME" slug enc res id
@@ -848,8 +849,17 @@ nb_ensure_custom_field() {
         local cur; cur=$(echo "$res" \
             | jq -r '(.results[0].type|objects|.value) // (.results[0].type|strings) // empty' 2>/dev/null)
         if [[ -n "$cur" && "$cur" != "$type" ]]; then
-            nb_patch "extras/custom-fields/${id}/" \
-                "$(jq -n --arg t "$type" '{type:$t}')" >/dev/null 2>&1 || true
+            # A PATCH of an existing field's type is unreliable once it holds a
+            # value (NetBox can refuse the cast), which left memory_gb stuck and
+            # 400'ing forever. Delete and recreate so the type is guaranteed; the
+            # value is rewritten this same run.
+            log_info "Custom field '$name' is '$cur', expected '$type' -- recreating"
+            nb_delete "extras/custom-fields/${id}/" >/dev/null 2>&1 || true
+            nb_post "extras/custom-fields/" \
+                "$(jq -n --arg n "$name" --arg l "$label" --arg t "$type" \
+                    --argjson ot "[\"$obj_types\"]" \
+                    '{name:$n,label:$l,type:$t,object_types:$ot}')" \
+                >/dev/null 2>&1 || true
         fi
     fi
 }
@@ -2779,9 +2789,12 @@ reconcile_results() {
     fi
     local pyf; pyf=$(mktemp --suffix=.py)
     cat > "$pyf" <<'PYEOF'
-import json, sys, re
+import json, sys, re, os
 
 HYPERV_OUI = "00:15:5d"
+# Set in __main__; persistent IP<->MAC cache so VM IPs survive a scan where a
+# router's ARP entry has aged out (the ARP tables are authoritative but volatile).
+CACHE_PATH = None
 
 # Default/generic hostnames shared by many distinct devices -- never a merge key.
 # (Two iPhones both mDNS-named "iPhone" are different phones, not one device;
@@ -3034,6 +3047,23 @@ def reconcile(data):
             mac = (n.get("mac") or "").strip().lower()
             if ip and len(mac) == 17 and ip not in ip2mac:
                 ip2mac[ip] = mac
+    # Persist IP<->MAC across runs. Router/firewall ARP is the source of truth
+    # but volatile: an entry can be absent for one scan (aging, SNMP timeout),
+    # which would strip a VM's IP and turn it into a phantom device. Fill gaps
+    # from history (this scan always wins), then save the union back.
+    if CACHE_PATH:
+        try:
+            _hist = json.load(open(CACHE_PATH))
+        except Exception:
+            _hist = {}
+        if isinstance(_hist, dict):
+            for _ip, _mac in _hist.items():
+                if _ip not in ip2mac and isinstance(_mac, str) and len(_mac) == 17:
+                    ip2mac[_ip] = _mac.lower()
+        try:
+            json.dump(ip2mac, open(CACHE_PATH, "w"))
+        except Exception:
+            pass
     # Inverse map (MAC -> IP) to recover the guest IP of a VM that reports none
     # via Get-VMNetworkAdapter: its vNIC MAC is in the gateway/host ARP tables.
     mac2ip = {}
@@ -3226,6 +3256,7 @@ def preview(data):
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "reconcile"
     path = sys.argv[2]
+    CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(path)), "ip_mac_cache.json")
     data = json.load(open(path))
     data = reconcile(data)
     if mode == "preview":
@@ -5342,10 +5373,8 @@ def device_custom_fields(hw, os_str):
     mg = hw.get('memory_gb')
     if mg is not None:
         try:
-            # memory_gb is a TEXT field (see writer): a numeric field can't be
-            # recast once it holds a value, and earlier builds wrote text here.
-            # Sending a string matches the type everywhere and always populates.
-            cf['memory_gb'] = ('%.2f' % float(mg)).rstrip('0').rstrip('.')
+            # memory_gb is a DECIMAL field; send a number. memory_mb stays int.
+            cf['memory_gb'] = round(float(mg), 2)
             cf['memory_mb'] = int(round(float(mg) * 1024))
         except (TypeError, ValueError):
             pass
@@ -5582,7 +5611,7 @@ PLANEOF
     nb_ensure_custom_field "cpu_cores"     "CPU Cores"       "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "vcpus"         "vCPUs"           "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "memory_mb"     "Memory (MB)"     "integer" "dcim.device" >/dev/null 2>&1 || true
-    nb_ensure_custom_field "memory_gb"     "Memory (GB)"     "text"    "dcim.device" >/dev/null 2>&1 || true
+    nb_ensure_custom_field "memory_gb"     "Memory (GB)"     "decimal" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "disk_total_gb" "Disk Total (GB)" "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "disk_count"    "Disk Count"      "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "os_version"    "OS Version"      "text"    "dcim.device" >/dev/null 2>&1 || true
@@ -5665,9 +5694,10 @@ PLANEOF
                 while IFS= read -r _k; do
                     _v=$(jq -c --arg k "$_k" '.[$k]' <<<"$cf")
                     _one=$(jq -nc --arg k "$_k" --argjson v "$_v" '{custom_fields:{($k):$v}}')
-                    echo "$(nb_patch "dcim/devices/$dev_id/" "$_one")" \
-                        | jq -e '.id' >/dev/null 2>&1 \
-                        || log_warn "Custom field '\''$_k'\'' rejected for device ID $dev_id"
+                    local _r; _r=$(nb_patch "dcim/devices/$dev_id/" "$_one")
+                    if ! echo "$_r" | jq -e '.id' >/dev/null 2>&1; then
+                        log_warn "Custom field '\''$_k'\'' rejected for device ID $dev_id: $(echo "$_r" | jq -c '.custom_fields // .' 2>/dev/null | head -c 160)"
+                    fi
                 done < <(jq -r 'keys[]' <<<"$cf")
             fi
         fi
