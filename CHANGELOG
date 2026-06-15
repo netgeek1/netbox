@@ -1,3 +1,40 @@
+#  Changelog v2.5.26 (VM IPs: persist router/firewall ARP so they stop vanishing):
+#   - ROOT CAUSE of VMs losing their IP (and the IP reappearing as a phantom
+#     device): VM IPs are resolved by matching the VM's vNIC MAC against the
+#     router/firewall ARP tables (VM MAC -> ARP IP). That data is authoritative
+#     but VOLATILE -- an ARP entry can be absent for a single scan (aging, an
+#     SNMP timeout on the gateway, a router not answering that run). When the
+#     entry is missing, the VM gets no IP and the discovered IP falls out to a
+#     standalone device. Verified against a real capture: every affected VM IP
+#     (.160/.214/.235/.190/.5/.30) was present in the ARP with the exact VM MAC
+#     when the fold worked, and absent when it didn't.
+#   - Fix: the reconciler now persists the learned IP<->MAC map to
+#     discovery/ip_mac_cache.json and merges it on every run -- the current scan
+#     always wins, history only fills gaps. So once an IP<->MAC is seen, a VM
+#     keeps its IP through scans where the ARP entry transiently disappears.
+#     The fold still requires the VM to exist in the current inventory, so a
+#     stale cache entry cannot invent a VM. Tested worst-case (all ARP +
+#     neighbor + guest IPs stripped): all 6 VM IPs recovered, 0 lost.
+#
+#  Changelog v2.5.25 (memory_gb: stop flip-flopping the type -- self-heal):
+#   - The memory_gb custom field had been bounced between text and integer
+#     across builds; once it holds a value NetBox refuses to recast it, so a
+#     PATCH of its type silently failed and every run kept 400'ing that one
+#     field (the resilient per-field patch logged 'memory_gb rejected').
+#   - Fix: nb_ensure_custom_field now DELETES and recreates a field whose type
+#     doesn't match the desired type (these are the script's own hardware
+#     fields, repopulated every run), so the type is guaranteed. memory_gb is
+#     now 'decimal' and sent as a number (e.g. 31.41), which is what it always
+#     should have been for fractional GB. Added nb_delete().
+#   - The per-field fallback now logs the actual NetBox error text, so any
+#     remaining rejection says exactly why.
+#   - NOTE (not a code bug): a wider scan now learns hosts on other VLANs via
+#     SNMP ARP -- those become generic device-* entries (18 real responders +
+#     ~10 ARP-only phantoms in the last capture). They are NOT VM IPs (verified:
+#     zero overlap between any device-side IP and any VM primary IP, and VM-IP
+#     coverage is identical to the earlier good run). An optional filter to skip
+#     no-response ARP phantoms can be added on request.
+#
 #  Changelog v2.5.24 (restore discovered_ports/discovery_methods; un-filter disks):
 #   - REVERTED a bad call from 2.5.19: it filtered out physical disks with
 #     media 'Unspecified', which silently dropped SERVER01's ~22 TB Storage
