@@ -1,3 +1,19 @@
+#  Changelog v2.5.27 (VM IPs blocked by stale device IPs -- the real 'did nothing'):
+#   - Why re-running still left VMs with no IP: earlier buggy runs created the
+#     VM IPs as DEVICE addresses with a /32 mask (e.g. 192.168.0.160/32). The
+#     writer assigns the VM's IP as /24, and NetBox enforce_unique treats
+#     .160/24 and .160/32 as the same host -> the POST is rejected, so the VM
+#     got no IP and the stale device kept it. (The 2.5.26 ARP persistence was
+#     fine; this was a writer/NetBox-state collision downstream of it.)
+#   - Fix: nb_add_vm_ip and nb_add_ip now look up an existing address by HOST
+#     (any mask) via ?address=<ip>, which matches regardless of prefix. A found
+#     object is PATCHed -- reassigned onto the VM interface (or device) and
+#     re-masked to the intended prefix -- instead of POSTing a conflicting
+#     duplicate. So a stale device-held /32 is MOVED onto the VM.
+#   - This means a wipe is no longer required: re-running option 9 now pulls the
+#     VM IPs off the stale device shells and onto the VMs. (A wipe still gives
+#     the tidiest result by removing the now-empty device shells.)
+#
 #  Changelog v2.5.26 (VM IPs: persist router/firewall ARP so they stop vanishing):
 #   - ROOT CAUSE of VMs losing their IP (and the IP reappearing as a phantom
 #     device): VM IPs are resolved by matching the VM's vNIC MAC against the
