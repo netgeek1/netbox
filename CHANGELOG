@@ -1,3 +1,15 @@
+#  Changelog v2.5.28 (plan crash: TypeError None < str when building clusters):
+#   - Option 9 aborted with "'<' not supported between instances of 'NoneType'
+#     and 'str'" at sorted(clusters). Cause: a VM whose owning Hyper-V host
+#     record came through with a null ip AND null hostname resolved to a null
+#     cluster (vm_cluster = host_name or host_ip -> None), which was added to
+#     the cluster set and then could not be sorted against the real names.
+#   - Fix: an unattributed VM now falls back to an 'Unclustered' bucket instead
+#     of None, so it still syncs (the writer creates the cluster and assigns the
+#     VM by name); sorted() additionally drops any falsy cluster defensively.
+#     Before this, such a VM both crashed the plan and -- had it gotten further
+#     -- would have been skipped with 'no cluster for VM'.
+#
 #  Changelog v2.5.27 (VM IPs blocked by stale device IPs -- the real 'did nothing'):
 #   - Why re-running still left VMs with no IP: earlier buggy runs created the
 #     VM IPs as DEVICE addresses with a /32 mask (e.g. 192.168.0.160/32). The
