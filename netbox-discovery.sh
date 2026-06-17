@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.29
+#  Version: 2.5.30
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.29"
+SCRIPT_VERSION="2.5.30"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1738,10 +1738,17 @@ for n in details.get('Neighbors', []) or []:
     nm    = clean(n.get('Neighbor Name'))
     rport = clean(n.get('Remote Port'))
     oif   = clean(n.get('Origin Interface'))
+    lif   = clean(n.get('Local Interface Index'))
     if proto == 'CDP':
-        cdp.append({'device_id': nm, 'remote_port': oif or rport})
+        cdp.append({'device_id': nm, 'remote_port': rport,
+                    'local_port': oif, 'local_if_index': lif})
     else:
-        lldp.append({'sys_name': nm, 'port_id': rport, 'port_desc': rport})
+        # Keep BOTH sides: remote (sys_name/port_id) AND the local port on THIS
+        # device (local_port / local_if_index). The local side is what cabling
+        # needs -- "my port X connects to neighbor's port Y" -- and was being
+        # dropped, leaving every switch-to-switch link unanchored.
+        lldp.append({'sys_name': nm, 'port_id': rport, 'port_desc': rport,
+                     'local_port': oif, 'local_if_index': lif})
 
 # Entity inventory (one synthesised root component for model/serial extraction)
 entity_inventory = []
@@ -2804,29 +2811,71 @@ for idx,name in if_names.items():
         'vlan':vlan,'vlan_name':vlan_names.get(str(vlan),''),
         'clients':macs_on_port,'remote_ips':remote_ips}
 
+# --- LLDP overlay: authoritative switch-to-switch cabling -------------------
+# The FDB/bridge mapping above is right for endpoint ports but wrong for
+# uplinks/trunks -- a trunk learns every MAC reachable behind it, so it can't
+# say which neighbor is on the port. LLDP states it directly (neighbor + local
+# port). The main SNMP scan already captures LLDP with the local port into each
+# host's lldp_neighbors (handling v3 / FortiSwitch); pull the most recent
+# capture for this switch and attach each link to its local port. Falls back
+# silently to FDB-only if no capture is available.
+import glob
+lldp_by_idx={}; lldp_by_name={}; lldp_src=''
+try:
+    cands=sorted(glob.glob(os.path.join(disc_dir,'results_*.json')),
+                 key=os.path.getmtime, reverse=True)
+    for rf in cands[:3]:
+        rd=json.load(open(rf))
+        hosts=(rd.get('hosts') if isinstance(rd,dict) else rd) or []
+        match=None
+        for h in hosts:
+            if h.get('ip')==ip: match=h; break
+        if not match: continue
+        for n in (match.get('lldp_neighbors') or []):
+            li=str(n.get('local_if_index') or '').strip()
+            lp=str(n.get('local_port') or '').strip()
+            rec={'neighbor':n.get('sys_name') or '','remote_port':n.get('port_id') or ''}
+            if not rec['neighbor'] and not rec['remote_port']: continue
+            if li: lldp_by_idx.setdefault(li,rec)
+            if lp: lldp_by_name.setdefault(lp.lower(),rec)
+        if lldp_by_idx or lldp_by_name:
+            lldp_src=os.path.basename(rf); break
+except Exception:
+    pass
+
+for idx,ent in if_entries.items():
+    link=lldp_by_idx.get(str(idx)) or lldp_by_name.get(str(ent['if_name']).lower())
+    ent['lldp_neighbor']=link['neighbor'] if link else ''
+    ent['lldp_remote_port']=link['remote_port'] if link else ''
+
 port_entries=sorted(if_entries.values(),key=lambda x:x['if_name'])
 out_file=os.path.join(disc_dir,'switchport_'+ip.replace('.', '-')+'.json')
 with open(out_file,'w') as f:
     json.dump({'switch_ip':ip,'interfaces':port_entries,
                'vlan_names':vlan_names,'interface_count':len(if_names),
-               'mac_count':len(mac_to_port)},f,indent=2)
+               'mac_count':len(mac_to_port),'lldp_source':lldp_src},f,indent=2)
 
 print('  Saved: '+out_file)
 print('\n  Switch     : '+ip)
 print('  Interfaces : {0}'.format(len(if_names)))
 print('  MAC entries: {0}'.format(len(mac_to_port)))
+if lldp_src:
+    nl=sum(1 for e in port_entries if e.get('lldp_neighbor'))
+    print('  LLDP links : {0} (from {1})'.format(nl, lldp_src))
 if vlan_names:
     pairs=sorted(vlan_names.items(),key=lambda x:int(x[0]) if x[0].isdigit() else 0)[:10]
     print('  VLANs      : '+', '.join('{0}={1}'.format(k,v) for k,v in pairs))
 print()
-hdr='  {:<24} {:<5} {:<5} {:<8} {:<6} {:<18} {:<17} {}'.format(
-    'Interface','Adm','Oper','Speed','VLAN','VLAN Name','Port MAC','Remote IPs / Clients')
-print(hdr); print('  '+'-'*110)
+hdr='  {:<24} {:<5} {:<5} {:<8} {:<6} {:<18} {:<22} {}'.format(
+    'Interface','Adm','Oper','Speed','VLAN','VLAN Name','LLDP Neighbor','Remote IPs / Clients')
+print(hdr); print('  '+'-'*120)
 for e in port_entries:
     cl=', '.join(e['remote_ips']) if e['remote_ips'] else ', '.join(e['clients'][:3])
-    print('  {:<24} {:<5} {:<5} {:<8} {:<6} {:<18} {:<17} {}'.format(
+    nbr=e.get('lldp_neighbor','')
+    if nbr and e.get('lldp_remote_port'): nbr=nbr+':'+e['lldp_remote_port']
+    print('  {:<24} {:<5} {:<5} {:<8} {:<6} {:<18} {:<22} {}'.format(
         e['if_name'][:23],e['admin'][:4],e['oper'][:4],e['speed'][:7],
-        str(e['vlan'])[:5],e['vlan_name'][:17],e['mac'][:16],cl[:50]))
+        str(e['vlan'])[:5],e['vlan_name'][:17],nbr[:21],cl[:46]))
 if not port_entries:
     print('  (No interfaces found -- check SNMP community and device support)')
 PYEOF
