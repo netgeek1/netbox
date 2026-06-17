@@ -1,3 +1,12 @@
+#  Changelog v2.5.31 (drop self-referential LLDP links):
+#   - The LLDP overlay now skips any neighbor whose name equals the switch's own
+#     hostname/serial -- a stack/aggregate interface reporting the switch itself,
+#     which is not a real cable. Real switch-to-switch links are unaffected even
+#     when the local port is named after the PEER's serial (FortiLink trunks),
+#     because the neighbor != the local switch's own id. Validated against the
+#     live FortiSwitch capture: the S224EP<->S124FN trunk is kept; a synthetic
+#     true self-reference is dropped.
+# 
 #  Changelog v2.5.30 (switchport cabling: use LLDP, keep the local port):
 #   - Diagnosed from real captures: Map Switchports derived links from the FDB
 #     (bridge MAC table) + the switch's OWN ARP. That is right for endpoint
