@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.31
+#  Version: 2.5.32
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.31"
+SCRIPT_VERSION="2.5.32"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -823,11 +823,77 @@ nb_upsert_device() {
 }
 
 nb_create_cable() {
-    local a_id="$1" b_id="$2" label="${3:-}"
+    local a_id="$1" b_id="$2" label="${3:-}" tag="${4:-}"
+    local tagj="[]"; [[ -n "$tag" ]] && tagj="[\"$tag\"]"
     nb_post "dcim/cables/" \
         "{\"a_terminations\":[{\"object_type\":\"dcim.interface\",\"object_id\":$a_id}],
           \"b_terminations\":[{\"object_type\":\"dcim.interface\",\"object_id\":$b_id}],
-          \"label\":\"$label\"}" >/dev/null 2>&1 || true
+          \"status\":\"connected\",\"tags\":$tagj,\"label\":\"$label\"}" >/dev/null 2>&1 || true
+}
+
+# Idempotent tag creator (used to mark tool-managed LLDP cables).
+nb_ensure_tag() {
+    local name="$1" slug="$2"
+    local enc; enc=$(nb_urlencode "$slug")
+    local ex; ex=$(nb_get "extras/tags/?slug=${enc}")
+    local id; id=$(echo "$ex" | jq -r '.results[0].id // empty' 2>/dev/null)
+    [[ -z "$id" ]] && nb_post "extras/tags/" "{\"name\":\"$name\",\"slug\":\"$slug\"}" >/dev/null 2>&1 || true
+}
+
+nb_dev_id_by_name() {
+    local nm="$1"; [[ -z "$nm" ]] && return
+    local enc; enc=$(nb_urlencode "$nm")
+    nb_get "dcim/devices/?name=${enc}" | jq -r '.results[0].id // empty' 2>/dev/null
+}
+nb_dev_id_by_serial() {
+    local sn="$1"; [[ -z "$sn" ]] && return
+    local enc; enc=$(nb_urlencode "$sn")
+    nb_get "dcim/devices/?serial=${enc}" | jq -r '.results[0].id // empty' 2>/dev/null
+}
+
+# Reconcile ONE LLDP cable between local and remote interface IDs. Only ever
+# touches cables tagged 'lldp-auto'. Returns 0 if it created or replaced a
+# cable, 1 if it left things as-is (already correct, or a manual cable it must
+# not disturb). This is what makes a moved cable self-correct instead of leaving
+# a stale link: a wrong lldp-auto cable on the local port is deleted + recreated.
+nb_reconcile_cable() {
+    local lif="$1" rif="$2" label="${3:-}"
+    local ifo; ifo=$(nb_get "dcim/interfaces/${lif}/")
+    local cid; cid=$(echo "$ifo" | jq -r '(.cable.id // .cable) // empty' 2>/dev/null)
+    if [[ -n "$cid" && "$cid" =~ ^[0-9]+$ ]]; then
+        local cab; cab=$(nb_get "dcim/cables/${cid}/")
+        local is_auto; is_auto=$(echo "$cab" | jq -r 'any(.tags[]?; .slug=="lldp-auto")' 2>/dev/null)
+        [[ "$is_auto" != "true" ]] && return 1   # manual cable -- never disturb
+        local hasr; hasr=$(echo "$cab" | jq -r --argjson r "$rif" \
+            'any((.a_terminations[]?,.b_terminations[]?); .object_id==$r)' 2>/dev/null)
+        [[ "$hasr" == "true" ]] && return 1      # already correct
+        nb_delete "dcim/cables/${cid}/" >/dev/null 2>&1   # changed -> replace
+    fi
+    nb_create_cable "$lif" "$rif" "$label" "lldp-auto"
+    return 0
+}
+
+# Remove lldp-auto cables on a device whose local interface is no longer in the
+# current link set ($keep = space-separated local interface IDs). This is the
+# 'remove' half of reconcile: a port that LLDP no longer reports loses its
+# auto-cable. Manual (untagged) cables are never enumerated here.
+nb_prune_lldp_cables() {
+    local dev_id="$1" keep="$2"
+    local cabs; cabs=$(nb_get "dcim/cables/?tag=lldp-auto&device_id=${dev_id}")
+    local n; n=$(echo "$cabs" | jq '.results | length' 2>/dev/null || echo 0)
+    [[ ! "$n" =~ ^[0-9]+$ || "$n" -eq 0 ]] && return
+    local row cid lifids lid k stale
+    while IFS= read -r row; do
+        cid=$(jq -r '.id' <<<"$row")
+        lifids=$(jq -r --argjson dev "$dev_id" \
+            '[(.a_terminations[]?,.b_terminations[]?)
+              | select((.object.device.id // -1)==$dev) | .object_id] | .[]' <<<"$row" 2>/dev/null)
+        stale=1
+        for lid in $lifids; do
+            for k in $keep; do [[ "$lid" == "$k" ]] && stale=0; done
+        done
+        [[ "$stale" -eq 1 ]] && nb_delete "dcim/cables/${cid}/" >/dev/null 2>&1
+    done < <(echo "$cabs" | jq -c '.results[]')
 }
 
 # Idempotent custom field creator -- only POSTs if field does not yet exist
@@ -5618,6 +5684,22 @@ def build(reconciled):
             _dm = h.get('discovery_methods') or []
             if _dm:
                 dcf['discovery_methods'] = ', '.join(str(m) for m in _dm)
+            # LLDP cabling links for this device. Each needs our local port and a
+            # named neighbor; self-referential entries (a stack/aggregate that
+            # reports this switch's own hostname/serial) are dropped -- not cables.
+            _own = {(h.get('hostname') or '').strip().lower(),
+                    (h.get('serial') or '').strip().lower()}
+            _own.discard('')
+            lldp_links = []
+            for _n in (h.get('lldp_neighbors') or []):
+                _nb = (_n.get('sys_name') or '').strip()
+                _lp = (_n.get('local_port') or '').strip()
+                _rp = (_n.get('port_id') or '').strip()
+                if not _nb or not _lp:
+                    continue
+                if _nb.lower() in _own:
+                    continue
+                lldp_links.append({'local_port': _lp, 'neighbor': _nb, 'remote_port': _rp})
             devices.append({
                 'name': h.get('hostname') or ('device-' + (ip or '').replace('.', '-')),
                 'role': h.get('device_role') or 'Unknown',
@@ -5633,6 +5715,7 @@ def build(reconciled):
                 'hardware': hw,
                 'custom_fields': dcf,
                 'ip_assignments': ip_assignments,
+                'lldp_links': lldp_links,
             })
 
         elif sa == 'vm':
@@ -5702,8 +5785,14 @@ def dry_run(plan):
             v['name'][:26], (v['cluster'] or '')[:12], (v.get('role') or '')[:10],
             v['status'], v['vcpus'], v['memory_mb'], v['disk_gb'], ipf))
     out.append('')
-    out.append('TOT:  %d devices, %d VMs, %d clusters' % (
-        len(plan['devices']), len(plan['vms']), len(plan['clusters'])))
+    _links = [(d['name'], l) for d in plan['devices'] for l in d.get('lldp_links', [])]
+    out.append('LLDP CABLES (%d, tag lldp-auto -- created/replaced/pruned on sync):' % len(_links))
+    for dn, l in _links:
+        out.append('  %-22s %-12s <-> %-22s %s' % (
+            dn[:22], l['local_port'][:12], l['neighbor'][:22], l.get('remote_port', '')))
+    out.append('')
+    out.append('TOT:  %d devices, %d VMs, %d clusters, %d cables' % (
+        len(plan['devices']), len(plan['vms']), len(plan['clusters']), len(_links)))
     return '\n'.join(out)
 
 
@@ -5837,6 +5926,49 @@ PLANEOF
         fi
         dcount=$((dcount+1))
     done < <(jq -c '.devices[]' "$plan")
+
+    # ---- LLDP cabling (tagged-reconcile) ------------------------------------
+    # Runs AFTER all devices exist so a neighbor resolves to a real device.
+    # Only cables tagged 'lldp-auto' are ever created, replaced, or removed;
+    # manual cables are untouched. Reciprocal links (each end advertises the
+    # same trunk) collapse to one cable: the second pass finds it already
+    # correct and no-ops.
+    nb_ensure_tag "lldp-auto" "lldp-auto"
+    local ccreated=0
+    while IFS= read -r d; do
+        local nlinks; nlinks=$(jq '.lldp_links | length' <<<"$d" 2>/dev/null || echo 0)
+        [[ ! "$nlinks" =~ ^[0-9]+$ || "$nlinks" -eq 0 ]] && continue
+        local lname ldev
+        lname=$(jq -r '.name' <<<"$d")
+        ldev=$(nb_dev_id_by_name "$lname")
+        [[ ! "$ldev" =~ ^[0-9]+$ ]] && continue
+        local keep="" lk
+        while IFS= read -r lk; do
+            local lp nb rp rdev nbshort lif rif rifname
+            lp=$(jq -r '.local_port' <<<"$lk")
+            nb=$(jq -r '.neighbor' <<<"$lk")
+            rp=$(jq -r '.remote_port // ""' <<<"$lk")
+            [[ -z "$lp" || -z "$nb" ]] && continue
+            # resolve neighbor device: exact name -> domain-stripped -> serial
+            rdev=$(nb_dev_id_by_name "$nb")
+            if [[ ! "$rdev" =~ ^[0-9]+$ ]]; then
+                nbshort="${nb%%.*}"; rdev=$(nb_dev_id_by_name "$nbshort")
+            fi
+            [[ ! "$rdev" =~ ^[0-9]+$ ]] && rdev=$(nb_dev_id_by_serial "$nb")
+            if [[ ! "$rdev" =~ ^[0-9]+$ ]]; then
+                log_info "  cable skip: neighbor '$nb' not a NetBox device"; continue
+            fi
+            lif=$(nb_add_interface "$ldev" "$lp" "other" "" "")
+            rifname="$rp"; [[ -z "$rifname" || "$rifname" == "null" ]] && rifname="to-$lname"
+            rif=$(nb_add_interface "$rdev" "$rifname" "other" "" "")
+            [[ ! "$lif" =~ ^[0-9]+$ || ! "$rif" =~ ^[0-9]+$ ]] && continue
+            keep="$keep $lif"
+            nb_reconcile_cable "$lif" "$rif" "$lname:$lp <-> $nb:$rifname" \
+                && { ccreated=$((ccreated+1)); log_info "  cable: $lname:$lp <-> $nb:$rifname"; }
+        done < <(jq -c '.lldp_links[]' <<<"$d")
+        nb_prune_lldp_cables "$ldev" "$keep"
+    done < <(jq -c '.devices[]' "$plan")
+    [[ "$ccreated" -gt 0 ]] && log_ok "LLDP cables created/replaced: $ccreated"
 
     while IFS= read -r v; do
         local vname vcl vrole status vcpus vmem vdisk vip vmac cid vm_id vif role_id
