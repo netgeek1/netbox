@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.32
+#  Version: 2.5.33
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.32"
+SCRIPT_VERSION="2.5.33"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -823,12 +823,28 @@ nb_upsert_device() {
 }
 
 nb_create_cable() {
-    local a_id="$1" b_id="$2" label="${3:-}" tag="${4:-}"
-    local tagj="[]"; [[ -n "$tag" ]] && tagj="[\"$tag\"]"
-    nb_post "dcim/cables/" \
-        "{\"a_terminations\":[{\"object_type\":\"dcim.interface\",\"object_id\":$a_id}],
-          \"b_terminations\":[{\"object_type\":\"dcim.interface\",\"object_id\":$b_id}],
-          \"status\":\"connected\",\"tags\":$tagj,\"label\":\"$label\"}" >/dev/null 2>&1 || true
+    local a_id="$1" b_id="$2" label="${3:-}"
+    # The 'lldp-auto:' label prefix is the version-proof marker for a tool-managed
+    # cable (a plain string field NetBox cannot reject). A tag is also attempted
+    # for NetBox-side filtering, but tag-write format varies by version, so if the
+    # tagged POST is rejected we retry WITHOUT the tag -- tagging must never block
+    # the cable from being created. Errors are surfaced, not swallowed.
+    local base resp id
+    base=$(jq -nc --argjson a "$a_id" --argjson b "$b_id" --arg lbl "$label" \
+        '{a_terminations:[{object_type:"dcim.interface",object_id:$a}],
+          b_terminations:[{object_type:"dcim.interface",object_id:$b}],
+          status:"connected", label:$lbl}')
+    resp=$(nb_post "dcim/cables/" "$(echo "$base" | jq -c '. + {tags:[{name:"lldp-auto"}]}')")
+    id=$(echo "$resp" | jq -r '.id // empty' 2>/dev/null)
+    if [[ -z "$id" ]]; then
+        resp=$(nb_post "dcim/cables/" "$base")            # retry untagged
+        id=$(echo "$resp" | jq -r '.id // empty' 2>/dev/null)
+    fi
+    if [[ -z "$id" ]]; then
+        log_warn "cable create failed (if $a_id <-> if $b_id): $(echo "$resp" | tr '\n' ' ' | head -c 240)"
+        return 1
+    fi
+    echo "$id"; return 0
 }
 
 # Idempotent tag creator (used to mark tool-managed LLDP cables).
@@ -858,19 +874,21 @@ nb_dev_id_by_serial() {
 # a stale link: a wrong lldp-auto cable on the local port is deleted + recreated.
 nb_reconcile_cable() {
     local lif="$1" rif="$2" label="${3:-}"
-    local ifo; ifo=$(nb_get "dcim/interfaces/${lif}/")
-    local cid; cid=$(echo "$ifo" | jq -r '(.cable.id // .cable) // empty' 2>/dev/null)
+    local ifo cid
+    ifo=$(nb_get "dcim/interfaces/${lif}/")
+    cid=$(echo "$ifo" | jq -r '(.cable.id // .cable) // empty' 2>/dev/null)
     if [[ -n "$cid" && "$cid" =~ ^[0-9]+$ ]]; then
-        local cab; cab=$(nb_get "dcim/cables/${cid}/")
-        local is_auto; is_auto=$(echo "$cab" | jq -r 'any(.tags[]?; .slug=="lldp-auto")' 2>/dev/null)
+        local cab is_auto hasr
+        cab=$(nb_get "dcim/cables/${cid}/")
+        is_auto=$(echo "$cab" | jq -r \
+            'any(.tags[]?; .slug=="lldp-auto" or .name=="lldp-auto") or (((.label) // "") | startswith("lldp-auto:"))' 2>/dev/null)
         [[ "$is_auto" != "true" ]] && return 1   # manual cable -- never disturb
-        local hasr; hasr=$(echo "$cab" | jq -r --argjson r "$rif" \
+        hasr=$(echo "$cab" | jq -r --argjson r "$rif" \
             'any((.a_terminations[]?,.b_terminations[]?); .object_id==$r)' 2>/dev/null)
         [[ "$hasr" == "true" ]] && return 1      # already correct
         nb_delete "dcim/cables/${cid}/" >/dev/null 2>&1   # changed -> replace
     fi
-    nb_create_cable "$lif" "$rif" "$label" "lldp-auto"
-    return 0
+    nb_create_cable "$lif" "$rif" "$label" >/dev/null   # propagates 0/1 success
 }
 
 # Remove lldp-auto cables on a device whose local interface is no longer in the
@@ -879,11 +897,14 @@ nb_reconcile_cable() {
 # auto-cable. Manual (untagged) cables are never enumerated here.
 nb_prune_lldp_cables() {
     local dev_id="$1" keep="$2"
-    local cabs; cabs=$(nb_get "dcim/cables/?tag=lldp-auto&device_id=${dev_id}")
+    local cabs; cabs=$(nb_get "dcim/cables/?device_id=${dev_id}")
     local n; n=$(echo "$cabs" | jq '.results | length' 2>/dev/null || echo 0)
     [[ ! "$n" =~ ^[0-9]+$ || "$n" -eq 0 ]] && return
-    local row cid lifids lid k stale
+    local row cid is_auto lifids lid k stale
     while IFS= read -r row; do
+        is_auto=$(echo "$row" | jq -r \
+            'any(.tags[]?; .slug=="lldp-auto" or .name=="lldp-auto") or (((.label) // "") | startswith("lldp-auto:"))' 2>/dev/null)
+        [[ "$is_auto" != "true" ]] && continue   # only prune tool-managed cables
         cid=$(jq -r '.id' <<<"$row")
         lifids=$(jq -r --argjson dev "$dev_id" \
             '[(.a_terminations[]?,.b_terminations[]?)
@@ -5963,7 +5984,7 @@ PLANEOF
             rif=$(nb_add_interface "$rdev" "$rifname" "other" "" "")
             [[ ! "$lif" =~ ^[0-9]+$ || ! "$rif" =~ ^[0-9]+$ ]] && continue
             keep="$keep $lif"
-            nb_reconcile_cable "$lif" "$rif" "$lname:$lp <-> $nb:$rifname" \
+            nb_reconcile_cable "$lif" "$rif" "lldp-auto: $lname:$lp <-> $nb:$rifname" \
                 && { ccreated=$((ccreated+1)); log_info "  cable: $lname:$lp <-> $nb:$rifname"; }
         done < <(jq -c '.lldp_links[]' <<<"$d")
         nb_prune_lldp_cables "$ldev" "$keep"
