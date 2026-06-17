@@ -1,3 +1,17 @@
+#  Changelog v2.5.29 (Map Switchports only tried 'public' / no SNMPv3):
+#   - map_switchports() took only the FIRST community (community=get_communities
+#     _for | head -1, usually 'public') and its inline snmpwalk was hardcoded to
+#     -v2c, so a switch on a non-default community or SNMPv3-only (e.g. the
+#     FortiGate / FortiSwitches) returned no interface/MAC data at all.
+#   - Fix: the full credential store is now passed to the walker -- ordered v2c
+#     communities (incl. per-IP override) plus v3 USM creds. It probes sysDescr
+#     with each (v2c first, then v3 authPriv/authNoPriv) and uses the first that
+#     answers for every walk; prints the chosen auth. The Cisco per-VLAN MAC
+#     trick now adapts to the working cred (v2c community@vid, or v3 'vlan-<id>'
+#     SNMP context). Mirrors the main scan's credential handling. Stub-tested:
+#     selects a non-first v2c community, falls through to v3, and exits cleanly
+#     when nothing authenticates.
+#
 #  Changelog v2.5.28 (plan crash: TypeError None < str when building clusters):
 #   - Option 9 aborted with "'<' not supported between instances of 'NoneType'
 #     and 'str'" at sorted(clusters). Cause: a VM whose owning Hyper-V host
