@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.28
+#  Version: 2.5.29
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.28"
+SCRIPT_VERSION="2.5.29"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2638,15 +2638,73 @@ PYEOF
 map_switchports() {
     local switch_ip="$1"
     log_step "Switchport Mapping: $switch_ip"
-    local community; community=$(get_communities_for "$switch_ip" | head -1)
-    python3 /dev/stdin "$switch_ip" "$community" \
+    local creds; creds=$(read_creds)
+    local communities; communities=$(get_communities_for "$switch_ip")
+    # Bundle ALL credentials (ordered v2c communities + v3 USM creds) so the
+    # walker can try each until one answers -- the old code took only the first
+    # community (usually 'public') and had no SNMPv3 support, so any switch on a
+    # non-default community or v3-only (e.g. the FortiGate) returned nothing.
+    local cred_json
+    cred_json=$(jq -n \
+        --argjson v2c "$(printf '%s\n' "$communities" | jq -R . | jq -s 'map(select(length>0))')" \
+        --argjson v3 "$(echo "$creds" | jq -c '.snmp_v3 // []')" \
+        '{v2c:$v2c, v3:$v3}' 2>/dev/null)
+    [[ -z "$cred_json" ]] && cred_json='{"v2c":["public"],"v3":[]}'
+    python3 /dev/stdin "$switch_ip" "$cred_json" \
             "$SNMP_TIMEOUT" "$DISCOVERY_DIR" <<'PYEOF'
 import subprocess, json, re, sys, os
-ip=sys.argv[1]; community=sys.argv[2]; timeout=sys.argv[3]; disc_dir=sys.argv[4]
-def walk(oid,comm=None):
-    c=comm or community
+ip=sys.argv[1]; cred_json=sys.argv[2]; timeout=sys.argv[3]; disc_dir=sys.argv[4]
+try:
+    CREDS=json.loads(cred_json)
+except Exception:
+    CREDS={'v2c':['public'],'v3':[]}
+
+def _norm_auth(a):
+    a=(a or 'SHA').upper().replace('SHA1','SHA').replace('SHA-1','SHA')
+    return a
+def _norm_priv(p):
+    p=(p or 'AES').upper()
+    return {'AES128':'AES','AES-128':'AES','AES256':'AES-256','AES192':'AES-192'}.get(p,p)
+
+def _v2c_args(c): return ['-v','2c','-c',c]
+def _v3_args(v):
+    a=['-v','3','-u',v.get('username','') or '']
+    apw=v.get('auth_pass') or ''; ppw=v.get('priv_pass') or ''
+    ap=_norm_auth(v.get('auth_proto')); pp=_norm_priv(v.get('priv_proto'))
+    if ppw and ppw!='null':
+        a+=['-l','authPriv','-a',ap,'-A',apw,'-x',pp,'-X',ppw]
+    elif apw and apw!='null':
+        a+=['-l','authNoPriv','-a',ap,'-A',apw]
+    else:
+        a+=['-l','noAuthNoPriv']
+    return a
+
+# Discover the working credential once, by reading sysDescr.0.
+CANDS=[_v2c_args(c) for c in (CREDS.get('v2c') or [])] \
+     + [_v3_args(v) for v in (CREDS.get('v3') or [])]
+def _probe(cred):
     try:
-        r=subprocess.run(['snmpwalk','-v2c','-c',c,'-t',timeout,'-r1',ip,oid],
+        r=subprocess.run(['snmpget',*cred,'-t',timeout,'-r','1',ip,'1.3.6.1.2.1.1.1.0'],
+                         capture_output=True,text=True,timeout=15)
+        out=r.stdout or ''
+        return ('= STRING:' in out) or ('= Hex-STRING:' in out)
+    except Exception:
+        return False
+SNMP_CRED=None
+for cand in CANDS:
+    if _probe(cand): SNMP_CRED=cand; break
+if SNMP_CRED is None:
+    print('  No working SNMP credential for {0} (tried {1} v2c + {2} v3)'.format(
+        ip, len(CREDS.get('v2c') or []), len(CREDS.get('v3') or [])))
+    sys.exit(0)
+_lbl = ('v2c '+SNMP_CRED[SNMP_CRED.index('-c')+1]) if '-c' in SNMP_CRED \
+       else ('v3 '+SNMP_CRED[SNMP_CRED.index('-u')+1])
+print('  SNMP auth: {0}'.format(_lbl))
+
+def walk(oid,cred=None):
+    c=cred or SNMP_CRED
+    try:
+        r=subprocess.run(['snmpwalk',*c,'-t',timeout,'-r','1',ip,oid],
                          capture_output=True,text=True,timeout=30)
         return r.stdout
     except: return ''
@@ -2701,9 +2759,15 @@ for line in walk('1.3.6.1.2.1.17.4.3.1.2').split('\n'):
 
 if not mac_to_port and vlan_names:
     print('  Standard bridge MIB: 0 MACs -- trying Cisco per-VLAN communities...')
+    def _vlan_cred(vid):
+        c=SNMP_CRED[:]
+        if '-c' in c:
+            ci=c.index('-c'); c[ci+1]='{0}@{1}'.format(c[ci+1],vid)
+        else:
+            c=c+['-n','vlan-{0}'.format(vid)]
+        return c
     for vid in list(vlan_names.keys())[:10]:
-        vlan_comm='{0}@{1}'.format(community,vid)
-        for line in walk('1.3.6.1.2.1.17.4.3.1.2',comm=vlan_comm).split('\n'):
+        for line in walk('1.3.6.1.2.1.17.4.3.1.2',cred=_vlan_cred(vid)).split('\n'):
             m=re.match(r'.*17\.4\.3\.1\.2\.(\d+\.\d+\.\d+\.\d+\.\d+\.\d+)\s*=\s*INTEGER:\s*(\d+)',line)
             if m:
                 mac=':'.join('{:02x}'.format(int(o)) for o in m.group(1).split('.'))
