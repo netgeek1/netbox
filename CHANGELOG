@@ -1,3 +1,25 @@
+#  Changelog v2.5.33 (cabling reported success but created nothing):
+#   - First live run logged 'LLDP cables created/replaced: 15' but NetBox got
+#     zero cables. Cause: nb_create_cable ended in '>/dev/null 2>&1 || true', so
+#     a rejected POST was silently treated as success. The rejection itself was
+#     almost certainly the tag-write form (tags:["lldp-auto"]) -- the one part
+#     that had never run against a live NetBox.
+#   - Fixes:
+#       * Tool-managed cables are now marked by a version-proof 'lldp-auto:'
+#         LABEL prefix (a plain string NetBox cannot reject). The tag is still
+#         attempted for UI filtering, but if the tagged POST fails we retry
+#         WITHOUT the tag -- tagging never blocks cable creation again.
+#       * nb_create_cable now captures the response, returns real success/failure
+#         (the cable id), and log_warns the actual NetBox error instead of hiding
+#         it. The 'created/replaced' count and per-cable log line now reflect
+#         what truly landed.
+#       * reconcile + prune detect a tool cable by tag OR label prefix, so
+#         management survives whether or not tagging took. Manual cables (no
+#         marker) are still never touched.
+#   - Validated: payload JSON, and detection across tag-only / label-only /
+#     manual. Re-run option 9: cables should now appear (carrying the lldp-auto:
+#     label), and a second run should report 0 created (idempotent).
+#
 #  Changelog v2.5.32 (LLDP cabling INTO NetBox via option 9 -- tagged reconcile):
 #   - The single writer now syncs switch cabling, closing the loop: the goal was
 #     correct cabling IN NetBox, not just a switchport_*.json dump. Previously
