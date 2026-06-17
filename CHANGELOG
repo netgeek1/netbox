@@ -1,3 +1,27 @@
+#  Changelog v2.5.32 (LLDP cabling INTO NetBox via option 9 -- tagged reconcile):
+#   - The single writer now syncs switch cabling, closing the loop: the goal was
+#     correct cabling IN NetBox, not just a switchport_*.json dump. Previously
+#     only the legacy raw sync made cables, using the 'local port unknown ->
+#     uplink-<neighbor>' placeholder (the wrong-cable bug); option 9 made none.
+#   - Plan generator emits per-device lldp_links {local_port, neighbor,
+#     remote_port} from the scan's lldp_neighbors (which now carry the real
+#     local port), dropping self-referential entries. --dry-run lists every
+#     cable it would touch. Validated against the live capture: 10 links,
+#     reciprocal FortiSwitch trunk kept, local ports real (port1/g8), no uplink-X.
+#   - Writer pass 2 (after all devices exist, so neighbors resolve): for each
+#     link it ensures the REAL local + remote interfaces, resolves the neighbor
+#     device (exact name -> domain-stripped -> serial; unmanaged neighbors are
+#     skipped), and RECONCILES a cable tagged 'lldp-auto':
+#       * missing -> create   * correct -> leave   * moved -> delete+recreate
+#       * port dropped from LLDP -> prune   * manual (untagged) cable -> never touch
+#     This answers the cable-change question: a moved cable self-corrects instead
+#     of leaving a stale link, and hand-made cables are safe. Reciprocal links
+#     collapse to one cable (second pass finds it already correct).
+#   - Decision logic unit-tested (create/leave/replace/skip/prune). NOTE: the
+#     NetBox tag-write form (tags:["lldp-auto"]) and cable-termination JSON
+#     shape are exercised live for the first time -- run option 9 --dry-run, then
+#     a real sync, and confirm the lldp-auto cables land on the right ports.
+#
 #  Changelog v2.5.31 (drop self-referential LLDP links):
 #   - The LLDP overlay now skips any neighbor whose name equals the switch's own
 #     hostname/serial -- a stack/aggregate interface reporting the switch itself,
