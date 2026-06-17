@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.30
+#  Version: 2.5.31
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.30"
+SCRIPT_VERSION="2.5.31"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2831,10 +2831,20 @@ try:
         for h in hosts:
             if h.get('ip')==ip: match=h; break
         if not match: continue
+        # This switch's own identity, to drop self-referential LLDP entries
+        # (a stack/aggregate interface that reports the switch itself as the
+        # neighbor). Real switch-to-switch links -- even where the local port is
+        # named after the PEER's serial -- have neighbor != own id and are kept.
+        self_ids={str(match.get('hostname') or '').strip().lower(),
+                  str(match.get('serial') or '').strip().lower()}
+        self_ids.discard('')
         for n in (match.get('lldp_neighbors') or []):
+            nb=(n.get('sys_name') or '').strip()
+            if nb and nb.lower() in self_ids:
+                continue  # self-referential -- not a cable
             li=str(n.get('local_if_index') or '').strip()
             lp=str(n.get('local_port') or '').strip()
-            rec={'neighbor':n.get('sys_name') or '','remote_port':n.get('port_id') or ''}
+            rec={'neighbor':nb,'remote_port':n.get('port_id') or ''}
             if not rec['neighbor'] and not rec['remote_port']: continue
             if li: lldp_by_idx.setdefault(li,rec)
             if lp: lldp_by_name.setdefault(lp.lower(),rec)
