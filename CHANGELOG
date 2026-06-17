@@ -1,3 +1,23 @@
+#  Changelog v2.5.30 (switchport cabling: use LLDP, keep the local port):
+#   - Diagnosed from real captures: Map Switchports derived links from the FDB
+#     (bridge MAC table) + the switch's OWN ARP. That is right for endpoint
+#     ports but wrong for uplinks/trunks (a trunk learns every MAC behind it),
+#     and remote_ips was always empty because an L2 switch has no ARP table.
+#     Meanwhile LLDP -- which states the neighbor and local port directly -- was
+#     being captured by the scan but the parser DROPPED the local side, so every
+#     switch-to-switch link was unanchored ('local=?').
+#   - Parser fix: lldp_neighbors (and cdp) now keep local_port + local_if_index
+#     from the probe's 'Origin Interface' / 'Local Interface Index', not just the
+#     remote sys_name/port. Verified on real gear: FortiSwitch port1->office-sw,
+#     Netgear g8->FortiSwitch:port2 (the uplink the FDB got wrong), etc.
+#   - map_switchports overlay: after the FDB walk it pulls LLDP for the switch
+#     from the most recent results_*.json and attaches each link to its local
+#     port (match local_if_index->ifIndex, else local_port->ifName). Output gains
+#     per-port lldp_neighbor / lldp_remote_port + a 'LLDP Neighbor' column and a
+#     lldp_source field; falls back silently to FDB-only if no capture exists.
+#   - NOTE: requires a fresh scan on 2.5.30+ first (older results_*.json lack the
+#     local port), THEN option 4, so the overlay has anchored LLDP to consume.
+# 
 #  Changelog v2.5.29 (Map Switchports only tried 'public' / no SNMPv3):
 #   - map_switchports() took only the FIRST community (community=get_communities
 #     _for | head -1, usually 'public') and its inline snmpwalk was hardcoded to
