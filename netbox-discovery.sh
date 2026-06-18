@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.36
+#  Version: 2.5.37
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.36"
+SCRIPT_VERSION="2.5.37"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -5960,6 +5960,16 @@ PLANEOF
             "$serial" "" "$pip_bare" 2>>"$LOG_FILE")
         if [[ -z "$dev_id" || ! "$dev_id" =~ ^[0-9]+$ ]]; then
             log_warn "device upsert failed: $name"; continue
+        fi
+        # Link the host Device to its Cluster -- nb_upsert_device doesn't set the
+        # device.cluster FK, so a Hyper-V host otherwise shows no cluster. The
+        # cluster name (== the host's own hostname) was created in CLU above.
+        local dcluster dcid
+        dcluster=$(jq -r '.cluster // ""' <<<"$d")
+        if [[ -n "$dcluster" && "$dcluster" != "null" ]]; then
+            dcid="${CLU[$dcluster]:-}"
+            [[ "$dcid" =~ ^[0-9]+$ ]] && \
+                nb_patch "dcim/devices/$dev_id/" "{\"cluster\":$dcid}" >/dev/null 2>&1 || true
         fi
         # Named interfaces (with MACs) from the SNMP ifTable / WinRM NICs.
         local ifc ifn ifm
