@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.33
+#  Version: 2.5.34
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.33"
+SCRIPT_VERSION="2.5.34"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -874,21 +874,29 @@ nb_dev_id_by_serial() {
 # a stale link: a wrong lldp-auto cable on the local port is deleted + recreated.
 nb_reconcile_cable() {
     local lif="$1" rif="$2" label="${3:-}"
-    local ifo cid
-    ifo=$(nb_get "dcim/interfaces/${lif}/")
-    cid=$(echo "$ifo" | jq -r '(.cable.id // .cable) // empty' 2>/dev/null)
-    if [[ -n "$cid" && "$cid" =~ ^[0-9]+$ ]]; then
-        local cab is_auto hasr
-        cab=$(nb_get "dcim/cables/${cid}/")
+    # Inspect BOTH endpoints. If either already carries the exact lif<->rif cable
+    # -> no-op. An lldp-auto cable on either end that does NOT join exactly these
+    # two ports is stale (a moved/renamed link, e.g. the old neighbor-abbreviated
+    # interface from a prior run) and is removed so the correct cable can form.
+    # A manual cable on an endpoint is respected -- we skip rather than steal it.
+    local end cab_id cab is_auto joins
+    for end in "$lif" "$rif"; do
+        cab_id=$(nb_get "dcim/interfaces/${end}/" | jq -r '(.cable.id // .cable) // empty' 2>/dev/null)
+        [[ -z "$cab_id" || ! "$cab_id" =~ ^[0-9]+$ ]] && continue
+        cab=$(nb_get "dcim/cables/${cab_id}/")
+        joins=$(echo "$cab" | jq -r --argjson a "$lif" --argjson b "$rif" \
+            '([(.a_terminations[]?,.b_terminations[]?).object_id]|sort)==([$a,$b]|sort)' 2>/dev/null)
+        [[ "$joins" == "true" ]] && return 1   # already exactly correct
         is_auto=$(echo "$cab" | jq -r \
-            'any(.tags[]?; .slug=="lldp-auto" or .name=="lldp-auto") or (((.label) // "") | startswith("lldp-auto:"))' 2>/dev/null)
-        [[ "$is_auto" != "true" ]] && return 1   # manual cable -- never disturb
-        hasr=$(echo "$cab" | jq -r --argjson r "$rif" \
-            'any((.a_terminations[]?,.b_terminations[]?); .object_id==$r)' 2>/dev/null)
-        [[ "$hasr" == "true" ]] && return 1      # already correct
-        nb_delete "dcim/cables/${cid}/" >/dev/null 2>&1   # changed -> replace
-    fi
-    nb_create_cable "$lif" "$rif" "$label" >/dev/null   # propagates 0/1 success
+            'any(.tags[]?; .slug=="lldp-auto" or .name=="lldp-auto") or (((.label)//"")|startswith("lldp-auto:"))' 2>/dev/null)
+        if [[ "$is_auto" == "true" ]]; then
+            nb_delete "dcim/cables/${cab_id}/" >/dev/null 2>&1   # stale auto-cable
+        else
+            log_info "  cable skip: endpoint busy with manual cable (if $lif/$rif)"
+            return 1
+        fi
+    done
+    nb_create_cable "$lif" "$rif" "$label"
 }
 
 # Remove lldp-auto cables on a device whose local interface is no longer in the
@@ -5773,8 +5781,65 @@ def build(reconciled):
                 'no_ip_flag': bool(h.get('vm_no_ip_flag')),
             })
 
+    # ---- Canonical cable list (dedupe reciprocal links) --------------------
+    # Each physical link is advertised from BOTH ends, and each end names the
+    # other's port differently (S224EP calls office-sw's port "1"; office-sw
+    # calls its own port "Port  1"). Building cables per-device therefore tried
+    # to create two cables to one termination -- the second failed and left the
+    # neighbor-abbreviated interface behind. Here we pair the two halves and emit
+    # ONE cable per link, each end under its OWN local port name.
+    def _n(s): return (s or '').strip().lower()
+    name_idx = {}
+    for d in devices:
+        nm = d['name']; sr = d.get('serial')
+        if nm:
+            name_idx[_n(nm)] = nm
+            name_idx[_n(nm).split('.')[0]] = nm
+        if sr:
+            name_idx[_n(sr)] = nm
+    def _resolve(neigh):
+        k = _n(neigh)
+        return name_idx.get(k) or name_idx.get(k.split('.')[0])
+
+    pair = {}
+    for d in devices:
+        a = d['name']
+        for l in d.get('lldp_links', []):
+            b = _resolve(l['neighbor'])
+            if not b or b == a:
+                continue
+            pair.setdefault(frozenset((a, b)), {}).setdefault(a, []).append(
+                (l['local_port'], l.get('remote_port') or ''))
+
+    cables = []
+    seen = set()
+    for key, sides in pair.items():
+        devs = list(key)
+        if len(devs) != 2:
+            continue
+        A, B = devs
+        la, lb = sides.get(A, []), sides.get(B, [])
+        if len(la) == 1 and len(lb) == 1:
+            # both ends reported exactly once -> use each device's own port name
+            ap, bp = la[0][0], lb[0][0]
+            ck = frozenset(((A, ap), (B, bp)))
+            if ck not in seen:
+                seen.add(ck)
+                cables.append({'a_dev': A, 'a_port': ap, 'b_dev': B, 'b_port': bp})
+        else:
+            # only one end reported, or a multi-link bundle: best effort using
+            # the reporter's local port and its view of the remote port
+            for sd, links in sides.items():
+                od = B if sd == A else A
+                for lp, rp in links:
+                    bp = rp or ('to-' + sd)
+                    ck = frozenset(((sd, lp), (od, bp)))
+                    if ck not in seen:
+                        seen.add(ck)
+                        cables.append({'a_dev': sd, 'a_port': lp, 'b_dev': od, 'b_port': bp})
+
     return {'site': site, 'clusters': sorted(c for c in clusters if c), 'devices': devices,
-            'vms': vms, 'max_disks': max_disks}
+            'vms': vms, 'max_disks': max_disks, 'cables': cables}
 
 
 def dry_run(plan):
@@ -5806,14 +5871,14 @@ def dry_run(plan):
             v['name'][:26], (v['cluster'] or '')[:12], (v.get('role') or '')[:10],
             v['status'], v['vcpus'], v['memory_mb'], v['disk_gb'], ipf))
     out.append('')
-    _links = [(d['name'], l) for d in plan['devices'] for l in d.get('lldp_links', [])]
-    out.append('LLDP CABLES (%d, tag lldp-auto -- created/replaced/pruned on sync):' % len(_links))
-    for dn, l in _links:
-        out.append('  %-22s %-12s <-> %-22s %s' % (
-            dn[:22], l['local_port'][:12], l['neighbor'][:22], l.get('remote_port', '')))
+    _cables = plan.get('cables', [])
+    out.append('LLDP CABLES (%d, marker lldp-auto -- created/replaced/pruned on sync):' % len(_cables))
+    for c in _cables:
+        out.append('  %-22s %-14s <-> %-22s %s' % (
+            c['a_dev'][:22], c['a_port'][:14], c['b_dev'][:22], c['b_port']))
     out.append('')
     out.append('TOT:  %d devices, %d VMs, %d clusters, %d cables' % (
-        len(plan['devices']), len(plan['vms']), len(plan['clusters']), len(_links)))
+        len(plan['devices']), len(plan['vms']), len(plan['clusters']), len(_cables)))
     return '\n'.join(out)
 
 
@@ -5949,46 +6014,42 @@ PLANEOF
     done < <(jq -c '.devices[]' "$plan")
 
     # ---- LLDP cabling (tagged-reconcile) ------------------------------------
-    # Runs AFTER all devices exist so a neighbor resolves to a real device.
-    # Only cables tagged 'lldp-auto' are ever created, replaced, or removed;
-    # manual cables are untouched. Reciprocal links (each end advertises the
-    # same trunk) collapse to one cable: the second pass finds it already
-    # correct and no-ops.
+    # Runs AFTER all devices exist so both endpoints resolve. Consumes the
+    # plan's canonical (deduplicated) cable list: one entry per physical link,
+    # each end already under its OWN local port name -- so no reciprocal
+    # conflict. Only lldp-auto-marked cables are created/replaced/pruned; manual
+    # cables are untouched.
     nb_ensure_tag "lldp-auto" "lldp-auto"
     local ccreated=0
-    while IFS= read -r d; do
-        local nlinks; nlinks=$(jq '.lldp_links | length' <<<"$d" 2>/dev/null || echo 0)
-        [[ ! "$nlinks" =~ ^[0-9]+$ || "$nlinks" -eq 0 ]] && continue
-        local lname ldev
-        lname=$(jq -r '.name' <<<"$d")
-        ldev=$(nb_dev_id_by_name "$lname")
-        [[ ! "$ldev" =~ ^[0-9]+$ ]] && continue
-        local keep="" lk
-        while IFS= read -r lk; do
-            local lp nb rp rdev nbshort lif rif rifname
-            lp=$(jq -r '.local_port' <<<"$lk")
-            nb=$(jq -r '.neighbor' <<<"$lk")
-            rp=$(jq -r '.remote_port // ""' <<<"$lk")
-            [[ -z "$lp" || -z "$nb" ]] && continue
-            # resolve neighbor device: exact name -> domain-stripped -> serial
-            rdev=$(nb_dev_id_by_name "$nb")
-            if [[ ! "$rdev" =~ ^[0-9]+$ ]]; then
-                nbshort="${nb%%.*}"; rdev=$(nb_dev_id_by_name "$nbshort")
-            fi
-            [[ ! "$rdev" =~ ^[0-9]+$ ]] && rdev=$(nb_dev_id_by_serial "$nb")
-            if [[ ! "$rdev" =~ ^[0-9]+$ ]]; then
-                log_info "  cable skip: neighbor '$nb' not a NetBox device"; continue
-            fi
-            lif=$(nb_add_interface "$ldev" "$lp" "other" "" "")
-            rifname="$rp"; [[ -z "$rifname" || "$rifname" == "null" ]] && rifname="to-$lname"
-            rif=$(nb_add_interface "$rdev" "$rifname" "other" "" "")
-            [[ ! "$lif" =~ ^[0-9]+$ || ! "$rif" =~ ^[0-9]+$ ]] && continue
-            keep="$keep $lif"
-            nb_reconcile_cable "$lif" "$rif" "lldp-auto: $lname:$lp <-> $nb:$rifname" \
-                && { ccreated=$((ccreated+1)); log_info "  cable: $lname:$lp <-> $nb:$rifname"; }
-        done < <(jq -c '.lldp_links[]' <<<"$d")
-        nb_prune_lldp_cables "$ldev" "$keep"
-    done < <(jq -c '.devices[]' "$plan")
+    declare -A CABLE_KEEP=()
+    local c a_dev b_dev a_port b_port adev_id bdev_id aif bif
+    while IFS= read -r c; do
+        a_dev=$(jq -r '.a_dev'  <<<"$c"); b_dev=$(jq -r '.b_dev'  <<<"$c")
+        a_port=$(jq -r '.a_port' <<<"$c"); b_port=$(jq -r '.b_port' <<<"$c")
+        [[ -z "$a_dev" || -z "$b_dev" || -z "$a_port" || -z "$b_port" ]] && continue
+        # resolve both devices: exact name -> domain-stripped -> serial
+        adev_id=$(nb_dev_id_by_name "$a_dev"); [[ ! "$adev_id" =~ ^[0-9]+$ ]] && adev_id=$(nb_dev_id_by_name "${a_dev%%.*}")
+        [[ ! "$adev_id" =~ ^[0-9]+$ ]] && adev_id=$(nb_dev_id_by_serial "$a_dev")
+        bdev_id=$(nb_dev_id_by_name "$b_dev"); [[ ! "$bdev_id" =~ ^[0-9]+$ ]] && bdev_id=$(nb_dev_id_by_name "${b_dev%%.*}")
+        [[ ! "$bdev_id" =~ ^[0-9]+$ ]] && bdev_id=$(nb_dev_id_by_serial "$b_dev")
+        if [[ ! "$adev_id" =~ ^[0-9]+$ || ! "$bdev_id" =~ ^[0-9]+$ ]]; then
+            log_info "  cable skip: $a_dev <-> $b_dev (device not in NetBox)"; continue
+        fi
+        aif=$(nb_add_interface "$adev_id" "$a_port" "other" "" "")
+        bif=$(nb_add_interface "$bdev_id" "$b_port" "other" "" "")
+        [[ ! "$aif" =~ ^[0-9]+$ || ! "$bif" =~ ^[0-9]+$ ]] && continue
+        CABLE_KEEP[$adev_id]="${CABLE_KEEP[$adev_id]:-} $aif"
+        CABLE_KEEP[$bdev_id]="${CABLE_KEEP[$bdev_id]:-} $bif"
+        nb_reconcile_cable "$aif" "$bif" "lldp-auto: $a_dev:$a_port <-> $b_dev:$b_port" \
+            && { ccreated=$((ccreated+1)); log_info "  cable: $a_dev:$a_port <-> $b_dev:$b_port"; }
+    done < <(jq -c '.cables[]?' "$plan")
+    # prune stale lldp-auto cables on every device we touched
+    local kdev
+    if [[ ${#CABLE_KEEP[@]} -gt 0 ]]; then
+        for kdev in "${!CABLE_KEEP[@]}"; do
+            nb_prune_lldp_cables "$kdev" "${CABLE_KEEP[$kdev]}"
+        done
+    fi
     [[ "$ccreated" -gt 0 ]] && log_ok "LLDP cables created/replaced: $ccreated"
 
     while IFS= read -r v; do
