@@ -1,3 +1,15 @@
+#  Changelog v2.5.39 (discovered ports/protocols on VMs):
+#   - VMs now get the same 'discovered_ports' custom field as devices (e.g.
+#     '53/dns, 80/http, 443/https'), built in the plan from the folded host's
+#     open ports and set on the VM after upsert. Filterable, consistent with
+#     devices -- not buried in comments.
+#   - nb_ensure_custom_field now accepts multiple comma-separated object_types
+#     and, for a multi-type field, sets the full requested set on the existing
+#     field -- so 'discovered_ports' (originally device-only) is extended to
+#     virtualization.virtualmachine without a manual migration.
+#   - Completes the three option-7 follow-ups (cluster-on-device 2.5.37, MACs
+#     2.5.38, VM ports 2.5.39). Validated: VM plan dict carries discovered_ports;
+#     object_types set spans device+VM.
 #
 #  Changelog v2.5.38 (MACs on interfaces -- rebuilt for the NetBox 4.x model):
 #   - Interface MACs weren't landing because nb_add_interface/nb_add_vm_interface
