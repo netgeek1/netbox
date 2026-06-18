@@ -1,3 +1,19 @@
+#  Changelog v2.5.35 (FortiLink ISL cabled to aggregate names, not the port):
+#   - The link between the two FortiSwitches (169.254.1.2 S224EP <-> 169.254.1.3
+#     S124FN) landed on each switch's FortiLink TRUNK interface -- which FortiOS
+#     names after the PEER's serial (4FNTF23000240-0 / 4EPTF19005531-0) -- so the
+#     cable looked backwards/wrong. But each switch reports the OTHER end as the
+#     real physical port (both say port23).
+#   - Fix: when pairing the two halves of a link, a side's own local port is used
+#     only if it is a real physical port; a serial-derived aggregate/trunk name
+#     (detected by a long embedded digit run) is replaced with the physical port
+#     the peer reports for that end. Result: S224EP:port23 <-> S124FN:port23.
+#     Normal links (office-sw:Port  1 <-> S224EP:port1) are unaffected. Validated
+#     against both FortiSwitches' real LLDP.
+#   - On the next 1->9, the prune step removes the old aggregate-named cable
+#     (its interface is no longer in the kept set) and creates the port23 one.
+#     The now-empty 4FNTF.../4EPTF... interfaces remain as cosmetic orphans.
+#
 #  Changelog v2.5.34 (cabling: reciprocal links collided -> wrong/uplink ports):
 #   - Symptom: after 2.5.33, cables on the switch processed FIRST (169.254.1.2)
 #     looked right, but the others showed neighbor-abbreviated/'uplink' ports.
