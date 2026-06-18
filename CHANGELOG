@@ -1,3 +1,28 @@
+#  Changelog v2.5.34 (cabling: reciprocal links collided -> wrong/uplink ports):
+#   - Symptom: after 2.5.33, cables on the switch processed FIRST (169.254.1.2)
+#     looked right, but the others showed neighbor-abbreviated/'uplink' ports.
+#     Cause: each physical link is advertised from BOTH ends with DIFFERENT port
+#     names (S224EP:port1 vs office-sw:'Port  1'; S224EP calls office-sw's port
+#     '1'). The per-device pass created the first end's cable, then the second
+#     end's POST hit an already-occupied termination and failed, leaving the
+#     interface named by the neighbor's abbreviation.
+#   - Fix: cables are now generated GLOBALLY and deduplicated. The plan emits a
+#     top-level 'cables' list: the two halves of each link are paired (by device,
+#     with reciprocal correlation) and emitted ONCE, each end under its OWN local
+#     port name. One-sided links (neighbor not scanned this run) fall back to the
+#     reported remote port; unmanaged neighbors are skipped.
+#   - Writer consumes plan.cables (after all devices exist), reconciling one
+#     cable per link and pruning per touched device. nb_reconcile_cable now
+#     inspects BOTH endpoints: exact match -> no-op; a stale lldp-auto cable on
+#     either end (e.g. the bad 2.5.33 'office-sw:1') is removed so the correct
+#     cable forms; a manual cable is respected (skip). This self-heals the
+#     earlier wrong cables on the next sync. Validated: dedup on the real multi-
+#     switch capture (5 clean cables, each end its own port), and reconcile
+#     decisions (no-op / replace / skip-manual).
+#   - NOTE: empty interfaces left by the 2.5.33 run (e.g. office-sw:'1') remain
+#     as cosmetic orphans; the cable moves to the correct port. Delete the empty
+#     ones by hand if desired.
+#
 #  Changelog v2.5.33 (cabling reported success but created nothing):
 #   - First live run logged 'LLDP cables created/replaced: 15' but NetBox got
 #     zero cables. Cause: nb_create_cable ended in '>/dev/null 2>&1 || true', so
