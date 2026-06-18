@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.37
+#  Version: 2.5.38
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.37"
+SCRIPT_VERSION="2.5.38"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -680,6 +680,37 @@ nb_add_ip() {
     echo "$ip_id"
 }
 
+# NetBox 4.x MAC model: MACs are first-class /dcim/mac-addresses/ objects bound
+# to an interface (the legacy interface.mac_address field was removed in 4.2, so
+# on 4.6 it is silently dropped). This creates the MAC object for the given
+# interface (idempotent: reuses one already on that interface) and sets it as the
+# interface's primary_mac_address. Handles both device and VM interfaces. All
+# output is captured/redirected and warnings go to stderr, so it is safe to call
+# inside nb_add_interface's command substitution.
+nb_ensure_mac_address() {
+    local obj_type="$1" obj_id="$2" mac="$3"
+    [[ -z "$mac" || "$mac" == "null" || ! "$obj_id" =~ ^[0-9]+$ ]] && return 0
+    mac=$(echo "$mac" | tr 'A-F' 'a-f')
+    local enc; enc=$(nb_urlencode "$mac")
+    local existing mid
+    existing=$(nb_get "dcim/mac-addresses/?mac_address=${enc}")
+    mid=$(echo "$existing" | jq -r --argjson i "$obj_id" --arg t "$obj_type" \
+        '[.results[] | select(.assigned_object_id==$i and .assigned_object_type==$t)][0].id // empty' 2>/dev/null)
+    if [[ -z "$mid" ]]; then
+        local res
+        res=$(nb_post "dcim/mac-addresses/" "$(jq -n --arg m "$mac" --arg t "$obj_type" --argjson i "$obj_id" \
+            '{mac_address:$m,assigned_object_type:$t,assigned_object_id:$i}')")
+        mid=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
+        if [[ -z "$mid" ]]; then
+            log_warn "mac create failed ($mac on $obj_type $obj_id): $(echo "$res" | tr '\n' ' ' | head -c 160)"
+            return 1
+        fi
+    fi
+    local ep="dcim/interfaces"
+    [[ "$obj_type" == "virtualization.vminterface" ]] && ep="virtualization/interfaces"
+    nb_patch "${ep}/${obj_id}/" "{\"primary_mac_address\":$mid}" >/dev/null 2>&1 || true
+}
+
 nb_add_interface() {
     local device_id="$1" if_name="$2" if_type="${3:-other}" \
           mac="${4:-}" desc="${5:-}"
@@ -693,13 +724,13 @@ nb_add_interface() {
             --argjson dev  "$device_id" \
             --arg     name "$if_name" \
             --arg     type "$if_type" \
-            --arg     mac  "$mac" \
             --arg     desc "$desc" \
-            '{device:$dev,name:$name,type:$type,description:$desc,
-              mac_address:(if $mac!="" and $mac!="null" then $mac else null end)}')
+            '{device:$dev,name:$name,type:$type,description:$desc}')
         local res; res=$(nb_post "dcim/interfaces/" "$payload")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
     fi
+    [[ -n "$id" && -n "$mac" && "$mac" != "null" ]] && \
+        nb_ensure_mac_address "dcim.interface" "$id" "$mac"
     echo "$id"
 }
 
@@ -1047,13 +1078,13 @@ nb_add_vm_interface() {
         payload=$(jq -n \
             --argjson vm  "$vm_id" \
             --arg     name "$if_name" \
-            --arg     mac  "$mac" \
             --arg     desc "$desc" \
-            '{virtual_machine:$vm,name:$name,description:$desc,
-              mac_address:(if $mac!="" and $mac!="null" then $mac else null end)}')
+            '{virtual_machine:$vm,name:$name,description:$desc}')
         local res; res=$(nb_post "virtualization/interfaces/" "$payload")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
     fi
+    [[ -n "$id" && -n "$mac" && "$mac" != "null" ]] && \
+        nb_ensure_mac_address "virtualization.vminterface" "$id" "$mac"
     echo "$id"
 }
 
@@ -5621,6 +5652,18 @@ def device_custom_fields(hw, os_str):
 def build(reconciled):
     hosts = reconciled['hosts']
 
+    # Global IP->MAC map from every host's ARP/neighbor tables (the router and
+    # firewall ARP tables resolve almost every host) plus any interface-bound
+    # MACs. Used to stamp the MAC onto each IP-bearing interface, since NetBox
+    # 4.x keeps MACs on interfaces, not on IPs.
+    ip2mac = {}
+    for h in hosts:
+        for key in ('arp_table', 'neighbor_table'):
+            for e in (h.get(key) or []):
+                i, m = e.get('ip'), e.get('mac')
+                if i and m:
+                    ip2mac.setdefault(i, m)
+
     # Inventory index: (cluster-or-host-key, vm_name) -> hardware detail.
     inv = {}
     for h in hosts:
@@ -5699,7 +5742,8 @@ def build(reconciled):
                 ip_assignments.append({
                     'ifname': nm,
                     'ip': '%s/%d' % (eip, mask_to_prefix(e.get('mask'))),
-                    'is_primary': (eip == ip)})
+                    'is_primary': (eip == ip),
+                    'mac': ip2mac.get(eip) or ''})
             dcf, ndisks = device_custom_fields(hw, (h.get('os') or '').strip())
             if ndisks > max_disks:
                 max_disks = ndisks
@@ -5983,11 +6027,11 @@ PLANEOF
         # mgmt0 interface holding the primary + folded secondary IPs.
         local nass; nass=$(jq '.ip_assignments | length' <<<"$d" 2>/dev/null || echo 0)
         if [[ "$nass" =~ ^[0-9]+$ && "$nass" -gt 0 ]]; then
-            local asg aif aip aprim aifid primset=0
+            local asg aif aip aprim aifid amac primset=0
             while IFS= read -r asg; do
                 aif=$(jq -r '.ifname' <<<"$asg"); aip=$(jq -r '.ip' <<<"$asg")
-                aprim=$(jq -r '.is_primary' <<<"$asg")
-                aifid=$(nb_add_interface "$dev_id" "$aif" "other" "" "" 2>>"$LOG_FILE")
+                aprim=$(jq -r '.is_primary' <<<"$asg"); amac=$(jq -r '.mac // ""' <<<"$asg")
+                aifid=$(nb_add_interface "$dev_id" "$aif" "other" "$amac" "" 2>>"$LOG_FILE")
                 [[ ! "$aifid" =~ ^[0-9]+$ ]] && continue
                 if [[ "$aprim" == "true" ]]; then
                     nb_add_ip "$aip" "$dev_id" "$aifid" >/dev/null 2>&1 || true
