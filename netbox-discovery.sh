@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.38
+#  Version: 2.5.39
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.38"
+SCRIPT_VERSION="2.5.39"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -959,37 +959,39 @@ nb_prune_lldp_cables() {
 # Idempotent custom field creator -- only POSTs if field does not yet exist
 nb_ensure_custom_field() {
     local name="$1" label="$2" type="${3:-text}" obj_types="${4:-dcim.device}"
+    local otj; otj=$(printf '%s' "$obj_types" | jq -R 'split(",")')
     local enc; enc=$(nb_urlencode "$name")
     local res; res=$(nb_get "extras/custom-fields/?name=${enc}")
     local id; id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
     if [[ -z "$id" ]]; then
         nb_post "extras/custom-fields/" \
-            "$(jq -n --arg n "$name" --arg l "$label" --arg t "$type" \
-                --argjson ot "[\"$obj_types\"]" \
+            "$(jq -nc --arg n "$name" --arg l "$label" --arg t "$type" --argjson ot "$otj" \
                 '{name:$n,label:$l,type:$t,object_types:$ot}')" \
             >/dev/null 2>&1 || true
-    else
-        # Reconcile the type of a pre-existing field. An earlier build created
-        # some fields with the wrong type (e.g. memory_gb as 'text'); since this
-        # was get-or-create, the wrong type persisted. Sending an integer to a
-        # text field 400s the ENTIRE custom_fields PATCH, silently dropping every
-        # device field. Upgrade the type to match (best-effort; harmless if the
-        # field has no incompatible existing values, which is our case).
-        local cur; cur=$(echo "$res" \
-            | jq -r '(.results[0].type|objects|.value) // (.results[0].type|strings) // empty' 2>/dev/null)
-        if [[ -n "$cur" && "$cur" != "$type" ]]; then
-            # A PATCH of an existing field's type is unreliable once it holds a
-            # value (NetBox can refuse the cast), which left memory_gb stuck and
-            # 400'ing forever. Delete and recreate so the type is guaranteed; the
-            # value is rewritten this same run.
-            log_info "Custom field '$name' is '$cur', expected '$type' -- recreating"
-            nb_delete "extras/custom-fields/${id}/" >/dev/null 2>&1 || true
-            nb_post "extras/custom-fields/" \
-                "$(jq -n --arg n "$name" --arg l "$label" --arg t "$type" \
-                    --argjson ot "[\"$obj_types\"]" \
-                    '{name:$n,label:$l,type:$t,object_types:$ot}')" \
-                >/dev/null 2>&1 || true
-        fi
+        return 0
+    fi
+    # Reconcile the type of a pre-existing field. An earlier build created some
+    # fields with the wrong type (e.g. memory_gb as 'text'); sending an integer to
+    # a text field 400s the ENTIRE custom_fields PATCH, silently dropping every
+    # field. A type PATCH is unreliable once the field holds a value, so delete +
+    # recreate to guarantee the type (the value is rewritten this same run).
+    local cur; cur=$(echo "$res" \
+        | jq -r '(.results[0].type|objects|.value) // (.results[0].type|strings) // empty' 2>/dev/null)
+    if [[ -n "$cur" && "$cur" != "$type" ]]; then
+        log_info "Custom field '$name' is '$cur', expected '$type' -- recreating"
+        nb_delete "extras/custom-fields/${id}/" >/dev/null 2>&1 || true
+        nb_post "extras/custom-fields/" \
+            "$(jq -nc --arg n "$name" --arg l "$label" --arg t "$type" --argjson ot "$otj" \
+                '{name:$n,label:$l,type:$t,object_types:$ot}')" \
+            >/dev/null 2>&1 || true
+        return 0
+    fi
+    # If more than one object type is requested (discovered_ports spans devices
+    # and VMs), make sure an already-existing field covers them. We set the full
+    # requested set directly -- this tool owns these fields -- which is robust to
+    # how the API represents object_types on read.
+    if [[ "$obj_types" == *,* ]]; then
+        nb_patch "extras/custom-fields/${id}/" "{\"object_types\":$otj}" >/dev/null 2>&1 || true
     fi
 }
 
@@ -5823,6 +5825,9 @@ def build(reconciled):
                 'primary_ip': ('%s/%d' % (ip, DEF_MASK)) if ip else None,
                 'mac': macs[0] if macs else None,
                 'no_ip_flag': bool(h.get('vm_no_ip_flag')),
+                'discovered_ports': (', '.join(
+                    '%s/%s' % (p.get('port'), p.get('service') or p.get('proto') or 'tcp')
+                    for p in (h.get('ports') or []) if p.get('port')) or None),
             })
 
     # ---- Canonical cable list (dedupe reciprocal links) --------------------
@@ -5982,7 +5987,7 @@ PLANEOF
     nb_ensure_custom_field "disk_total_gb" "Disk Total (GB)" "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "disk_count"    "Disk Count"      "integer" "dcim.device" >/dev/null 2>&1 || true
     nb_ensure_custom_field "os_version"    "OS Version"      "text"    "dcim.device" >/dev/null 2>&1 || true
-    nb_ensure_custom_field "discovered_ports" "Discovered Ports" "text" "dcim.device" >/dev/null 2>&1 || true
+    nb_ensure_custom_field "discovered_ports" "Discovered Ports" "text" "dcim.device,virtualization.virtualmachine" >/dev/null 2>&1 || true
     nb_ensure_custom_field "discovery_methods" "Discovery Methods" "text" "dcim.device" >/dev/null 2>&1 || true
     local _maxd _di; _maxd=$(jq -r '.max_disks // 0' "$plan" 2>/dev/null || echo 0)
     for (( _di=0; _di<_maxd; _di++ )); do
@@ -6121,7 +6126,7 @@ PLANEOF
     [[ "$ccreated" -gt 0 ]] && log_ok "LLDP cables created/replaced: $ccreated"
 
     while IFS= read -r v; do
-        local vname vcl vrole status vcpus vmem vdisk vip vmac cid vm_id vif role_id
+        local vname vcl vrole status vcpus vmem vdisk vip vmac cid vm_id vif role_id vports
         local _nd _i _dsz _dname
         vname=$(jq -r '.name' <<<"$v");   vcl=$(jq -r '.cluster' <<<"$v")
         vrole=$(jq -r '.role // "Server"' <<<"$v")
@@ -6142,6 +6147,13 @@ PLANEOF
             [[ "$role_id" =~ ^[0-9]+$ ]] && nb_patch \
                 "virtualization/virtual-machines/$vm_id/" \
                 "{\"role\":$role_id}" >/dev/null 2>&1 || true
+        fi
+        # Discovered ports/protocols on the VM (parity with devices' custom field).
+        vports=$(jq -r '.discovered_ports // ""' <<<"$v")
+        if [[ -n "$vports" && "$vports" != "null" ]]; then
+            nb_patch "virtualization/virtual-machines/$vm_id/" \
+                "$(jq -nc --arg p "$vports" '{custom_fields:{discovered_ports:$p}}')" \
+                >/dev/null 2>&1 || true
         fi
         # Per-VM virtual disks (NetBox 4.x aggregates VM.disk from these). Fall
         # back to the single aggregate disk field only when no per-disk data.
