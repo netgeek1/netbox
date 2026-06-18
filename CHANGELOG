@@ -1,3 +1,13 @@
+#  Changelog v2.5.37 (re-link Hyper-V host Device to its Cluster):
+#   - After switching every path to the reconciled writer, Hyper-V host devices
+#     (SERVER01/03/04) no longer showed a cluster: nb_upsert_device has no
+#     cluster argument and never set the device.cluster FK (the legacy sync did).
+#   - Writer now PATCHes device.cluster after upsert, resolving the device's
+#     cluster name (== the host's hostname for a Hyper-V host) against the CLU
+#     name->id map already built for the VM sync. Additive; non-Hyper-V devices
+#     (no .cluster) are untouched. First of three requested follow-ups; MACs on
+#     IP-bearing interfaces and discovered_ports on VMs come next.
+#
 #  Changelog v2.5.36 (route ALL sync through the reconciled single writer):
 #   - The single writer is now validated end-to-end (devices, VMs, IPs, clusters,
 #     cabling), so every menu sync path is repointed to it. Previously the
