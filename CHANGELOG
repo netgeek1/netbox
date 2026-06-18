@@ -1,3 +1,17 @@
+#  Changelog v2.5.36 (route ALL sync through the reconciled single writer):
+#   - The single writer is now validated end-to-end (devices, VMs, IPs, clusters,
+#     cabling), so every menu sync path is repointed to it. Previously the
+#     post-Discover 'Sync to NetBox?' prompt (opt 1/3), option 6, and Full Auto
+#     (opt 7 + CLI --auto) all called the LEGACY sync_to_netbox -- which invents
+#     uplink-<neighbor> interfaces and skips reconciliation/VM-folding/cabling.
+#     That was the source of the stray 'uplink' cables.
+#   - New run_reconciled_sync() wraps the writer with the same dry-run + confirm
+#     as option 9; the interactive prompts (1/3/6) now use it. Full Auto (7 and
+#     CLI) calls sync_reconciled_to_netbox directly (unattended, no uplinks).
+#   - sync_to_netbox() is left DEFINED but unreferenced by any menu path, so the
+#     change is reversible and the legacy code is available if ever needed. No
+#     menu option can create uplink-* interfaces anymore.
+#
 #  Changelog v2.5.35 (FortiLink ISL cabled to aggregate names, not the port):
 #   - The link between the two FortiSwitches (169.254.1.2 S224EP <-> 169.254.1.3
 #     S124FN) landed on each switch's FortiLink TRUNK interface -- which FortiOS
