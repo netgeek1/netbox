@@ -1,3 +1,23 @@
+#
+#  Changelog v2.5.38 (MACs on interfaces -- rebuilt for the NetBox 4.x model):
+#   - Interface MACs weren't landing because nb_add_interface/nb_add_vm_interface
+#     set the interface 'mac_address' field, which NetBox REMOVED in 4.2 (user is
+#     on 4.6, so every MAC was silently dropped). MACs are now first-class
+#     /dcim/mac-addresses/ objects.
+#   - New nb_ensure_mac_address(obj_type,obj_id,mac): idempotently creates the
+#     MAC object bound to the interface (assigned_object_type + assigned_object_id)
+#     and sets it as the interface's primary_mac_address FK. Handles both
+#     dcim.interface and virtualization.vminterface. Reuses an existing MAC on the
+#     same interface on re-runs (no duplicates). Errors are surfaced.
+#   - nb_add_interface and nb_add_vm_interface no longer send the dead field; they
+#     call the helper after the interface exists. Covers all three MAC sources:
+#     SNMP ifTable MACs, VM NIC MACs, and now ARP-derived IP MACs.
+#   - The MAC for each IP comes from a global ip2mac map the plan builds from
+#     every host's ARP/neighbor tables (router+firewall ARP resolve almost every
+#     host). ip_assignments now carry 'mac'; the writer stamps it on the IP's
+#     interface. Validated: 4.x payload shape, ip2mac coverage on a real capture
+#     (every sampled device/VM IP resolved), and ip_assignments now carry MACs.
+#
 #  Changelog v2.5.37 (re-link Hyper-V host Device to its Cluster):
 #   - After switching every path to the reconciled writer, Hyper-V host devices
 #     (SERVER01/03/04) no longer showed a cluster: nb_upsert_device has no
