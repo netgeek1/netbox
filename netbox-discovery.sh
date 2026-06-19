@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.39
+#  Version: 2.5.40
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.39"
+SCRIPT_VERSION="2.5.40"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2290,9 +2290,20 @@ host={'ip':ip,'hostname':None,'mac':None,'vendor':None,
           'kernel':ssh.get('kernel','')},
       'discovery_methods':[]}
 
+def _valid_host(s):
+    s = (s or '').strip()
+    if not s or len(s) > 253 or s.lower() in ('none', 'null'):
+        return False
+    if any(c in s for c in ' ;#/'):          # resolver noise, not a hostname
+        return False
+    _sl = s.lower()
+    return not any(b in _sl for b in (
+        'communications error', 'timed out', 'connection refused', 'servfail',
+        'nxdomain', 'no servers could be reached', '127.0.0.53'))
+
 for src in (snmp.get('sys_name'),ssh.get('hostname'),nmap.get('hostname'),
             dns.get('ptr_hostname'),mdns.get('mdns_hostname'),nb.get('netbios_name')):
-    if src and src.strip() and src.lower() not in ('none','null',''):
+    if _valid_host(src):
         host['hostname']=src.strip(); break
 if not host['hostname']:
     host['hostname']='device-'+ip.replace('.', '-')
@@ -3049,6 +3060,9 @@ HYPERV_OUI = "00:15:5d"
 # Set in __main__; persistent IP<->MAC cache so VM IPs survive a scan where a
 # router's ARP entry has aged out (the ARP tables are authoritative but volatile).
 CACHE_PATH = None
+# Set in __main__; persistent host-identity cache so a host's hostname, role and
+# Hyper-V status survive a run where DNS/SNMP/WinRM transiently fail.
+ID_CACHE_PATH = None
 
 # Default/generic hostnames shared by many distinct devices -- never a merge key.
 # (Two iPhones both mDNS-named "iPhone" are different phones, not one device;
@@ -3137,6 +3151,64 @@ class UF:
 
 def reconcile(data):
     hosts = data.get("hosts", [])
+
+    # ---- Persistent host-identity cache (backfill) --------------------------
+    # Discovery is probabilistic: DNS, SNMP sysName and WinRM each fail
+    # intermittently, so for a single run a host can lose its hostname (falling
+    # back to device-<ip>), its role, or its is_hyperv flag + VM inventory (which
+    # then drops the cluster and orphans its VMs). Carry the last KNOWN-GOOD
+    # identity across runs: anything missing THIS run is backfilled from cache;
+    # a real value found this run always wins and refreshes the cache (saved at
+    # the end of reconcile()).
+    def _is_fallback_name(hn, ip):
+        return (not hn) or hn == ('device-' + (ip or '').replace('.', '-'))
+    def _valid_host(s):
+        s = (s or '').strip()
+        if not s or len(s) > 253 or s.lower() in ('none', 'null'):
+            return False
+        if any(c in s for c in ' ;#/'):
+            return False
+        _sl = s.lower()
+        return not any(b in _sl for b in (
+            'communications error', 'timed out', 'connection refused', 'servfail',
+            'nxdomain', 'no servers could be reached', '127.0.0.53'))
+    def _bad_host(hn, ip):
+        # unusable as a name: the device-<ip> fallback OR resolver noise that an
+        # older scan may already have baked into the results file (e.g. .41's
+        # ';; communications error ...'). Either should yield to the cache.
+        return _is_fallback_name(hn, ip) or not _valid_host(hn)
+    _idc = {}
+    if ID_CACHE_PATH:
+        try:
+            _idc = json.load(open(ID_CACHE_PATH))
+        except Exception:
+            _idc = {}
+        if not isinstance(_idc, dict):
+            _idc = {}
+        for h in hosts:
+            ip = h.get("ip")
+            if not ip:
+                continue
+            cached = _idc.get(ip) or {}
+            if _bad_host(h.get("hostname"), ip):
+                if cached.get("hostname") and _valid_host(cached["hostname"]):
+                    h["hostname"] = cached["hostname"]
+                    h["identity_source"] = "cache"
+                elif not _is_fallback_name(h.get("hostname"), ip):
+                    # invalid name, nothing cached -> scrub to the clean fallback
+                    h["hostname"] = 'device-' + ip.replace('.', '-')
+            for f in ("device_role", "manufacturer", "model", "serial"):
+                if not (str(h.get(f) or "").strip()) and cached.get(f):
+                    h[f] = cached[f]
+            # Restore Hyper-V status + last VM list only when this run found none,
+            # so a transient WinRM failure keeps the cluster and its VMs.
+            if (not h.get("is_hyperv")) and cached.get("is_hyperv") \
+                    and not (h.get("hyperv_vms")):
+                h["is_hyperv"] = True
+                if cached.get("hyperv_vms"):
+                    h["hyperv_vms"] = cached["hyperv_vms"]
+                h["identity_source"] = "cache"
+
     by_ip = {h["ip"]: h for h in hosts}
     ips = list(by_ip.keys())
     uf = UF(ips)
@@ -3457,6 +3529,35 @@ def reconcile(data):
         hosts.append(rec)
 
     data["hosts"] = hosts
+
+    # ---- Persistent host-identity cache (save) ------------------------------
+    # Refresh the cache with this run's known-good values. Never overwrite a good
+    # cached value with a fallback/empty one, so a single bad scan can't poison
+    # the cache -- only improve it.
+    if ID_CACHE_PATH:
+        for h in hosts:
+            ip = h.get("ip")
+            if not ip:
+                continue
+            ent = _idc.get(ip, {})
+            hn = h.get("hostname")
+            if not _bad_host(hn, ip):
+                ent["hostname"] = hn
+            for f in ("device_role", "manufacturer", "model", "serial"):
+                v = str(h.get(f) or "").strip()
+                if v and v.lower() not in ("unknown", "none"):
+                    ent[f] = v
+            if h.get("is_hyperv"):
+                ent["is_hyperv"] = True
+                if h.get("hyperv_vms"):
+                    ent["hyperv_vms"] = h["hyperv_vms"]
+            if ent:
+                _idc[ip] = ent
+        try:
+            json.dump(_idc, open(ID_CACHE_PATH, "w"))
+        except Exception:
+            pass
+
     return data
 
 
@@ -3511,6 +3612,7 @@ if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "reconcile"
     path = sys.argv[2]
     CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(path)), "ip_mac_cache.json")
+    ID_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(path)), "host_identity_cache.json")
     data = json.load(open(path))
     data = reconcile(data)
     if mode == "preview":
