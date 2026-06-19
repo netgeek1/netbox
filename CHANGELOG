@@ -1,3 +1,26 @@
+#  Changelog v2.5.40 (carry known-good identity across runs + hostname hygiene):
+#   - Discovery is probabilistic -- DNS, SNMP sysName and WinRM each fail for the
+#     odd run -- and a single miss had outsized effects: a host lost its hostname
+#     (-> device-<ip>, which broke its cabling because LLDP neighbors no longer
+#     resolved to it), or lost is_hyperv (-> no cluster, orphaned VMs). Observed
+#     live: .52 mancave-sw fell back to device-192-168-0-52; SERVER01 came back
+#     is_hyperv=False one run; .41 took a dig error string as its hostname.
+#   - NEW persistent host-identity cache (discovery/host_identity_cache.json,
+#     sibling of the IP<->MAC cache). reconcile() backfills anything missing this
+#     run from the last KNOWN-GOOD value -- hostname, device_role, manufacturer,
+#     model, serial, and is_hyperv + the hyperv_vms inventory (only when the run
+#     found none, so a real scan always wins). Good values are saved back; bad
+#     ones never are. A transient WinRM/DNS/SNMP failure no longer drops a host's
+#     identity, its cluster, or its cables.
+#   - Hostname hygiene: the scanner's source-selection now rejects resolver noise
+#     (';; communications error', 'timed out', SERVFAIL, 127.0.0.53, anything
+#     with spaces/';'/'#'/'/'), and reconcile() re-validates names already baked
+#     into a results file -- scrubbing a bad one to device-<ip> (or the cached
+#     real name) and refusing to cache it. Fixes .41's garbage name.
+#   - Net effect for .52/.241: rescan + option 9 now restores the real hostname
+#     and Hyper-V cluster from cache, so the cable forms (Port  1, not 1) and the
+#     VMs cluster correctly even on a run where the live probe missed.
+#
 #  Changelog v2.5.39 (discovered ports/protocols on VMs):
 #   - VMs now get the same 'discovered_ports' custom field as devices (e.g.
 #     '53/dns, 80/http, 443/https'), built in the plan from the folded host's
