@@ -1,3 +1,33 @@
+#  Changelog v2.5.42 (WinRM NIC IPs were null on Hyper-V hosts -> root cause):
+#   - Real cause of the mgmt0 IP (the 2.5.41 ARP bind was only a fallback): the
+#     WinRM collector used Get-NetAdapter -PHYSICAL. On a Hyper-V host the mgmt IP
+#     lives on a vEthernet (vSwitch) VIRTUAL adapter, while the physical NIC bound
+#     to the switch has no IP -- so -Physical returned the IP-less NIC and dropped
+#     the adapter that actually holds the address (NIC IPs came back null).
+#   - Collector now enumerates ALL Up adapters and keeps those that are physical
+#     (inventory) OR carry an IPv4 (the mgmt vEthernet). The host now reports its
+#     real IP<->NIC mapping directly, as it used to.
+#   - Plan binds each WinRM NIC's reported IP straight to that adapter (with its
+#     MAC and prefix) -- authoritative, no guessing. The 2.5.41 ARP-MAC match
+#     remains as a secondary fallback for hosts WinRM can't reach. Validated: the
+#     mgmt IP lands on the vEthernet adapter, not mgmt0.
+#   - Scanner-side: requires a fresh WinRM scan to repopulate NIC IPs.
+#
+#  Changelog v2.5.41 (Hyper-V host model = OS string; host IP landed on mgmt0):
+#   - Model bug: WinRM correctly reports the hardware model (SERVER01 ->
+#     'HP Z210 Workstation'), but the SNMP/HTTP model fallback chain ran AFTER the
+#     WinRM block and overwrote it -- ending at host['os'], so model became
+#     'Microsoft Windows Server 2016 Datacenter'. WinRM model is now the top of
+#     that chain (authoritative for Windows hosts); SNMP/HTTP still win for gear.
+#   - IP-on-mgmt bug: WinRM hosts report NIC name+MAC but usually not the NIC's
+#     IP, and have no SNMP ip_table -- so the primary IP had no ip_assignment and
+#     the writer parked it on a synthetic mgmt0. The plan now binds the primary IP
+#     to the real NIC whose MAC matches the IP's ARP entry (or the sole NIC).
+#     Validated on SERVER01: 192.168.0.241 now lands on '10Gb (Core)' with its MAC.
+#   - Both are SCANNER-side (model) / PLAN-side (IP) -- they take effect on the
+#     next scan + option 9; they don't rewrite values already baked into an old
+#     results file.
+#
 #  Changelog v2.5.40 (carry known-good identity across runs + hostname hygiene):
 #   - Discovery is probabilistic -- DNS, SNMP sysName and WinRM each fail for the
 #     odd run -- and a single miss had outsized effects: a host lost its hostname
