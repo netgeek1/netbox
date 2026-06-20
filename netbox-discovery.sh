@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.40
+#  Version: 2.5.42
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.40"
+SCRIPT_VERSION="2.5.42"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2123,14 +2123,20 @@ $cs   = Get-CimInstance Win32_ComputerSystem  2>$null
 $os   = Get-CimInstance Win32_OperatingSystem 2>$null
 $bios = Get-CimInstance Win32_BIOS            2>$null
 $cpu  = Get-CimInstance Win32_Processor 2>$null | Select-Object -First 1
-$nics = Get-NetAdapter -Physical 2>$null | Where-Object { $_.Status -eq "Up" } |
+$nics = Get-NetAdapter 2>$null | Where-Object { $_.Status -eq "Up" } |
         ForEach-Object {
             $if = $_
             $v4 = Get-NetIPAddress -InterfaceIndex $if.ifIndex 2>$null |
                   Where-Object { $_.AddressFamily -eq "IPv4" -and $_.IPAddress -ne "127.0.0.1" }
-            [ordered]@{ Name=$if.Name; Description=$if.InterfaceDescription;
-                        MacAddress=($if.MacAddress -replace "-",":").ToUpper();
-                        IPAddresses=@($v4.IPAddress); PrefixLens=@([int[]]$v4.PrefixLength) }
+            # Keep physical NICs (inventory) AND any adapter that actually holds an
+            # IPv4 -- on a Hyper-V host the mgmt IP lives on a vEthernet (vSwitch)
+            # virtual adapter while the physical NIC bound to the switch has none,
+            # so -Physical alone returned NIC IPs as null.
+            if ($if.HardwareInterface -or @($v4).Count -gt 0) {
+                [ordered]@{ Name=$if.Name; Description=$if.InterfaceDescription;
+                            MacAddress=($if.MacAddress -replace "-",":").ToUpper();
+                            IPAddresses=@($v4.IPAddress); PrefixLens=@([int[]]$v4.PrefixLength) }
+            }
         }
 $isHyperV = $false
 try { $isHyperV = ($null -ne (Get-Command Get-VM -ErrorAction SilentlyContinue)) } catch {}
@@ -2760,7 +2766,13 @@ for _s in host.get('http_services',[]):
                               r'iis|lighttpd|tomcat|default page|test page|'
                               r'it works|web server|placeholder)\b',_t,re.I)):
         _http_model=_t; break
-if k_model and k_model not in ('Unknown',):
+_winrm_model = winrm.get('Model') if (isinstance(winrm, dict) and winrm.get('available')) else None
+if _winrm_model and str(_winrm_model).strip():
+    # WinRM reports the host's own hardware model (e.g. 'HP Z210 Workstation',
+    # 'Virtual Machine'); authoritative for Windows hosts. Must win over the
+    # SNMP/HTTP/OS fallbacks below, which otherwise clobbered it with the OS.
+    host['model']=str(_winrm_model)[:80]
+elif k_model and k_model not in ('Unknown',):
     host['model']=k_model[:80]
 elif _ent_model:
     host['model']=_ent_model
@@ -5848,6 +5860,44 @@ def build(reconciled):
                     'ip': '%s/%d' % (eip, mask_to_prefix(e.get('mask'))),
                     'is_primary': (eip == ip),
                     'mac': ip2mac.get(eip) or ''})
+            # Direct IP<->NIC binding from WinRM: the host itself reports which IP
+            # sits on which adapter (including the Hyper-V mgmt vEthernet), so no
+            # guessing is needed. Authoritative -- runs before the ARP fallback.
+            for n in (h.get('winrm_nics') or []):
+                nm2 = n.get('name') or 'eth'
+                nmac2 = norm_mac(n.get('mac') or '')
+                plens = n.get('prefix_lens') or []
+                for _i, nip in enumerate(n.get('ips') or []):
+                    if not nip or nip.startswith('127.') or nip.startswith('169.254'):
+                        continue
+                    if any((a.get('ip') or '').split('/')[0] == nip for a in ip_assignments):
+                        continue
+                    try:
+                        pfx = int(plens[_i])
+                    except Exception:
+                        pfx = host_prefix(h, nip)
+                    ip_assignments.append({
+                        'ifname': nm2, 'ip': '%s/%d' % (nip, pfx),
+                        'is_primary': (nip == ip), 'mac': nmac2 or (ip2mac.get(nip) or '')})
+            # WinRM hosts report their NICs (name + MAC) but usually not the NIC's
+            # IP, and have no SNMP ip_table -- so the primary IP had nowhere to
+            # land and fell back to a synthetic mgmt0. Bind it to the real NIC
+            # whose MAC matches the primary IP's ARP entry (or the sole NIC).
+            if ip and not any(a.get('is_primary') for a in ip_assignments):
+                _pmac = norm_mac(ip2mac.get(ip) or h.get('mac') or '')
+                _target = None
+                if _pmac:
+                    for f in ifaces:
+                        if f.get('mac') and norm_mac(f.get('mac')) == _pmac:
+                            _target = f['name']; break
+                if not _target and len(ifaces) == 1:
+                    _target = ifaces[0]['name']
+                if _target:
+                    ip_assignments.append({
+                        'ifname': _target,
+                        'ip': '%s/%d' % (ip, host_prefix(h, ip)),
+                        'is_primary': True,
+                        'mac': _pmac or (ifaces[0].get('mac') if len(ifaces) == 1 else '')})
             dcf, ndisks = device_custom_fields(hw, (h.get('os') or '').strip())
             if ndisks > max_disks:
                 max_disks = ndisks
