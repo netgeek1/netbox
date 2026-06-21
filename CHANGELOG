@@ -1,3 +1,19 @@
+#  Changelog v2.5.43 (mfr mismap, VM disk MB-vs-GB, Unknown-type vendor via OUI):
+#   - Manufacturer mismap: WinRM correctly reports HP for SERVER03/04, but the
+#     nmap MAC-vendor step then overwrote it with 'Microsoft' (their Hyper-V NICs
+#     use the 00:15:5d Microsoft OUI). An authoritative vendor already set by
+#     WinRM or a definitive SNMP OID is no longer clobbered by the MAC vendor.
+#     Validated on .243: stays HP / 'HP ProDesk 600 G3 SFF'.
+#   - VM disk unit: NetBox 4.x VirtualDisk.size AND VM.disk are MB, not GB -- the
+#     plan computed GB and sent it straight in, so a 60 GB disk showed as 60 MB.
+#     nb_sync_vm_disk and the VM.disk fallback now convert GB -> MB (x1024).
+#   - Unknown device type defaulted to 'HP' from a substring keyword guess. For
+#     unidentified-type hosts the manufacturer now comes from a MAC/OUI vendor
+#     lookup on the ARP MAC (new oui_vendor(): nmap's nmap-mac-prefixes file when
+#     present, small embedded fallback otherwise) -- the real NIC vendor instead
+#     of a wrong default. Keyword guess is now only a last resort.
+#   - All three are scanner-side -- they take effect on the next scan.
+#
 #  Changelog v2.5.42 (WinRM NIC IPs were null on Hyper-V hosts -> root cause):
 #   - Real cause of the mgmt0 IP (the 2.5.41 ARP bind was only a fallback): the
 #     WinRM collector used Get-NetAdapter -PHYSICAL. On a Hyper-V host the mgmt IP
