@@ -1,3 +1,18 @@
+#  Changelog v2.5.44 (OUI vendor lookup relocated to where the MAC exists):
+#   - The 2.5.43 OUI lookup ran in the scan-time host assembly, but the scanner
+#     is L3-only (NAT'd) so host['mac'] is None there -- oui_vendor() always got
+#     nothing and nothing changed. Moved it into the reconciler, AFTER each host's
+#     MAC is resolved from the gateway/router ARP table (ip2mac). For hosts whose
+#     type stayed unidentified (Endpoint/Unknown role), the manufacturer now comes
+#     from the real NIC vendor via OUI instead of a keyword guess / 'HP' default.
+#   - oui_vendor() reads nmap's /usr/share/nmap/nmap-mac-prefixes (install_deps
+#     apt-installs nmap on the host, so the full table is present); tiny embedded
+#     fallback for common virt/SBC prefixes. Validated on a real capture: 35
+#     Endpoint hosts resolve a MAC from ARP and get an OUI-derived manufacturer
+#     (e.g. 00:15:5d -> Microsoft); the rest resolve against the full nmap table.
+#   - The 2.5.43 manufacturer-preserve (.243/.244 stay HP) and VM disk GB->MB
+#     fixes are unchanged.
+#
 #  Changelog v2.5.43 (mfr mismap, VM disk MB-vs-GB, Unknown-type vendor via OUI):
 #   - Manufacturer mismap: WinRM correctly reports HP for SERVER03/04, but the
 #     nmap MAC-vendor step then overwrote it with 'Microsoft' (their Hyper-V NICs
