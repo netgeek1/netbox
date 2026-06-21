@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.42
+#  Version: 2.5.43
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.42"
+SCRIPT_VERSION="2.5.43"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -34,12 +34,15 @@ nb_sync_vm_disk() {
     # aggregates the VM's total disk from these objects.
     local vm_id="$1" name="$2" size_gb="$3"
     [[ "$vm_id" =~ ^[0-9]+$ && "$size_gb" =~ ^[0-9]+$ ]] || return 0
+    # NetBox 4.x VirtualDisk.size (and VM.disk) are in MB, not GB -- sending the
+    # GB number made a 60 GB disk show as 60 MB. Convert GB -> MB.
+    local size_mb=$(( size_gb * 1024 ))
     local enc; enc=$(nb_urlencode "$name")
     local existing; existing=$(nb_get \
         "virtualization/virtual-disks/?virtual_machine_id=${vm_id}&name=${enc}")
     local did; did=$(echo "$existing" | jq -r '.results[0].id // empty' 2>/dev/null)
     local payload; payload=$(jq -n --arg n "$name" \
-        --argjson s "$size_gb" --argjson vm "$vm_id" \
+        --argjson s "$size_mb" --argjson vm "$vm_id" \
         '{name:$n,size:$s,virtual_machine:$vm}')
     if [[ -n "$did" && "$did" =~ ^[0-9]+$ ]]; then
         nb_patch "virtualization/virtual-disks/${did}/" "$payload" >/dev/null 2>&1 || true
@@ -2269,6 +2272,37 @@ def load(f):
     p=os.path.join(tmp,f+'.json')
     try: return json.load(open(p)) if os.path.exists(p) else {}
     except: return {}
+_OUI_CACHE=None
+def oui_vendor(mac):
+    # Map a MAC's OUI (first 3 octets) to a vendor. The scanner is L3-only, so a
+    # device's only MAC comes from the gateway ARP table -- this turns that MAC
+    # into a real manufacturer instead of a guessed default. Uses nmap's own
+    # prefix file (present wherever nmap runs); tiny embedded fallback otherwise.
+    global _OUI_CACHE
+    if not mac: return ''
+    hx=re.sub(r'[^0-9A-Fa-f]','',str(mac)).upper()
+    if len(hx)<6: return ''
+    if _OUI_CACHE is None:
+        _OUI_CACHE={}
+        for path in ('/usr/share/nmap/nmap-mac-prefixes',
+                     '/usr/local/share/nmap/nmap-mac-prefixes',
+                     '/opt/homebrew/share/nmap/nmap-mac-prefixes'):
+            try:
+                if os.path.exists(path):
+                    for line in open(path, encoding='utf-8', errors='replace'):
+                        line=line.strip()
+                        if not line or line.startswith('#'): continue
+                        parts=line.split(None,1)
+                        if len(parts)==2 and len(parts[0])==6:
+                            _OUI_CACHE[parts[0].upper()]=parts[1].strip()
+                    break
+            except Exception:
+                pass
+        for k,v in {'00155D':'Microsoft','000C29':'VMware','005056':'VMware',
+                    '000569':'VMware','B827EB':'Raspberry Pi',
+                    'DCA632':'Raspberry Pi','E45F01':'Raspberry Pi'}.items():
+            _OUI_CACHE.setdefault(k,v)
+    return _OUI_CACHE.get(hx[:6],'')
 nmap=load('nmap'); snmp=load('snmp'); ssh=load('ssh')
 http=load('http'); nb=load('netbios'); dns=load('dns')
 bnr=load('banners'); mdns=load('mdns'); winrm=load('winrm')
@@ -2695,7 +2729,14 @@ if (_oid_role or host['device_role'] not in ('Server','Workstation')) \
     host['os']=''; host['os_accuracy']=None
 
 vendor=host.get('vendor','') or ''
-if vendor not in ('','null','None'): host['manufacturer']=vendor
+if host.get('manufacturer','Unknown') not in ('','Unknown'):
+    # An authoritative vendor was already set (WinRM Win32_ComputerSystem, or a
+    # definitive SNMP OID). Do NOT let the nmap MAC vendor override it -- a
+    # Hyper-V host's 00:15:5d NIC makes nmap report 'Microsoft', which was
+    # clobbering the real 'HP' on SERVER03/04.
+    pass
+elif vendor not in ('','null','None'):
+    host['manufacturer']=vendor
 else:
     MFR={'cisco':'Cisco','juniper':'Juniper','arista':'Arista',
          'procurve':'HP','hp ':'HP','hewlett':'HP','dell':'Dell',
@@ -2719,7 +2760,13 @@ else:
          'raspbian':'Raspberry Pi','raspberry':'Raspberry Pi'}
     # Skip keyword MFR lookup when OID already identified the vendor;
     # prevents script text from overriding a definitive OID match
-    if not _oid_mfr:
+    _unknown_type = host.get('device_role','Endpoint') in ('Endpoint','Unknown','')
+    _ouiv = oui_vendor(host.get('mac')) if _unknown_type else ''
+    if _ouiv:
+        # Unidentified device type: the real NIC vendor from the MAC/OUI is more
+        # trustworthy than a substring keyword guess (which was defaulting to HP).
+        host['manufacturer']=_ouiv
+    elif not _oid_mfr:
         for k,v in MFR.items():
             if k in mfr_txt: host['manufacturer']=v; break
     else:
@@ -6318,8 +6365,9 @@ PLANEOF
                 _i=$((_i+1))
             done < <(jq -r '.disks_gb[]' <<<"$v")
         elif [[ -n "$vdisk" && "$vdisk" =~ ^[0-9]+$ ]]; then
+            # VM.disk is MB in NetBox 4.x -- convert the GB aggregate.
             nb_patch "virtualization/virtual-machines/$vm_id/" \
-                "{\"disk\":$vdisk}" >/dev/null 2>&1 || true
+                "{\"disk\":$(( vdisk * 1024 ))}" >/dev/null 2>&1 || true
         fi
         vif=$(nb_add_vm_interface "$vm_id" "eth0" "$vmac" "" 2>>"$LOG_FILE")
         if [[ -n "$vip" && "$vif" =~ ^[0-9]+$ ]]; then
