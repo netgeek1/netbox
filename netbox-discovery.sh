@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.44
+#  Version: 2.5.45
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.44"
+SCRIPT_VERSION="2.5.45"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -601,16 +601,24 @@ nb_get_or_create_manufacturer() {
 }
 
 nb_get_or_create_device_type() {
-    local mfr_id="$1" model="$2" slug enc res id slug_enc
+    local mfr_id="$1" model="$2" slug enc res id slug_enc mfr_slug
     # Truncate to 64 chars; long model names from sys_descr drift between
     # runs and cause slug collisions on the second attempt
     model="${model:0:64}"
-    slug=$(slugify "$model")
-    [[ -z "$slug" ]] && slug="unknown-model"
     enc=$(nb_urlencode "$model")
-    res=$(nb_get "dcim/device-types/?model=${enc}")
+    # Match by manufacturer_id + model, NOT model alone. A shared model such as
+    # 'Unknown' under one vendor must never be reused for a different vendor --
+    # that dragged correctly-identified devices (Wyze Labs, Roku, ...) onto HP's
+    # 'Unknown' device type.
+    res=$(nb_get "dcim/device-types/?manufacturer_id=${mfr_id}&model=${enc}")
     id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
     if [[ -z "$id" ]]; then
+        # device-type slug is GLOBALLY unique in NetBox, so scope it to the
+        # manufacturer; otherwise two vendors' identical model (e.g. 'Unknown')
+        # collide and the recovery-by-slug returns the wrong vendor's type.
+        mfr_slug=$(nb_get "dcim/manufacturers/${mfr_id}/" | jq -r '.slug // empty' 2>/dev/null)
+        slug=$(slugify "${mfr_slug}-${model}")
+        [[ -z "$slug" ]] && slug="${mfr_slug:-mfr${mfr_id}}-unknown-model"
         res=$(nb_post "dcim/device-types/" \
             "{\"manufacturer\":$mfr_id,\"model\":\"$model\",\"slug\":\"$slug\"}")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
@@ -743,6 +751,14 @@ nb_upsert_device() {
     local name="$1" role="$2" mfr="$3" model="$4" site_id="$5" \
           serial="${6:-}" comments="${7:-}" primary_ip="${8:-}"
     local mfr_id dtype_id role_id
+    # An unidentified MODEL under a KNOWN manufacturer: label the device type with
+    # the manufacturer name instead of a shared 'Unknown' (e.g. 'Wyze Labs/Wyze
+    # Labs'). Keeps each vendor's type distinct and avoids inheriting another
+    # vendor's 'Unknown' type. A truly-unknown vendor (mfr 'Unknown') is left as
+    # 'Unknown', so it correctly becomes the 'Unknown/Unknown' device type.
+    if [[ ( -z "$model" || "$model" == "Unknown" ) && -n "$mfr" && "$mfr" != "Unknown" ]]; then
+        model="$mfr"
+    fi
     mfr_id=$(nb_get_or_create_manufacturer "$mfr")
     dtype_id=$(nb_get_or_create_device_type "$mfr_id" "$model")
     role_id=$(nb_get_or_create_role "$role")
