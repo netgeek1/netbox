@@ -1,3 +1,18 @@
+#  Changelog v2.5.45 (Unknown device type collapsed every vendor onto HP):
+#   - Root cause: nb_get_or_create_device_type looked up the type by MODEL ALONE
+#     ("?model=Unknown"), so the first 'Unknown' type ever made (under HP) was
+#     reused for EVERY Unknown-model device regardless of vendor -- dragging
+#     correctly-identified devices (Wyze Labs, Roku, ...) onto HP. The slug is
+#     globally unique too, so the recovery-by-slug returned that same HP type.
+#   - Fix 1: the lookup is now scoped by manufacturer_id + model, and the slug is
+#     prefixed with the manufacturer slug, so each vendor gets its own type.
+#   - Fix 2: when the MODEL is Unknown but the manufacturer IS known, the device
+#     type is labelled with the manufacturer name (e.g. Wyze Labs/Wyze Labs)
+#     instead of a shared Unknown. A truly-unknown vendor stays Unknown, so it
+#     correctly lands on an Unknown/Unknown type (Unknown manufacturer), not HP.
+#   - Writer-side: a re-sync moves existing devices off the HP/Unknown type onto
+#     their correct vendor type (the old HP/Unknown type is left orphaned).
+#
 #  Changelog v2.5.44 (OUI vendor lookup relocated to where the MAC exists):
 #   - The 2.5.43 OUI lookup ran in the scan-time host assembly, but the scanner
 #     is L3-only (NAT'd) so host['mac'] is None there -- oui_vendor() always got
