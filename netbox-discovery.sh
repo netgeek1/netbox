@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.46
+#  Version: 2.5.47
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.46"
+SCRIPT_VERSION="2.5.47"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -613,7 +613,24 @@ nb_api() {
         -H "Authorization: Token $NETBOX_API_TOKEN"
         -H "Content-Type: application/json")
     [[ -n "$data" ]] && args+=(-d "$data")
-    curl "${args[@]}" "${NETBOX_API_URL}/api/${endpoint}" 2>>"$LOG_FILE"
+    local url="${NETBOX_API_URL}/api/${endpoint}"
+    # Full HTTP trace (method/endpoint/request body + status/response body) when a
+    # sync enables it -- stdout still carries ONLY the response body so callers'
+    # jq parsing is unchanged.
+    if [[ "${NB_HTTP_LOG:-0}" == "1" && -n "${NB_HTTP_LOG_FILE:-}" ]]; then
+        local raw code body
+        raw=$(curl "${args[@]}" -w $'\n__NBCODE__:%{http_code}' "$url" 2>>"$LOG_FILE")
+        code="${raw##*__NBCODE__:}"
+        body="${raw%$'\n'__NBCODE__:*}"
+        {
+            printf '[%s] %s %s\n' "$(date '+%F %T')" "$method" "$endpoint"
+            [[ -n "$data" ]] && printf '    > req: %s\n' "$data"
+            printf '    < %s: %s\n' "$code" "${body:-<empty>}"
+        } >> "$NB_HTTP_LOG_FILE" 2>/dev/null
+        printf '%s' "$body"
+    else
+        curl "${args[@]}" "$url" 2>>"$LOG_FILE"
+    fi
 }
 nb_get()   { nb_api GET   "$1"; }
 nb_post()  { nb_api POST  "$1" "${2:-}"; }
@@ -635,7 +652,7 @@ nb_get_or_create_site() {
 }
 
 nb_get_or_create_manufacturer() {
-    local name="$1" slug enc res id
+    local name="$1" slug enc res id slug_enc
     slug=$(slugify "$name"); enc=$(nb_urlencode "$name")
     res=$(nb_get "dcim/manufacturers/?name=${enc}")
     id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
@@ -643,6 +660,17 @@ nb_get_or_create_manufacturer() {
         res=$(nb_post "dcim/manufacturers/" \
             "{\"name\":\"$name\",\"slug\":\"$slug\"}")
         id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
+        # POST failed -- almost always a slug collision with an existing
+        # manufacturer whose NAME differs but slugs the same, e.g. WinRM's
+        # 'Hewlett-Packard' vs the OUI table's 'Hewlett Packard' (both ->
+        # 'hewlett-packard'). The name lookup missed, the POST 409'd, and the
+        # device upsert then failed with 'Invalid manufacturer ID'. Recover the
+        # existing manufacturer by slug.
+        if [[ -z "$id" ]]; then
+            slug_enc=$(nb_urlencode "$slug")
+            res=$(nb_get "dcim/manufacturers/?slug=${slug_enc}")
+            id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
+        fi
     fi
     echo "$id"
 }
@@ -6242,6 +6270,15 @@ PLANEOF
     python3 "$pyf" plan "$recon" "$plan" >/dev/null 2>&1; rm -f "$pyf"
     [[ -s "$plan" ]] || { log_error "Plan generation failed"; return 1; }
 
+    # Full HTTP trace of this sync (every request + response) for debugging, e.g.
+    # the 'Invalid manufacturer ID' 409s. Disabled with SYNC_HTTP_LOG=0.
+    if [[ "${SYNC_HTTP_LOG:-1}" == "1" ]]; then
+        export NB_HTTP_LOG=1
+        export NB_HTTP_LOG_FILE="${results_file%.json}.sync_http.log"
+        : > "$NB_HTTP_LOG_FILE" 2>/dev/null || NB_HTTP_LOG_FILE="$(dirname "$results_file")/sync_http.log"
+        printf '# NetBox sync HTTP trace %s\n# %s\n' "$(date '+%F %T')" "$(basename "$plan")" >> "$NB_HTTP_LOG_FILE"
+    fi
+
     log_info "Single-writer sync from $(basename "$plan")"
     local site_id ctype_id
     site_id=$(nb_get_or_create_site "$(jq -r '.site' "$plan")")
@@ -6454,6 +6491,14 @@ PLANEOF
     done < <(jq -c '.vms[]' "$plan")
 
     log_ok "Single-writer sync complete: $dcount device(s), $vcount VM(s) -> NetBox."
+    if [[ "${NB_HTTP_LOG:-0}" == "1" && -n "${NB_HTTP_LOG_FILE:-}" ]]; then
+        local nreq nerr
+        nreq=$(grep -c '^\[' "$NB_HTTP_LOG_FILE" 2>/dev/null || echo 0)
+        nerr=$(grep -cE '< (4[0-9]{2}|5[0-9]{2}):' "$NB_HTTP_LOG_FILE" 2>/dev/null || echo 0)
+        log_info "HTTP trace: $nreq request(s), $nerr error response(s) -> $NB_HTTP_LOG_FILE"
+        [[ "$nerr" -gt 0 ]] && log_warn "Sync had $nerr HTTP error response(s); see the trace for details."
+    fi
+    unset NB_HTTP_LOG NB_HTTP_LOG_FILE
 }
 
 # Interactive wrapper around the single writer: dry-run preview, confirm, sync.
@@ -6816,6 +6861,11 @@ PYEOF
         local comm="$1"
         snmpget -v2c -c "$comm" -t 2 -r 1 "$ip" 1.3.6.1.2.1.1.1.0 2>&1
         ;;
+    snmpv3)
+        local u="$1" ap="$2" ap2="$3" pp="$4" pp2="$5"
+        snmpget -v3 -u "$u" -l authPriv -a "$ap" -A "$ap2" -x "$pp" -X "$pp2" \
+            -t 2 -r 1 "$ip" 1.3.6.1.2.1.1.1.0 2>&1
+        ;;
     esac
 }
 
@@ -6836,25 +6886,43 @@ cred_test_report() {
 test_credentials_against_ip() {
     local ip="$1" creds; creds=$(read_creds)
     printf "\n  ${C}Testing stored credentials against %s${NC}\n" "$ip"
-    printf "\n  ${W}WinRM:${NC}\n"
-    local n=0
-    while IFS=$'\t' read -r u p d; do
-        [[ -z "$u" ]] && continue; n=$((n+1))
-        cred_test_report "${d:+$d\\}$u" winrm "$ip" "$u" "$p" "$d"
-    done < <(echo "$creds" | jq -r '.windows_credentials[]? | [.username,.password,(.domain//"")] | @tsv')
-    [[ $n -eq 0 ]] && echo "    (none stored)"
-    printf "\n  ${W}SSH:${NC}\n"; n=0
-    while IFS=$'\t' read -r u p k; do
-        [[ -z "$u" ]] && continue; n=$((n+1))
-        cred_test_report "$u" ssh "$ip" "$u" "$p" "$k"
-    done < <(echo "$creds" | jq -r '.ssh_credentials[]? | [.username,(.password//""),(.key_file//"")] | @tsv')
-    [[ $n -eq 0 ]] && echo "    (none stored)"
-    printf "\n  ${W}SNMP v2c:${NC}\n"; n=0
+    printf "  ${D}(order: SNMP v2c, SNMP v3, SSH, WinRM; stops at the first that passes)${NC}\n"
+    local any=0
+
+    printf "\n  ${W}SNMP v2c:${NC}\n"; any=0
     while IFS= read -r comm; do
-        [[ -z "$comm" ]] && continue; n=$((n+1))
-        cred_test_report "$comm" snmp "$ip" "$comm"
+        [[ -z "$comm" ]] && continue; any=1
+        if cred_test_report "$comm" snmp "$ip" "$comm"; then
+            printf "\n  ${G}A credential passed -- stopping.${NC}\n"; return 0; fi
     done < <(echo "$creds" | jq -r '.snmp_communities[]?')
-    [[ $n -eq 0 ]] && echo "    (none stored)"
+    [[ $any -eq 0 ]] && echo "    (none stored)"
+
+    printf "\n  ${W}SNMP v3:${NC}\n"; any=0
+    while IFS=$'\t' read -r u ap ap2 pp pp2; do
+        [[ -z "$u" ]] && continue; any=1
+        if cred_test_report "$u" snmpv3 "$ip" "$u" "$ap" "$ap2" "$pp" "$pp2"; then
+            printf "\n  ${G}A credential passed -- stopping.${NC}\n"; return 0; fi
+    done < <(echo "$creds" | jq -r '.snmp_v3[]? | [.username,(.auth_proto//"SHA"),(.auth_pass//""),(.priv_proto//"AES"),(.priv_pass//"")] | @tsv')
+    [[ $any -eq 0 ]] && echo "    (none stored)"
+
+    printf "\n  ${W}SSH:${NC}\n"; any=0
+    while IFS=$'\t' read -r u p k; do
+        [[ -z "$u" ]] && continue; any=1
+        if cred_test_report "$u" ssh "$ip" "$u" "$p" "$k"; then
+            printf "\n  ${G}A credential passed -- stopping.${NC}\n"; return 0; fi
+    done < <(echo "$creds" | jq -r '.ssh_credentials[]? | [.username,(.password//""),(.key_file//"")] | @tsv')
+    [[ $any -eq 0 ]] && echo "    (none stored)"
+
+    printf "\n  ${W}WinRM:${NC}\n"; any=0
+    while IFS=$'\t' read -r u p d; do
+        [[ -z "$u" ]] && continue; any=1
+        if cred_test_report "${d:+$d\\}$u" winrm "$ip" "$u" "$p" "$d"; then
+            printf "\n  ${G}A credential passed -- stopping.${NC}\n"; return 0; fi
+    done < <(echo "$creds" | jq -r '.windows_credentials[]? | [.username,.password,(.domain//"")] | @tsv')
+    [[ $any -eq 0 ]] && echo "    (none stored)"
+
+    printf "\n  ${R}No stored credential passed against %s.${NC}\n" "$ip"
+    return 1
 }
 
 menu_credentials() {
@@ -6900,7 +6968,10 @@ menu_credentials() {
         case "$c" in
         1)  read -rp "  Community: " x
             write_creds "$(echo "$creds" | jq ".snmp_communities += [\"$x\"]")"
-            log_info "Added: $x" ;;
+            log_info "Added: $x"
+            local s1ip
+            read -rp "  Test against IP (blank to skip): " s1ip
+            [[ -n "$s1ip" ]] && cred_test_report "$x" snmp "$s1ip" "$x" ;;
         2)  read -rp "  Remove: " x
             write_creds "$(echo "$creds" \
                 | jq "del(.snmp_communities[] | select(.==\"$x\"))")" ;;
@@ -6912,7 +6983,10 @@ menu_credentials() {
             v3e=$(jq -n --arg u "$u" --arg ap "$ap" --arg ap2 "$ap2" \
                 --arg pp "$pp" --arg pp2 "$pp2" \
                 '{username:$u,auth_proto:$ap,auth_pass:$ap2,priv_proto:$pp,priv_pass:$pp2}')
-            write_creds "$(echo "$creds" | jq ".snmp_v3 += [$v3e]")" ;;
+            write_creds "$(echo "$creds" | jq ".snmp_v3 += [$v3e]")"
+            local s3ip
+            read -rp "  Test against IP (blank to skip): " s3ip
+            [[ -n "$s3ip" ]] && cred_test_report "$u" snmpv3 "$s3ip" "$u" "$ap" "$ap2" "$pp" "$pp2" ;;
         4)  read -rp "  Username: " u
             read -rsp "  Password (blank=key): " p; echo
             read -rp "  Key file (blank=password): " k
