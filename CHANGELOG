@@ -1,3 +1,22 @@
+#  Changelog v2.5.49 (credential-test stop-on-pass is now a toggle):
+#   - New persisted setting CRED_TEST_STOP_ON_PASS (default 1 = prior behavior:
+#     "Test credentials against an IP" tries SNMP v2c -> v3 -> SSH -> WinRM and
+#     stops at the first that passes). Set to 0 to test EVERY protocol/credential
+#     and report a pass/fail summary -- useful for catching one specific bad
+#     credential (e.g. a mistyped WinRM password) even when another protocol
+#     already works. Toggle from Discovery Settings -> 8) Cred Test Stop-on-Pass;
+#     persisted in config.conf.
+#   - Settings menu renumbered: Schedule=9, View Scheduled=10.
+#
+#  Changelog v2.5.48 (sync HTTP summary no longer cries wolf on recovered 409s):
+#   - The 2.5.47 trace summary counted the EXPECTED "slug already exists" 400/409
+#     from the get-or-create helpers (which POST optimistically then recover by
+#     slug) as a real error, producing a scary WARN even though the sync fully
+#     succeeded (e.g. SERVER01 created fine after the manufacturer was recovered).
+#     The summary now excludes "already exists" responses from the error count,
+#     reports them separately as "recovered collision(s)", and only WARNs on
+#     genuinely unexpected 4xx/5xx.
+#
 #  Changelog v2.5.47 (SERVER01 mfr 409 from OUI name clash; sync HTTP trace):
 #   - SERVER01 device upsert failed ("Invalid manufacturer ID") once OUI matching
 #     existed: the OUI table spells HP "Hewlett Packard" (space) while WinRM
