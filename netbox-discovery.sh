@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.45
+#  Version: 2.5.46
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.45"
+SCRIPT_VERSION="2.5.46"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -402,6 +402,50 @@ RSWRAP
 # -----------------------------------------------------------------------------
 # NETBOX DEPLOYMENT
 # -----------------------------------------------------------------------------
+# Install a systemd unit that brings the NetBox compose stack up on boot. Docker
+# is already enabled at boot (install_deps), but a oneshot 'up -d' unit guarantees
+# the stack starts regardless of per-container restart policy.
+setup_netbox_autostart() {
+    local unit="/etc/systemd/system/netbox-discovery.service"
+    local SUDO=""
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        if sudo -n true 2>/dev/null; then SUDO="sudo"
+        else log_warn "Root required to install the boot unit; re-run with sudo."; return 1; fi
+    fi
+    local docker_bin up_cmd down_cmd
+    docker_bin="$(command -v docker || echo /usr/bin/docker)"
+    if [[ "$DOCKER_COMPOSE" == "docker compose" ]]; then
+        up_cmd="$docker_bin compose up -d"; down_cmd="$docker_bin compose stop"
+    else
+        local dc_bin; dc_bin="$(command -v docker-compose || echo /usr/local/bin/docker-compose)"
+        up_cmd="$dc_bin up -d"; down_cmd="$dc_bin stop"
+    fi
+    $SUDO tee "$unit" >/dev/null <<UNIT
+[Unit]
+Description=NetBox (netbox-discovery) auto-start
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${NETBOX_DIR}
+ExecStart=${up_cmd}
+ExecStop=${down_cmd}
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    $SUDO systemctl daemon-reload >> "$LOG_FILE" 2>&1
+    if $SUDO systemctl enable netbox-discovery.service >> "$LOG_FILE" 2>&1; then
+        log_ok "NetBox auto-start enabled (systemd unit: netbox-discovery.service)"
+    else
+        log_error "Failed to enable netbox-discovery.service"; return 1
+    fi
+}
+
 deploy_netbox() {
     log_step "Deploying NetBox via Docker Compose"
     detect_docker_compose
@@ -470,6 +514,9 @@ DCEOF
     log_info "Starting NetBox containers..."
     $DOCKER_COMPOSE up -d >> "$LOG_FILE" 2>&1 &
     spinner $!; wait $!
+
+    # Make NetBox come back up automatically after a host reboot.
+    setup_netbox_autostart || log_warn "Auto-start not configured (enable later from the Management menu)."
 
     printf "  Waiting for NetBox to initialize "
     local retries=0 http_code=""
@@ -6722,6 +6769,94 @@ ENVEOF
 # -----------------------------------------------------------------------------
 # CREDENTIAL MANAGEMENT MENU
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# CREDENTIAL TESTING (validate a credential against a live IP before relying on it)
+# -----------------------------------------------------------------------------
+# cred_test <winrm|ssh|snmp> <ip> [args...]; rc 0 = success. Output -> stdout.
+cred_test() {
+    local typ="$1" ip="$2"; shift 2
+    case "$typ" in
+    winrm)
+        local u="$1" p="$2" d="${3:-}"
+        python3 - "$ip" "$u" "$p" "$d" <<'PYEOF'
+import sys
+ip,u,p,d = (list(sys.argv)+["","","",""])[1:5]
+try:
+    import winrm
+except Exception as e:
+    print("pywinrm not installed: %s" % e); sys.exit(2)
+au = (d+"\\"+u) if (d and "\\" not in u and "@" not in u) else u
+last="no response"
+for proto,port in (("http",5985),("https",5986)):
+    try:
+        s=winrm.Session("%s://%s:%d/wsman"%(proto,ip,port),auth=(au,p),
+            transport="ntlm",server_cert_validation="ignore",
+            operation_timeout_sec=20,read_timeout_sec=30)
+        r=s.run_ps("hostname")
+        if r.status_code==0:
+            print("%s -> %s"%(proto,r.std_out.decode("utf-8","replace").strip())); sys.exit(0)
+        last="%s status=%d %s"%(proto,r.status_code,r.std_err.decode("utf-8","replace")[:160].strip())
+    except Exception as e:
+        last="%s %s"%(proto,str(e)[:160])
+print(last); sys.exit(1)
+PYEOF
+        ;;
+    ssh)
+        local u="$1" p="$2" k="${3:-}"
+        local opts=(-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o NumberOfPasswordPrompts=1)
+        if [[ -n "$k" && -f "$k" ]]; then
+            ssh -i "$k" "${opts[@]}" -o PreferredAuthentications=publickey "$u@$ip" 'echo SSH-OK $(hostname)' 2>&1
+        elif [[ -n "$p" ]]; then
+            sshpass -p "$p" ssh "${opts[@]}" -o PreferredAuthentications=password "$u@$ip" 'echo SSH-OK $(hostname)' 2>&1
+        else
+            ssh "${opts[@]}" "$u@$ip" 'echo SSH-OK $(hostname)' 2>&1
+        fi
+        ;;
+    snmp)
+        local comm="$1"
+        snmpget -v2c -c "$comm" -t 2 -r 1 "$ip" 1.3.6.1.2.1.1.1.0 2>&1
+        ;;
+    esac
+}
+
+# Print a coloured PASS/FAIL line for a single test.
+cred_test_report() {
+    local label="$1"; shift
+    local out rc
+    out=$(cred_test "$@" 2>&1); rc=$?
+    if [[ $rc -eq 0 && "$out" == *OK* ]] || [[ $rc -eq 0 && -n "$out" ]]; then
+        printf "    ${G}PASS${NC} %-26s %s\n" "$label" "$out"
+        return 0
+    fi
+    printf "    ${R}FAIL${NC} %-26s %s\n" "$label" "${out:-no response}"
+    return 1
+}
+
+# Test every stored credential of each type against one IP.
+test_credentials_against_ip() {
+    local ip="$1" creds; creds=$(read_creds)
+    printf "\n  ${C}Testing stored credentials against %s${NC}\n" "$ip"
+    printf "\n  ${W}WinRM:${NC}\n"
+    local n=0
+    while IFS=$'\t' read -r u p d; do
+        [[ -z "$u" ]] && continue; n=$((n+1))
+        cred_test_report "${d:+$d\\}$u" winrm "$ip" "$u" "$p" "$d"
+    done < <(echo "$creds" | jq -r '.windows_credentials[]? | [.username,.password,(.domain//"")] | @tsv')
+    [[ $n -eq 0 ]] && echo "    (none stored)"
+    printf "\n  ${W}SSH:${NC}\n"; n=0
+    while IFS=$'\t' read -r u p k; do
+        [[ -z "$u" ]] && continue; n=$((n+1))
+        cred_test_report "$u" ssh "$ip" "$u" "$p" "$k"
+    done < <(echo "$creds" | jq -r '.ssh_credentials[]? | [.username,(.password//""),(.key_file//"")] | @tsv')
+    [[ $n -eq 0 ]] && echo "    (none stored)"
+    printf "\n  ${W}SNMP v2c:${NC}\n"; n=0
+    while IFS= read -r comm; do
+        [[ -z "$comm" ]] && continue; n=$((n+1))
+        cred_test_report "$comm" snmp "$ip" "$comm"
+    done < <(echo "$creds" | jq -r '.snmp_communities[]?')
+    [[ $n -eq 0 ]] && echo "    (none stored)"
+}
+
 menu_credentials() {
     while true; do
         banner
@@ -6758,6 +6893,7 @@ menu_credentials() {
         echo "   9) Export credentials (plaintext)"
         echo "  10) Add Windows Credential (workgroup or domain)"
         echo "  11) Remove Windows Credential"
+        echo "  12) Test credentials against an IP"
         echo "   0) Back"
         read -rp $'\nChoice: ' c
         local v3e sshe deve
@@ -6785,7 +6921,12 @@ menu_credentials() {
                 '{username:$u,password:(if $p!="" then $p else null end),
                   key_file:(if $k!="" then $k else null end),
                   enable_pass:(if $e!="" then $e else null end)}')
-            write_creds "$(echo "$creds" | jq ".ssh_credentials += [$sshe]")" ;;
+            write_creds "$(echo "$creds" | jq ".ssh_credentials += [$sshe]")"
+            local stip
+            read -rp "  Test against IP (blank to skip): " stip
+            if [[ -n "$stip" ]]; then
+                cred_test_report "$u" ssh "$stip" "$u" "$p" "$k"
+            fi ;;
         5)  read -rp "  Remove username: " u
             write_creds "$(echo "$creds" \
                 | jq "del(.ssh_credentials[] | select(.username==\"$u\"))")" ;;
@@ -6831,11 +6972,20 @@ menu_credentials() {
             wine=$(jq -n --arg u "$wuser" --arg p "$wpass" --arg d "$wdomain" \
                 '{username:$u,password:$p,domain:$d}')
             write_creds "$(echo "$creds" | jq ".windows_credentials += [$wine]")"
-            log_info "Added Windows: ${wdomain:+$wdomain\\}$wuser" ;;
+            log_info "Added Windows: ${wdomain:+$wdomain\\}$wuser"
+            local wtip
+            read -rp "  Test against IP (blank to skip): " wtip
+            if [[ -n "$wtip" ]]; then
+                cred_test_report "${wdomain:+$wdomain\\}$wuser" winrm "$wtip" "$wuser" "$wpass" "$wdomain"
+            fi ;;
         11) read -rp "  Remove username (exact): " wuser
             write_creds "$(echo "$creds" \
                 | jq "del(.windows_credentials[] | select(.username==\"$wuser\"))")"
             log_info "Removed Windows credential: $wuser" ;;
+        12) local tip
+            read -rp "  Test against IP: " tip
+            if [[ -n "$tip" ]]; then test_credentials_against_ip "$tip"
+            else printf "${R}  No IP entered${NC}\n"; fi ;;
         0)  return ;;
         esac
         pause
@@ -6909,6 +7059,7 @@ menu_netbox_mgmt() {
         echo "   8) Restore Database"
         echo "   9) Update NetBox"
         echo "  10) Show Container Status"
+        echo "  11) Enable Auto-Start on Boot (systemd)"
         echo "   0) Back"
         read -rp $'\nChoice: ' c
         case "$c" in
@@ -6960,6 +7111,7 @@ PYEOF
             $DOCKER_COMPOSE up -d >> "$LOG_FILE" 2>&1
             log_ok "Update complete" ;;
         10) cd "$NETBOX_DIR" && $DOCKER_COMPOSE ps ;;
+        11) detect_docker_compose; setup_netbox_autostart ;;
         0)  return ;;
         esac
         pause
