@@ -1,3 +1,21 @@
+#  Changelog v2.5.47 (SERVER01 mfr 409 from OUI name clash; sync HTTP trace):
+#   - SERVER01 device upsert failed ("Invalid manufacturer ID") once OUI matching
+#     existed: the OUI table spells HP "Hewlett Packard" (space) while WinRM
+#     reports "Hewlett-Packard" (hyphen) -- different names, SAME slug
+#     "hewlett-packard". The name lookup missed and the create 409d on the
+#     duplicate slug with no recovery -> empty id -> upsert aborted.
+#     nb_get_or_create_manufacturer now recovers by slug (like the device-type
+#     helper), consolidating onto the existing manufacturer instead of failing.
+#   - Full HTTP sync trace: every request+response (method, endpoint, body,
+#     status) is written to <results>.sync_http.log during a write (off with
+#     SYNC_HTTP_LOG=0). End-of-sync summary reports request/error counts and
+#     warns if any 4xx/5xx occurred. stdout to callers is unchanged (body only).
+#   - Credential testing: SNMP v3 is now actually tested (authPriv, same flags as
+#     the scanner). "Test against an IP" now runs in the order SNMP v2c -> SNMP
+#     v3 -> SSH -> WinRM and STOPS at the first credential that passes. Entering
+#     an SNMP v2c community or v3 user now offers the same inline test as Windows
+#     and SSH did.
+# 
 #  Changelog v2.5.46 (NetBox boot auto-start + credential testing):
 #   - NetBox auto-start: new setup_netbox_autostart() installs+enables a systemd
 #     unit (netbox-discovery.service, oneshot "compose up -d" on boot, Requires
