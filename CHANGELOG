@@ -1,3 +1,21 @@
+#  Changelog v2.5.46 (NetBox boot auto-start + credential testing):
+#   - NetBox auto-start: new setup_netbox_autostart() installs+enables a systemd
+#     unit (netbox-discovery.service, oneshot "compose up -d" on boot, Requires
+#     docker.service). Called at the end of deploy_netbox, and exposed as
+#     Management-menu option 11 to enable it on an existing deployment. docker is
+#     already enabled at boot; this guarantees the stack returns after a reboot
+#     regardless of per-container restart policy.
+#   - Credential testing: new cred_test() (WinRM via pywinrm/ntlm http5985->
+#     https5986; SSH via key/sshpass; SNMP v2c via snmpget sysDescr) +
+#     cred_test_report() + test_credentials_against_ip(). After adding a Windows
+#     (opt 10) or SSH (opt 4) credential the user is prompted to test it against
+#     an IP (blank = skip, accept as before). New Credential-menu option 12 tests
+#     every stored credential against a given IP and reports PASS/FAIL -- catches
+#     a mistyped credential before it silently degrades a scan (as happened to
+#     SERVER01: WinRM auth failed -> host came in as Microsoft/non-Hyper-V).
+#   - No change to discovery/reconciliation; SERVER01 already reconciles
+#     correctly on a good WinRM scan (HP/Hyper-V, cluster + 9 VMs, IP on NIC).
+#
 #  Changelog v2.5.45 (Unknown device type collapsed every vendor onto HP):
 #   - Root cause: nb_get_or_create_device_type looked up the type by MODEL ALONE
 #     ("?model=Unknown"), so the first 'Unknown' type ever made (under HP) was
