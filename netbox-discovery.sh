@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.47
+#  Version: 2.5.49
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.47"
+SCRIPT_VERSION="2.5.49"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -70,6 +70,10 @@ DEBUG_MODE=0
 # container JSON, per-probe *.json, OS fingerprints) per host instead of
 # discarding the temp dir. Lets the full discovery evidence be reviewed.
 RAW_CAPTURE=1
+# When testing stored credentials against an IP: 1 = stop at the first credential
+# that passes (quick "is it reachable" check); 0 = test every protocol and
+# highlight which fail (useful for catching one specific bad credential).
+CRED_TEST_STOP_ON_PASS=1
 
 LOG_FILE="$LOG_DIR/discovery-$(date +%Y%m%d).log"
 
@@ -201,6 +205,7 @@ SSH_TIMEOUT=${SSH_TIMEOUT}
 MAX_THREADS=${MAX_THREADS}
 DEBUG_MODE=${DEBUG_MODE}
 RAW_CAPTURE=${RAW_CAPTURE}
+CRED_TEST_STOP_ON_PASS=${CRED_TEST_STOP_ON_PASS}
 CONF
     chmod 600 "$CONFIG_FILE"
 }
@@ -6492,11 +6497,17 @@ PLANEOF
 
     log_ok "Single-writer sync complete: $dcount device(s), $vcount VM(s) -> NetBox."
     if [[ "${NB_HTTP_LOG:-0}" == "1" && -n "${NB_HTTP_LOG_FILE:-}" ]]; then
-        local nreq nerr
+        local nreq nerr_all nerr
         nreq=$(grep -c '^\[' "$NB_HTTP_LOG_FILE" 2>/dev/null || echo 0)
-        nerr=$(grep -cE '< (4[0-9]{2}|5[0-9]{2}):' "$NB_HTTP_LOG_FILE" 2>/dev/null || echo 0)
-        log_info "HTTP trace: $nreq request(s), $nerr error response(s) -> $NB_HTTP_LOG_FILE"
-        [[ "$nerr" -gt 0 ]] && log_warn "Sync had $nerr HTTP error response(s); see the trace for details."
+        nerr_all=$(grep -cE '< (4[0-9]{2}|5[0-9]{2}):' "$NB_HTTP_LOG_FILE" 2>/dev/null || echo 0)
+        # "already exists" 4xx are expected: the get-or-create helpers POST
+        # optimistically and recover by slug/name on collision. Only count the
+        # unexpected ones as real errors.
+        nerr=$(grep -E '< (4[0-9]{2}|5[0-9]{2}):' "$NB_HTTP_LOG_FILE" 2>/dev/null \
+                | grep -vc 'already exists' || echo 0)
+        local recovered=$(( nerr_all - nerr ))
+        log_info "HTTP trace: $nreq request(s), $nerr error(s)$([[ $recovered -gt 0 ]] && echo ", $recovered recovered collision(s)") -> $NB_HTTP_LOG_FILE"
+        [[ "$nerr" -gt 0 ]] && log_warn "Sync had $nerr unexpected HTTP error(s); see the trace for details."
     fi
     unset NB_HTTP_LOG NB_HTTP_LOG_FILE
 }
@@ -6885,43 +6896,62 @@ cred_test_report() {
 # Test every stored credential of each type against one IP.
 test_credentials_against_ip() {
     local ip="$1" creds; creds=$(read_creds)
+    local stop="${CRED_TEST_STOP_ON_PASS:-1}" stopped=0 passes=0 fails=0 any
     printf "\n  ${C}Testing stored credentials against %s${NC}\n" "$ip"
-    printf "  ${D}(order: SNMP v2c, SNMP v3, SSH, WinRM; stops at the first that passes)${NC}\n"
-    local any=0
+    printf "  ${D}(order: SNMP v2c -> v3 -> SSH -> WinRM; %s)${NC}\n" \
+        "$([[ "$stop" == "1" ]] && echo 'stops at first pass' || echo 'tests all, highlights failures')"
 
-    printf "\n  ${W}SNMP v2c:${NC}\n"; any=0
-    while IFS= read -r comm; do
-        [[ -z "$comm" ]] && continue; any=1
-        if cred_test_report "$comm" snmp "$ip" "$comm"; then
-            printf "\n  ${G}A credential passed -- stopping.${NC}\n"; return 0; fi
-    done < <(echo "$creds" | jq -r '.snmp_communities[]?')
-    [[ $any -eq 0 ]] && echo "    (none stored)"
+    if [[ $stopped -ne 1 ]]; then
+        printf "\n  ${W}SNMP v2c:${NC}\n"; any=0
+        while IFS= read -r comm; do
+            [[ -z "$comm" ]] && continue; [[ $stopped -eq 1 ]] && break; any=1
+            if cred_test_report "$comm" snmp "$ip" "$comm"; then
+                passes=$((passes+1)); [[ "$stop" == "1" ]] && stopped=1
+            else fails=$((fails+1)); fi
+        done < <(echo "$creds" | jq -r '.snmp_communities[]?')
+        [[ $any -eq 0 ]] && echo "    (none stored)"
+    fi
+    if [[ $stopped -ne 1 ]]; then
+        printf "\n  ${W}SNMP v3:${NC}\n"; any=0
+        while IFS=$'\t' read -r u ap ap2 pp pp2; do
+            [[ -z "$u" ]] && continue; [[ $stopped -eq 1 ]] && break; any=1
+            if cred_test_report "$u" snmpv3 "$ip" "$u" "$ap" "$ap2" "$pp" "$pp2"; then
+                passes=$((passes+1)); [[ "$stop" == "1" ]] && stopped=1
+            else fails=$((fails+1)); fi
+        done < <(echo "$creds" | jq -r '.snmp_v3[]? | [.username,(.auth_proto//"SHA"),(.auth_pass//""),(.priv_proto//"AES"),(.priv_pass//"")] | @tsv')
+        [[ $any -eq 0 ]] && echo "    (none stored)"
+    fi
+    if [[ $stopped -ne 1 ]]; then
+        printf "\n  ${W}SSH:${NC}\n"; any=0
+        while IFS=$'\t' read -r u p k; do
+            [[ -z "$u" ]] && continue; [[ $stopped -eq 1 ]] && break; any=1
+            if cred_test_report "$u" ssh "$ip" "$u" "$p" "$k"; then
+                passes=$((passes+1)); [[ "$stop" == "1" ]] && stopped=1
+            else fails=$((fails+1)); fi
+        done < <(echo "$creds" | jq -r '.ssh_credentials[]? | [.username,(.password//""),(.key_file//"")] | @tsv')
+        [[ $any -eq 0 ]] && echo "    (none stored)"
+    fi
+    if [[ $stopped -ne 1 ]]; then
+        printf "\n  ${W}WinRM:${NC}\n"; any=0
+        while IFS=$'\t' read -r u p d; do
+            [[ -z "$u" ]] && continue; [[ $stopped -eq 1 ]] && break; any=1
+            if cred_test_report "${d:+$d\\}$u" winrm "$ip" "$u" "$p" "$d"; then
+                passes=$((passes+1)); [[ "$stop" == "1" ]] && stopped=1
+            else fails=$((fails+1)); fi
+        done < <(echo "$creds" | jq -r '.windows_credentials[]? | [.username,.password,(.domain//"")] | @tsv')
+        [[ $any -eq 0 ]] && echo "    (none stored)"
+    fi
 
-    printf "\n  ${W}SNMP v3:${NC}\n"; any=0
-    while IFS=$'\t' read -r u ap ap2 pp pp2; do
-        [[ -z "$u" ]] && continue; any=1
-        if cred_test_report "$u" snmpv3 "$ip" "$u" "$ap" "$ap2" "$pp" "$pp2"; then
-            printf "\n  ${G}A credential passed -- stopping.${NC}\n"; return 0; fi
-    done < <(echo "$creds" | jq -r '.snmp_v3[]? | [.username,(.auth_proto//"SHA"),(.auth_pass//""),(.priv_proto//"AES"),(.priv_pass//"")] | @tsv')
-    [[ $any -eq 0 ]] && echo "    (none stored)"
-
-    printf "\n  ${W}SSH:${NC}\n"; any=0
-    while IFS=$'\t' read -r u p k; do
-        [[ -z "$u" ]] && continue; any=1
-        if cred_test_report "$u" ssh "$ip" "$u" "$p" "$k"; then
-            printf "\n  ${G}A credential passed -- stopping.${NC}\n"; return 0; fi
-    done < <(echo "$creds" | jq -r '.ssh_credentials[]? | [.username,(.password//""),(.key_file//"")] | @tsv')
-    [[ $any -eq 0 ]] && echo "    (none stored)"
-
-    printf "\n  ${W}WinRM:${NC}\n"; any=0
-    while IFS=$'\t' read -r u p d; do
-        [[ -z "$u" ]] && continue; any=1
-        if cred_test_report "${d:+$d\\}$u" winrm "$ip" "$u" "$p" "$d"; then
-            printf "\n  ${G}A credential passed -- stopping.${NC}\n"; return 0; fi
-    done < <(echo "$creds" | jq -r '.windows_credentials[]? | [.username,.password,(.domain//"")] | @tsv')
-    [[ $any -eq 0 ]] && echo "    (none stored)"
-
-    printf "\n  ${R}No stored credential passed against %s.${NC}\n" "$ip"
+    echo ""
+    if [[ $passes -gt 0 ]]; then
+        if [[ "$stop" == "1" ]]; then
+            log_ok "A credential passed against $ip (stopped at first pass)."
+        else
+            log_ok "$passes credential(s) passed, $fails failed against $ip."
+        fi
+        return 0
+    fi
+    log_error "No stored credential passed against $ip ($fails failed)."
     return 1
 }
 
@@ -7081,8 +7111,10 @@ menu_disc_settings() {
         printf "  6) NetBox Port       ${W}%s${NC}\n"  "$NETBOX_PORT"
         printf "  7) Debug Mode        ${W}%s${NC}\n"  \
             "$([ $DEBUG_MODE -eq 1 ] && echo ON || echo OFF)"
-        echo "  8) Schedule Recurring Scan (cron)"
-        echo "  9) View Scheduled Scans"
+        printf "  8) Cred Test Stop-on-Pass  ${W}%s${NC}\n" \
+            "$([ "${CRED_TEST_STOP_ON_PASS:-1}" -eq 1 ] && echo ON || echo OFF)"
+        echo "  9) Schedule Recurring Scan (cron)"
+        echo " 10) View Scheduled Scans"
         echo "  0) Back"
         read -rp $'\nChoice: ' c
         case "$c" in
@@ -7094,13 +7126,14 @@ menu_disc_settings() {
         6) read -rp "  Port: " NETBOX_PORT
            NETBOX_API_URL="http://$(get_host_ip):${NETBOX_PORT}";    save_config ;;
         7) (( DEBUG_MODE ^= 1 ));                               save_config ;;
-        8) read -rp "  Networks (CIDRs or file): " snet
+        8) (( CRED_TEST_STOP_ON_PASS ^= 1 ));                   save_config ;;
+        9) read -rp "  Networks (CIDRs or file): " snet
            read -rp "  Cron (e.g. 0 2 * * *): " scron
            (crontab -l 2>/dev/null
             echo "$scron root $SCRIPT_PATH --auto-scan '$snet' \
 >> $LOG_DIR/cron.log 2>&1") | crontab -
            log_info "Scheduled: [$scron] $snet" ;;
-        9) crontab -l 2>/dev/null | grep "auto-scan" || echo "  (none)" ;;
+        10) crontab -l 2>/dev/null | grep "auto-scan" || echo "  (none)" ;;
         0) return ;;
         esac
         pause
