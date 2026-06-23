@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.51
+#  Version: 2.5.52
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.51"
+SCRIPT_VERSION="2.5.52"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -6497,15 +6497,19 @@ PLANEOF
 
     log_ok "Single-writer sync complete: $dcount device(s), $vcount VM(s) -> NetBox."
     if [[ "${NB_HTTP_LOG:-0}" == "1" && -n "${NB_HTTP_LOG_FILE:-}" ]]; then
-        local nreq nerr_all nerr
-        nreq=$(grep -c '^\[' "$NB_HTTP_LOG_FILE" 2>/dev/null || echo 0)
-        nerr_all=$(grep -cE '< (4[0-9]{2}|5[0-9]{2}):' "$NB_HTTP_LOG_FILE" 2>/dev/null || echo 0)
+        local nreq nerr_all nerr recovered
+        # grep -c already prints 0 on no match (and exits 1) -- do NOT append
+        # "|| echo 0", which would yield "0\n0" and break the arithmetic below.
+        # Normalize to a single integer defensively.
+        nreq=$(grep -c '^\[' "$NB_HTTP_LOG_FILE" 2>/dev/null); nreq=$(( ${nreq:-0} + 0 ))
+        nerr_all=$(grep -cE '< (4[0-9]{2}|5[0-9]{2}):' "$NB_HTTP_LOG_FILE" 2>/dev/null)
+        nerr_all=$(( ${nerr_all:-0} + 0 ))
         # "already exists" 4xx are expected: the get-or-create helpers POST
         # optimistically and recover by slug/name on collision. Only count the
         # unexpected ones as real errors.
         nerr=$(grep -E '< (4[0-9]{2}|5[0-9]{2}):' "$NB_HTTP_LOG_FILE" 2>/dev/null \
-                | grep -vc 'already exists' || echo 0)
-        local recovered=$(( nerr_all - nerr ))
+                | grep -vc 'already exists'); nerr=$(( ${nerr:-0} + 0 ))
+        recovered=$(( nerr_all - nerr ))
         log_info "HTTP trace: $nreq request(s), $nerr error(s)$([[ $recovered -gt 0 ]] && echo ", $recovered recovered collision(s)") -> $NB_HTTP_LOG_FILE"
         [[ "$nerr" -gt 0 ]] && log_warn "Sync had $nerr unexpected HTTP error(s); see the trace for details."
     fi
