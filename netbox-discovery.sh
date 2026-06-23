@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.49
+#  Version: 2.5.51
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.49"
+SCRIPT_VERSION="2.5.51"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -6869,13 +6869,20 @@ PYEOF
         fi
         ;;
     snmp)
-        local comm="$1"
-        snmpget -v2c -c "$comm" -t 2 -r 1 "$ip" 1.3.6.1.2.1.1.1.0 2>&1
+        local comm="$1" out rc
+        # -Oqv: value only (no OID/type prefix). Drop net-snmp's MIB-load chatter
+        # ("Cannot adopt OID ...") on stderr; show only the device's response.
+        out=$(snmpget -v2c -c "$comm" -Oqv -t 2 -r 1 "$ip" \
+              1.3.6.1.2.1.1.1.0 2>/dev/null); rc=$?
+        [[ $rc -eq 0 && -n "$out" ]] && printf '%s' "$out" || printf 'no response (timeout/auth)'
+        return $rc
         ;;
     snmpv3)
-        local u="$1" ap="$2" ap2="$3" pp="$4" pp2="$5"
-        snmpget -v3 -u "$u" -l authPriv -a "$ap" -A "$ap2" -x "$pp" -X "$pp2" \
-            -t 2 -r 1 "$ip" 1.3.6.1.2.1.1.1.0 2>&1
+        local u="$1" ap="$2" ap2="$3" pp="$4" pp2="$5" out rc
+        out=$(snmpget -v3 -u "$u" -l authPriv -a "$ap" -A "$ap2" -x "$pp" -X "$pp2" \
+              -Oqv -t 2 -r 1 "$ip" 1.3.6.1.2.1.1.1.0 2>/dev/null); rc=$?
+        [[ $rc -eq 0 && -n "$out" ]] && printf '%s' "$out" || printf 'no response (timeout/auth)'
+        return $rc
         ;;
     esac
 }
@@ -6983,15 +6990,16 @@ menu_credentials() {
         echo "   1) Add SNMP v2c Community"
         echo "   2) Remove SNMP v2c Community"
         echo "   3) Add SNMP v3 Account"
-        echo "   4) Add SSH Credential"
-        echo "   5) Remove SSH Credential"
-        echo "   6) Add Device Override"
-        echo "   7) Remove Device Override"
-        echo "   8) Import credentials JSON"
-        echo "   9) Export credentials (plaintext)"
-        echo "  10) Add Windows Credential (workgroup or domain)"
-        echo "  11) Remove Windows Credential"
-        echo "  12) Test credentials against an IP"
+        echo "   4) Remove SNMP v3 Account"
+        echo "   5) Add SSH Credential"
+        echo "   6) Remove SSH Credential"
+        echo "   7) Add Windows Credential (workgroup or domain)"
+        echo "   8) Remove Windows Credential"
+        echo "   9) Add Device Override"
+        echo "  10) Remove Device Override"
+        echo "  11) Import credentials JSON"
+        echo "  12) Export credentials (plaintext)"
+        echo "  13) Test credentials against an IP"
         echo "   0) Back"
         read -rp $'\nChoice: ' c
         local v3e sshe deve
@@ -7017,7 +7025,13 @@ menu_credentials() {
             local s3ip
             read -rp "  Test against IP (blank to skip): " s3ip
             [[ -n "$s3ip" ]] && cred_test_report "$u" snmpv3 "$s3ip" "$u" "$ap" "$ap2" "$pp" "$pp2" ;;
-        4)  read -rp "  Username: " u
+        4)  read -rp "  Remove SNMP v3 username (exact): " v3u
+            if [[ -n "$v3u" ]]; then
+                write_creds "$(echo "$creds" \
+                    | jq "del(.snmp_v3[] | select(.username==\"$v3u\"))")"
+                log_info "Removed SNMP v3 account: $v3u"
+            else printf "${R}  No username entered${NC}\n"; fi ;;
+        5)  read -rp "  Username: " u
             read -rsp "  Password (blank=key): " p; echo
             read -rp "  Key file (blank=password): " k
             read -rsp "  Enable pass (opt): " e; echo
@@ -7031,10 +7045,30 @@ menu_credentials() {
             if [[ -n "$stip" ]]; then
                 cred_test_report "$u" ssh "$stip" "$u" "$p" "$k"
             fi ;;
-        5)  read -rp "  Remove username: " u
+        6)  read -rp "  Remove username: " u
             write_creds "$(echo "$creds" \
                 | jq "del(.ssh_credentials[] | select(.username==\"$u\"))")" ;;
-        6)  read -rp "  Device IP: " dip
+        7)  local wtype wdomain wuser wpass wine
+            printf "  1) Workgroup / local  2) Domain\n"
+            read -rp "  Type [1]: " wtype; wtype="${wtype:-1}"
+            wdomain=""
+            [[ "$wtype" == "2" ]] && read -rp "  Domain: " wdomain
+            read -rp "  Username: " wuser
+            read -rsp "  Password: " wpass; echo
+            wine=$(jq -n --arg u "$wuser" --arg p "$wpass" --arg d "$wdomain" \
+                '{username:$u,password:$p,domain:$d}')
+            write_creds "$(echo "$creds" | jq ".windows_credentials += [$wine]")"
+            log_info "Added Windows: ${wdomain:+$wdomain\\}$wuser"
+            local wtip
+            read -rp "  Test against IP (blank to skip): " wtip
+            if [[ -n "$wtip" ]]; then
+                cred_test_report "${wdomain:+$wdomain\\}$wuser" winrm "$wtip" "$wuser" "$wpass" "$wdomain"
+            fi ;;
+        8)  read -rp "  Remove username (exact): " wuser
+            write_creds "$(echo "$creds" \
+                | jq "del(.windows_credentials[] | select(.username==\"$wuser\"))")"
+            log_info "Removed Windows credential: $wuser" ;;
+        9)  read -rp "  Device IP: " dip
             read -rp "  SNMP community: " dc
             read -rp "  SSH username: " du
             read -rsp "  SSH password: " dp; echo
@@ -7055,38 +7089,18 @@ menu_credentials() {
                   windows_domain:(if $wd!="" then $wd else "" end)}')
             write_creds "$(echo "$creds" \
                 | jq ".device_overrides[\"$dip\"] = $deve")" ;;
-        7)  read -rp "  Device IP: " dip
+        10) read -rp "  Device IP: " dip
             write_creds "$(echo "$creds" \
                 | jq "del(.device_overrides[\"$dip\"])")" ;;
-        8)  read -rp "  JSON file: " jf
+        11) read -rp "  JSON file: " jf
             if [[ -f "$jf" ]]; then write_creds "$(cat "$jf")"
                 log_info "Imported: $jf"
             else printf "${R}  Not found${NC}\n"; sleep 1; fi ;;
-        9)  printf "${R}  WARNING: plaintext export!${NC}\n"
+        12) printf "${R}  WARNING: plaintext export!${NC}\n"
             confirm "Continue?" || continue
             read -rp "  Output file: " of
             read_creds > "$of"; chmod 600 "$of"; log_warn "Exported: $of" ;;
-        10) local wtype wdomain wuser wpass wine
-            printf "  1) Workgroup / local  2) Domain\n"
-            read -rp "  Type [1]: " wtype; wtype="${wtype:-1}"
-            wdomain=""
-            [[ "$wtype" == "2" ]] && read -rp "  Domain: " wdomain
-            read -rp "  Username: " wuser
-            read -rsp "  Password: " wpass; echo
-            wine=$(jq -n --arg u "$wuser" --arg p "$wpass" --arg d "$wdomain" \
-                '{username:$u,password:$p,domain:$d}')
-            write_creds "$(echo "$creds" | jq ".windows_credentials += [$wine]")"
-            log_info "Added Windows: ${wdomain:+$wdomain\\}$wuser"
-            local wtip
-            read -rp "  Test against IP (blank to skip): " wtip
-            if [[ -n "$wtip" ]]; then
-                cred_test_report "${wdomain:+$wdomain\\}$wuser" winrm "$wtip" "$wuser" "$wpass" "$wdomain"
-            fi ;;
-        11) read -rp "  Remove username (exact): " wuser
-            write_creds "$(echo "$creds" \
-                | jq "del(.windows_credentials[] | select(.username==\"$wuser\"))")"
-            log_info "Removed Windows credential: $wuser" ;;
-        12) local tip
+        13) local tip
             read -rp "  Test against IP: " tip
             if [[ -n "$tip" ]]; then test_credentials_against_ip "$tip"
             else printf "${R}  No IP entered${NC}\n"; fi ;;
