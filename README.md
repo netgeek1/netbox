@@ -6,8 +6,8 @@ clusters, and cabling — automatically and idempotently.
 
 > **Version:** 2.5.51 · **Platform:** Ubuntu 24.04 · **License:** see [License](#license)
 >
-> The authoritative, per-version history lives in the changelog block at the top
-> of `netbox-discovery.sh`. This README describes current behavior.
+> The authoritative, per-version history lives in CHANGELOG.
+> This README describes current behavior.
 
 ---
 
