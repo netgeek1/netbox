@@ -1,3 +1,19 @@
+#  Changelog v2.5.51 (credentials menu reorg + quiet SNMP test output):
+#   - The 2.5.50 "Remove SNMP v3 Account" landed at the bottom as option 13, far
+#     from "Add SNMP v3", so it read as missing. The credentials menu is now
+#     ordered in add/remove pairs: SNMP v2c (1/2), SNMP v3 (3/4), SSH (5/6),
+#     Windows (7/8), Device Override (9/10), then Import(11)/Export(12)/Test(13).
+#   - SNMP credential test was dumping net-snmp MIB chatter ("Cannot adopt OID in
+#     NET-SNMP-AGENT-MIB ...") and the raw "iso.3.6.1... = STRING:" prefix. The
+#     test now uses snmpget -Oqv (value only) and drops stderr, so a pass shows
+#     just the device response (e.g. the sysDescr string) and a fail shows a
+#     short "no response (timeout/auth)".
+#
+#  Changelog v2.5.50 (add missing "Remove SNMP v3 Account" menu option):
+#   - The credentials menu could ADD an SNMP v3 account (opt 3) but had no way to
+#     remove one. New option 13 removes an SNMP v3 account by exact username
+#     (mirrors the SSH/Windows remove options).
+#
 #  Changelog v2.5.49 (credential-test stop-on-pass is now a toggle):
 #   - New persisted setting CRED_TEST_STOP_ON_PASS (default 1 = prior behavior:
 #     "Test credentials against an IP" tries SNMP v2c -> v3 -> SSH -> WinRM and
