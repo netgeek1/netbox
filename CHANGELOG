@@ -1,3 +1,13 @@
+#  Changelog v2.5.52 (fix arithmetic crash in HTTP-trace summary on clean sync):
+#   - "syntax error in expression (error token is 0)" at the END of a sync: the
+#     trace summary used `grep -c ... || echo 0`, but grep -c already prints 0 on
+#     no match AND exits non-zero, so the `|| echo 0` appended a SECOND line ->
+#     the var held "0\n0" and `$(( nerr_all - nerr ))` choked. Only triggered on
+#     a clean sync with zero HTTP errors (a run with a recovered 409 had a
+#     match, so it slipped through before). Counts are now taken straight from
+#     grep -c and normalized to a single integer; the sync itself was always
+#     fine -- this was a cosmetic post-sync summary crash.
+#
 #  Changelog v2.5.51 (credentials menu reorg + quiet SNMP test output):
 #   - The 2.5.50 "Remove SNMP v3 Account" landed at the bottom as option 13, far
 #     from "Add SNMP v3", so it read as missing. The credentials menu is now
