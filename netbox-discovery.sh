@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.53
+#  Version: 2.5.54
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.53"
+SCRIPT_VERSION="2.5.54"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -27,6 +27,42 @@ DISCOVERY_DIR="$BASE_DIR/discovery"
 latest_scan_file() {
     ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
         | grep -vE '\.(plan|reconciled)\.json$' | head -1
+}
+
+# Let the user choose among recent RAW scan results files (newest first), with
+# host count shown. Pressing Enter picks the newest -- so callers behave exactly
+# like latest_scan_file() unless the user deliberately chooses an older file.
+# The chosen path is echoed on STDOUT; all prompts/listing go to STDERR so the
+# result can be captured with  f=$(pick_results_file). Returns non-zero on
+# cancel or when no results exist.
+pick_results_file() {
+    local files=() f cnt i=1 choice
+    while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(
+        ls -t "$DISCOVERY_DIR"/results_*.json 2>/dev/null \
+            | grep -vE '\.(plan|reconciled)\.json$')
+    if [[ ${#files[@]} -eq 0 ]]; then
+        return 1
+    fi
+    if [[ ${#files[@]} -eq 1 ]]; then
+        printf '%s' "${files[0]}"; return 0
+    fi
+    {
+        printf "\n  ${W}Select a results file:${NC}\n"
+        for f in "${files[@]}"; do
+            cnt=$(jq '.hosts | length' "$f" 2>/dev/null || echo "?")
+            printf "  %2d) %-42s %s host(s)\n" "$i" "$(basename "$f")" "$cnt"
+            i=$((i+1))
+        done
+        printf "   0) Cancel\n"
+    } >&2
+    read -rp "  Choice [1=newest]: " choice
+    choice="${choice:-1}"
+    [[ "$choice" == "0" ]] && return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#files[@]} )); then
+        printf '%s' "${files[$((choice-1))]}"; return 0
+    fi
+    printf "${R}  Invalid choice${NC}\n" >&2
+    return 1
 }
 
 nb_sync_vm_disk() {
@@ -774,20 +810,6 @@ nb_get_or_create_role() {
     echo "$id"
 }
 
-nb_get_or_create_vlan() {
-    local vid="$1" name="${2:-VLAN-$1}" site_id="$3" res id payload
-    res=$(nb_get "ipam/vlans/?vid=${vid}")
-    id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
-    if [[ -z "$id" ]]; then
-        payload=$(jq -n \
-            --argjson vid "$vid" --arg name "$name" --argjson site "$site_id" \
-            '{vid:$vid,name:$name,site:$site,status:"active"}')
-        res=$(nb_post "ipam/vlans/" "$payload")
-        id=$(echo "$res" | jq -r '.id // empty' 2>/dev/null)
-        [[ -n "$id" ]] && log_info "Created VLAN $vid: $name"
-    fi
-    echo "$id"
-}
 
 nb_add_ip() {
     local ip="$1" device_id="${2:-}" iface_id="${3:-}"
@@ -1240,18 +1262,6 @@ nb_add_vm_interface() {
 # -----------------------------------------------------------------------------
 # SNMP HELPERS  (top-level -- bash forbids "local func()")
 # -----------------------------------------------------------------------------
-_snmp_get() {
-    local ip="$1" tok="$2" tout="$3" oid="$4"
-    if [[ "$tok" == v3:* ]]; then
-        local IFS=':'; read -r _ u ap ap2 pp pp2 <<< "$tok"
-        snmpget -v3 -u "$u" -l authPriv \
-            -a "$ap" -A "$ap2" -x "$pp" -X "$pp2" \
-            -t "$tout" -r 1 "$ip" "$oid" 2>/dev/null | sed 's/.*: //' || true
-    else
-        snmpget -v2c -c "$tok" -t "$tout" -r 1 "$ip" "$oid" 2>/dev/null \
-            | sed 's/.*: //' || true
-    fi
-}
 _snmp_walk() {
     local ip="$1" tok="$2" tout="$3" oid="$4"
     if [[ "$tok" == v3:* ]]; then
@@ -1516,10 +1526,6 @@ PYEOF
 }
 
 # Legacy single-target wrapper (used internally and by --auto-scan)
-discover_live_hosts() {
-    local target="$1"
-    discover_targets "$target"
-}
 
 # ?? Phase 2: Deep scan ????????????????????????????????????????????????????????
 scan_all_hosts() {
@@ -3848,312 +3854,6 @@ PYEOF
     python3 "$pyf" preview "$results_file" >&2
     rm -f "$pyf"
     echo "$out"
-}
-
-# -----------------------------------------------------------------------------
-# SYNC TO NETBOX
-# -----------------------------------------------------------------------------
-sync_to_netbox() {
-    local results_file="${1:-}"
-    [[ -z "$results_file" ]] \
-        && results_file=$(latest_scan_file)
-    [[ ! -f "$results_file" ]] \
-        && { log_error "No results file found"; pause; return 1; }
-
-    log_step "Syncing to NetBox: $(basename "$results_file")"
-
-    if [[ -z "$NETBOX_API_TOKEN" ]]; then
-        read -rp "  Enter NetBox API Token: " NETBOX_API_TOKEN; save_config
-    fi
-
-    if ! nc -z -w 5 $(get_host_ip) "${NETBOX_PORT}" 2>/dev/null; then
-        log_error "NetBox port ${NETBOX_PORT} not reachable -- is it running?"
-        log_info  "Start: Menu -> NetBox Management -> Start NetBox"
-        pause; return 1
-    fi
-    local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
-        -H "Authorization: Token $NETBOX_API_TOKEN" \
-        "${NETBOX_API_URL}/api/dcim/sites/" 2>/dev/null)
-    if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
-        log_error "NetBox API auth failed (HTTP $http_code)"
-        log_info  "Token : ${NETBOX_API_TOKEN:0:12}..."
-        log_info  "Creds : cat $BASE_DIR/netbox-credentials.txt"
-        read -rp "  Enter correct token (blank to cancel): " new_tok
-        if [[ -n "$new_tok" ]]; then NETBOX_API_TOKEN="$new_tok"; save_config
-        else pause; return 1; fi
-    elif [[ "$http_code" != "200" ]]; then
-        log_error "NetBox API HTTP $http_code"
-        pause; return 1
-    fi
-
-    local site_id; site_id=$(nb_get_or_create_site)
-    [[ -z "$site_id" || ! "$site_id" =~ ^[0-9]+$ ]] \
-        && { log_error "Cannot create site"; pause; return 1; }
-    log_info "Site ID: $site_id"
-    # Ensure custom fields exist (idempotent)
-    nb_ensure_custom_field "discovered_ports" "Discovered Ports" "text" "dcim.device"
-    nb_ensure_custom_field "discovery_methods" "Discovery Methods" "text" "dcim.device"
-
-    local total; total=$(jq '.hosts | length' "$results_file")
-    local ok=0 fail=0 idx=0
-
-    local host
-    while IFS= read -r host; do
-        (( idx++ )) || true
-        local ip hn role mfr model os serial
-        local loc contact uptime oid dmethods comments
-        ip=$(echo "$host"       | jq -r '.ip')
-        hn=$(echo "$host"       | jq -r '.hostname // "unknown"')
-        role=$(echo "$host"     | jq -r '.device_role // "Endpoint"')
-        mfr=$(echo "$host"      | jq -r '.manufacturer // "Unknown"')
-        model=$(echo "$host"    | jq -r '.model // "Unknown"' | cut -c1-64)
-        os=$(echo "$host"       | jq -r '.os // ""')
-        serial=$(echo "$host"   | jq -r '.serial // ""')
-        loc=$(echo "$host"      | jq -r '.snmp_details.sys_location // ""')
-        contact=$(echo "$host"  | jq -r '.snmp_details.sys_contact // ""')
-        uptime=$(echo "$host"   | jq -r '.snmp_details.sys_uptime // ""')
-        oid=$(echo "$host"      | jq -r '.snmp_details.sys_oid // ""')
-        dmethods=$(echo "$host" | jq -r '.discovery_methods | join(", ")')
-
-        comments="Discovered by NetBox Discovery Suite v${SCRIPT_VERSION}"
-        [[ -n "$os"      ]] && comments="${comments}\nOS         : $os"
-        [[ -n "$loc"     ]] && comments="${comments}\nLocation   : $loc"
-        [[ -n "$contact" ]] && comments="${comments}\nContact    : $contact"
-        [[ -n "$uptime"  ]] && comments="${comments}\nUptime     : $uptime"
-        [[ -n "$oid"     ]] && comments="${comments}\nSNMP OID   : $oid"
-        comments="${comments}\nDiscovery  : $dmethods"
-
-        printf "  ${C}[%d/%d]${NC} ${W}%-16s${NC} %-28s %-14s " \
-            "$idx" "$total" "$ip" "$hn" "$role"
-
-        local dev_id
-        dev_id=$(nb_upsert_device "$hn" "$role" "$mfr" "$model" \
-            "$site_id" "$serial" "$comments" "$ip" 2>>"$LOG_FILE")
-
-        if [[ -z "$dev_id" || ! "$dev_id" =~ ^[0-9]+$ ]]; then
-            printf "${R}FAIL${NC}\n"; (( fail++ )); continue
-        fi
-
-        # Skip mgmt0 when WinRM NICs are present -- the real NIC names
-        # and IPs will be assigned in the WinRM NIC loop below, avoiding
-        # the IP landing on a placeholder interface and then needing
-        # reassignment.
-        local _has_winrm_nics
-        _has_winrm_nics=$(echo "$host" \
-            | jq '.winrm_nics | length' 2>/dev/null || echo 0)
-        local mac_addr mgmt_id
-        if [[ "${_has_winrm_nics:-0}" -eq 0 ]]; then
-            mac_addr=$(echo "$host" | jq -r '.mac // ""')
-            mgmt_id=$(nb_add_interface \
-                "$dev_id" "mgmt0" "other" "$mac_addr" \
-                "Management (auto-discovered)" 2>/dev/null)
-            if [[ -n "$mgmt_id" && "$mgmt_id" =~ ^[0-9]+$ ]]; then
-                nb_add_ip "$ip" "$dev_id" "$mgmt_id" >/dev/null 2>&1 || true
-            fi
-        fi
-
-        local ip_table_json vlan_pvid_json vlan_names_json lldp_json cdp_json
-        ip_table_json=$(echo "$host"    | jq -c '.ip_table // []')
-        vlan_pvid_json=$(echo "$host"   | jq -c '.vlan_pvid // {}')
-        vlan_names_json=$(echo "$host"  | jq -c '.vlan_names // {}')
-        lldp_json=$(echo "$host"        | jq -c '.lldp_neighbors // []')
-        cdp_json=$(echo "$host"         | jq -c '.cdp_neighbors // []')
-
-        local iface
-        while IFS= read -r iface; do
-            local if_name if_mac if_type if_idx nb_type if_desc lldp_d cdp_d
-            if_name=$(echo "$iface" | jq -r '.name // "if"')
-            if_mac=$(echo "$iface"  | jq -r '.mac // ""')
-            if_type=$(echo "$iface" | jq -r '.type // "other"')
-            if_idx=$(echo "$iface"  | jq -r '.index // ""')
-            nb_type="other"
-            case "$if_type" in
-                6)   nb_type="1000base-t"       ;;
-                53)  nb_type="1000base-x-sfp"   ;;
-                161) nb_type="ieee802-11a"       ;;
-                24)  nb_type="virtual"           ;;
-            esac
-            lldp_d=$(echo "$lldp_json" | jq -r \
-                "[.[] | select(.port_id==\"$if_name\" or .port_desc==\"$if_name\")
-                  | \"LLDP: \"+(.sys_name // \"?\")] | join(\"; \")" \
-                2>/dev/null || echo "")
-            cdp_d=$(echo "$cdp_json" | jq -r \
-                "[.[] | select(.remote_port==\"$if_name\")
-                  | \"CDP: \"+(.device_id // \"?\")] | join(\"; \")" \
-                2>/dev/null || echo "")
-            if_desc="${lldp_d}${cdp_d:+; $cdp_d}"
-
-            local if_id
-            if_id=$(nb_add_interface "$dev_id" "$if_name" "$nb_type" \
-                "$if_mac" "${if_desc:0:200}" 2>/dev/null) || true
-            [[ -z "$if_id" || ! "$if_id" =~ ^[0-9]+$ ]] && continue
-
-            # Assign every SNMP ip_table IP bound to this interface index, not
-            # just the first -- an interface can hold multiple IPs (e.g. UCG
-            # if_index 44 carries both 192.168.0.253 and the secondary
-            # 192.168.0.2). Skip unroutable addresses.
-            local _iprow iface_ip iface_mask iface_prefix
-            while IFS= read -r _iprow; do
-                [[ -z "$_iprow" || "$_iprow" == "null" ]] && continue
-                iface_ip=$(echo "$_iprow"   | jq -r '.ip   // empty')
-                iface_mask=$(echo "$_iprow" | jq -r '.mask // "255.255.255.0"')
-                # 169.254 retained on purpose: FortiLink uses it as a managed,
-                # routable block. Only loopback / unspecified are dropped.
-                [[ -z "$iface_ip" || "$iface_ip" == "0.0.0.0" \
-                   || "$iface_ip" == 127.* ]] && continue
-                iface_prefix=$(python3 -c \
-                    "import ipaddress; \
-print(ipaddress.IPv4Network('$iface_ip/$iface_mask',strict=False).prefixlen)" \
-                    2>/dev/null || echo "24")
-                nb_add_ip "${iface_ip}/${iface_prefix}" "" "$if_id" \
-                    >/dev/null 2>&1 || true
-            done < <(echo "$ip_table_json" | jq -c \
-                "[.[] | select(.if_index==\"$if_idx\")][]" 2>/dev/null || true)
-
-            local pvid vlan_nm vlan_id
-            pvid=$(echo "$vlan_pvid_json" | jq -r \
-                ".\"$if_idx\" // empty" 2>/dev/null || echo "")
-            if [[ -n "$pvid" && "$pvid" =~ ^[0-9]+$ && "$pvid" != "0" ]]; then
-                vlan_nm=$(echo "$vlan_names_json" | jq -r \
-                    ".\"$pvid\" // \"VLAN-$pvid\"" 2>/dev/null || echo "VLAN-$pvid")
-                vlan_id=$(nb_get_or_create_vlan \
-                    "$pvid" "$vlan_nm" "$site_id" 2>/dev/null) || true
-                if [[ -n "$vlan_id" && "$vlan_id" =~ ^[0-9]+$ ]]; then
-                    nb_patch "dcim/interfaces/${if_id}/" \
-                        "{\"untagged_vlan\":$vlan_id,\"mode\":\"access\"}" \
-                        >/dev/null 2>&1 || true
-                fi
-            fi
-        done < <(echo "$host" | jq -c '.interfaces[]?' 2>/dev/null || true)
-
-        # WinRM NIC interfaces (Windows hosts)
-        local winrm_nic
-        while IFS= read -r winrm_nic; do
-            local wn_name wn_mac wn_desc wn_if_id _idx_ip
-            wn_name=$(echo "$winrm_nic" | jq -r '.name // "NIC"')
-            wn_mac=$(echo "$winrm_nic"  | jq -r '.mac  // ""')
-            wn_desc=$(echo "$winrm_nic" | jq -r '.description // ""')
-            wn_if_id=$(nb_add_interface "$dev_id" "$wn_name" \
-                "1000base-t" "$wn_mac" "${wn_desc:0:200}" 2>/dev/null) || true
-            [[ -z "$wn_if_id" || ! "$wn_if_id" =~ ^[0-9]+$ ]] && continue
-            _idx_ip=0
-            local wn_ip wn_pl
-            while IFS= read -r wn_ip; do
-                [[ -z "$wn_ip" || "$wn_ip" == "null" ]] \
-                    && { (( _idx_ip++ )) || true; continue; }
-                [[ "$wn_ip" == 127.* || "$wn_ip" == 169.254.* ]] \
-                    && { (( _idx_ip++ )) || true; continue; }
-                wn_pl=$(echo "$winrm_nic" \
-                    | jq -r ".prefix_lens[$_idx_ip] // 24" 2>/dev/null || echo "24")
-                nb_add_ip "${wn_ip}/${wn_pl}" "" "$wn_if_id" >/dev/null 2>&1 || true
-                (( _idx_ip++ )) || true
-            done < <(echo "$winrm_nic" | jq -r '.ips[]?' 2>/dev/null || true)
-        done < <(echo "$host" | jq -c '.winrm_nics[]?' 2>/dev/null || true)
-
-        # Guarantee the management IP is assigned SOMEWHERE on this device so
-        # IP-first dedup (bash + Hyper-V PS1) can find it on later runs. WinRM
-        # NIC data sometimes lacks per-NIC IPs (ips:[null]), which previously
-        # left the mgmt IP unassigned -- the root cause of the SERVER01 /
-        # server01.fqdn duplicate. If the IP is not already linked to this
-        # device, attach it to the first real interface (or a mgmt0 fallback).
-        local _mre _mat _mai
-        _mre=$(nb_get "ipam/ip-addresses/?address=$(nb_urlencode "${ip}/32")&limit=1")
-        [[ $(echo "$_mre" | jq '.count // 0' 2>/dev/null) == "0" ]] && \
-            _mre=$(nb_get "ipam/ip-addresses/?address=$(nb_urlencode "$ip")&limit=1")
-        _mat=$(echo "$_mre" | jq -r '.results[0].assigned_object_type // empty' 2>/dev/null)
-        _mai=$(echo "$_mre" | jq -r '.results[0].assigned_object_id  // empty' 2>/dev/null)
-        local _owner=""
-        if [[ "$_mat" == "dcim.interface" && "$_mai" =~ ^[0-9]+$ ]]; then
-            _owner=$(nb_get "dcim/interfaces/${_mai}/" | jq -r '.device.id // empty' 2>/dev/null)
-        fi
-        if [[ "$_owner" != "$dev_id" ]]; then
-            # find an existing interface on this device, else create mgmt0
-            local _tgt_if
-            _tgt_if=$(nb_get "dcim/interfaces/?device_id=${dev_id}&limit=1" \
-                | jq -r '.results[0].id // empty' 2>/dev/null)
-            if [[ -z "$_tgt_if" || ! "$_tgt_if" =~ ^[0-9]+$ ]]; then
-                _tgt_if=$(nb_add_interface "$dev_id" "mgmt0" "other" "" \
-                    "Management (auto)" 2>/dev/null)
-            fi
-            if [[ -n "$_tgt_if" && "$_tgt_if" =~ ^[0-9]+$ ]]; then
-                nb_add_ip "$ip" "$dev_id" "$_tgt_if" >/dev/null 2>&1 || true
-            fi
-        fi
-
-        local nbr
-        while IFS= read -r nbr; do
-            local nbr_name nbr_remote_port
-            nbr_name=$(echo "$nbr" | jq -r '.sys_name // .device_id // empty')
-            # The port advertised by an LLDP/CDP neighbor (port_id/port_desc) is
-            # the NEIGHBOR's (remote) port -- NOT ours. It must terminate on the
-            # remote device. The container does not give us our own local port,
-            # so the local side is named descriptively rather than mislabeled
-            # with the remote port (which previously put e.g. laundry-sw's "g4"
-            # onto mancave-sw).
-            nbr_remote_port=$(echo "$nbr" | jq -r '.port_id // .port_desc // .remote_port // empty')
-            [[ -z "$nbr_name" ]] && continue
-            local nbr_enc nbr_dev_id
-            nbr_enc=$(nb_urlencode "$nbr_name")
-            nbr_dev_id=$(nb_get "dcim/devices/?name=${nbr_enc}" \
-                | jq -r '.results[0].id // empty' 2>/dev/null || echo "")
-            [[ -z "$nbr_dev_id" || ! "$nbr_dev_id" =~ ^[0-9]+$ ]] && continue
-            [[ "$nbr_dev_id" == "$dev_id" ]] && continue
-            local local_if_id nbr_if_id
-            # LOCAL side on THIS device: descriptive uplink (local port unknown).
-            local_if_id=$(nb_add_interface "$dev_id" \
-                "uplink-${nbr_name}" "other" "" \
-                "Topology link to $nbr_name" 2>/dev/null) || true
-            # REMOTE side on the neighbor: the advertised port is theirs.
-            nbr_if_id=$(nb_add_interface "$nbr_dev_id" \
-                "${nbr_remote_port:-to-$hn}" "other" "" \
-                "Topology link to $hn" 2>/dev/null) || true
-            [[ -z "$local_if_id" || ! "$local_if_id" =~ ^[0-9]+$ ]] && continue
-            [[ -z "$nbr_if_id"   || ! "$nbr_if_id"   =~ ^[0-9]+$ ]] && continue
-            nb_create_cable "$local_if_id" "$nbr_if_id" \
-                "$hn <-> $nbr_name" >/dev/null 2>&1 || true
-            log_info "Cable: $hn <-> $nbr_name[${nbr_remote_port:-?}]"
-        done < <({
-            echo "$host" | jq -c '.lldp_neighbors[]?' 2>/dev/null
-            echo "$host" | jq -c '.cdp_neighbors[]?'  2>/dev/null
-        } 2>/dev/null || true)
-
-        # Populate custom fields: open ports + discovery methods
-        local _ports_cf _dmethods_cf
-        _ports_cf=$(echo "$host" | jq -r \
-            '[.ports[] | .port + "/" + (.service // .proto // "tcp")] | join(", ")' \
-            2>/dev/null || echo "")
-        _dmethods_cf=$(echo "$host" | jq -r \
-            '.discovery_methods | join(", ")' 2>/dev/null || echo "")
-        if [[ -n "$_ports_cf" || -n "$_dmethods_cf" ]]; then
-            nb_patch "dcim/devices/${dev_id}/" \
-                "$(jq -n --arg p "$_ports_cf" --arg d "$_dmethods_cf" \
-                    '{custom_fields:{discovered_ports:$p,discovery_methods:$d}}')" \
-                >/dev/null 2>&1 || true
-        fi
-
-        printf "${G}OK${NC}\n"; (( ok++ ))
-
-        # Auto-run full Hyper-V PS1 sync when discovery found a WinRM
-        # host with Hyper-V available and stored credentials exist
-        local _tier _is_hv
-        _tier=$(echo "$host" | jq -r '.scan_tier // 4' 2>/dev/null || echo 4)
-        _is_hv=$(echo "$host" | jq -r '.is_hyperv // false' 2>/dev/null || echo false)
-        if [[ "$_tier" == "1" && "$_is_hv" == "true" ]]; then
-            local _wcc
-            _wcc=$(get_windows_creds_for "$ip" | jq 'length' 2>/dev/null || echo 0)
-            if [[ "${_wcc:-0}" -gt 0 ]]; then
-                log_info "Auto-running Hyper-V PS1 sync for $ip (Hyper-V detected)"
-                import_hyperv_powershell "$ip" "auto"
-            fi
-        fi
-
-    done < <(jq -c '.hosts[]' "$results_file")
-
-    printf "\n  ${G}Complete:${NC} %d synced  ${R}%d failed${NC}  (total: %d)\n" \
-        "$ok" "$fail" "$total"
-    log_info "Sync: ok=$ok fail=$fail total=$total"
-    pause
 }
 
 # -----------------------------------------------------------------------------
@@ -7402,8 +7102,8 @@ menu_discovery() {
         echo "  3) Scan Host List from File"
         echo "     (IPs and/or CIDRs; # comments; whitespace stripped)"
         echo "  4) Map Switchports (SNMP)"
-        echo "  5) View Latest Results"
-        echo "  6) Sync Last Results to NetBox"
+        echo "  5) View Results (choose file; Enter=latest)"
+        echo "  6) Sync Results to NetBox (choose file; Enter=latest)"
         echo "  7) Full Auto: Discover + Sync"
         echo "  8) Preview Reconciliation (dry-run, no NetBox writes)"
         echo "  9) Sync RECONCILED model to NetBox (single writer)"
@@ -7469,7 +7169,7 @@ menu_discovery() {
         4)  read -rp "  Switch IP: " swip
             valid_ip "$swip" && map_switchports "$swip" \
                 || printf "${R}  Invalid IP${NC}\n" ;;
-        5)  latest=$(latest_scan_file)
+        5)  latest=$(pick_results_file)
             [[ -z "$latest" ]] && { echo "  No results"; pause; continue; }
             cnt=$(jq '.hosts | length' "$latest")
             printf "\n${W}%s  (%s hosts)${NC}\n\n" "$latest" "$cnt"
@@ -7480,8 +7180,10 @@ menu_discovery() {
                     printf "  %-16s %-28s %-16s %-16s %s\n" \
                         "$i" "${h:0:27}" "${r:0:15}" "${m:0:15}" "${o:0:26}"
                   done | head -80 ;;
-        6)  latest=$(latest_scan_file); run_reconciled_sync "$latest" ;;
-        8)  latest=$(latest_scan_file)
+        6)  latest=$(pick_results_file)
+            [[ -n "$latest" ]] && run_reconciled_sync "$latest" \
+                || printf "${D}  Cancelled -- nothing synced.${NC}\n" ;;
+        8)  latest=$(pick_results_file)
             if [[ -z "$latest" ]]; then
                 printf "${Y}  No discovery results -- run a scan first${NC}\n"
             else
@@ -7490,7 +7192,7 @@ menu_discovery() {
                 printf "\n${D}  (dry-run only -- nothing written to NetBox)${NC}\n"
             fi
             pause ;;
-        9)  latest=$(latest_scan_file)
+        9)  latest=$(pick_results_file)
             if [[ -z "$latest" ]]; then
                 printf "${Y}  No discovery results -- run a scan first${NC}\n"; pause; continue
             fi
