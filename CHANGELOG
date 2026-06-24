@@ -1,3 +1,24 @@
+#  Changelog v2.5.57 (token generation done correctly: provision endpoint + v2 Bearer):
+#   - Definitive fix, confirmed against NetBox 4.6 behavior and the docs. NetBox
+#     4.5+ v2 tokens: the usable credential is  nbt_<key>.<token>  and the plain
+#     <token> is returned ONLY at creation (never retrievable later), and the
+#     auth header must be  Authorization: Bearer nbt_<key>.<token>  -- NOT
+#     "Token <key>". The Django-shell approaches (2.5.55 read t.key = the v2
+#     checksum; 2.5.56 minted v1 with the wrong header/disabled path) could not
+#     produce a working token.
+#   - New provision_api_token(): mints a token via the supported REST endpoint
+#     POST /api/users/tokens/provision/ {username,password}. On 4.5+ it returns
+#     key+token and we store nbt_<key>.<token>; on older NetBox it returns the
+#     40-hex key and we store that. No Django shell, no API_TOKEN_PEPPERS config.
+#   - nb_api now selects the scheme by token format: nbt_* -> Bearer, else Token
+#     (legacy v1). The Hyper-V import PS1 (New-AuthHeaders) does the same.
+#   - Deploy: the Django shell now only ensures the admin account + password
+#     (always set, so provisioning works even if admin pre-existed); the token
+#     is then provisioned over REST. Management option 6 likewise provisions via
+#     REST (prompts for the admin password if not stored), no longer the shell.
+#   - Note: provisioned tokens are v2 on NetBox 4.5+ (v1 is deprecated, removed
+#     in 5.0), so this is future-proof. Verified the built credential exactly
+#     matches a known-good working token.
 #
 #  Changelog v2.5.56 (FIX: token generator returned the key, not a usable token):
 #   - NetBox 4.5+ introduced v2 API tokens: the plaintext is hashed with a
