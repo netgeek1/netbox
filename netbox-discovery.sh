@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.56
+#  Version: 2.5.57
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.56"
+SCRIPT_VERSION="2.5.57"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -574,46 +574,23 @@ DCEOF
     done
     printf " ${G}HTTP %s${NC}\n" "$http_code"
 
-    # Admin user is idempotent (get_or_create); password set only on creation.
-    # API token: NetBox 4.5+ introduced v2 tokens whose plaintext is hashed with
-    # a server pepper and cannot be read back (and needs a pepper configured), so
-    # we explicitly mint a v1 token with a key we generate -- the stored value is
-    # then the actual usable bearer token. Older NetBox has no versioning and the
-    # key field is the token directly.
-    log_info "Configuring admin credentials via Django shell..."
+    # Ensure the admin account exists with the password we will use to provision
+    # an API token. The token itself is minted via the supported REST endpoint
+    # afterward (see provision_api_token) -- NetBox 4.5+ v2 token plaintext can
+    # only be obtained at creation and not via the shell.
+    log_info "Configuring admin account via Django shell..."
     local setup_py setup_result setup_tries=0
     setup_py="
 from django.contrib.auth import get_user_model
-from users.models import Token
 import sys
-
 User = get_user_model()
 u, created = User.objects.get_or_create(username='admin')
-if created:
-    u.set_password('${admin_pass}')
-    u.is_superuser = True
-    u.is_staff = True
-    u.save()
-    sys.stderr.write('Created new admin user\n')
-else:
-    sys.stderr.write('Admin user already exists\n')
-
-import secrets
-key = secrets.token_hex(20)
-# NetBox 4.5+ defaults to v2 tokens (plaintext hashed with a pepper and NOT
-# retrievable, and pepper-dependent). Create an explicit v1 token whose plain
-# hex key we control, so the stored value IS the usable bearer token. On older
-# NetBox (no token versioning) the key field is the token directly.
-field_names = {f.name for f in Token._meta.get_fields()}
-if 'version' in field_names:
-    t = Token(user=u, version=1)
-    t.token = key
-else:
-    t = Token(user=u, key=key)
-t.save()
-sys.stderr.write('Created new v1 API token\n')
-
-print('SETUP_OK:' + key)
+u.set_password('${admin_pass}')
+u.is_superuser = True
+u.is_staff = True
+u.save()
+sys.stderr.write('admin user ready (created=%s)\n' % created)
+print('SETUP_OK:admin')
 "
     until setup_result=$(cd "$NETBOX_DIR" && \
             $DOCKER_COMPOSE exec -T netbox \
@@ -630,15 +607,21 @@ PYEOF
     done
 
     if [[ "$setup_result" == SETUP_OK:* ]]; then
-        NETBOX_API_TOKEN="${setup_result#SETUP_OK:}"
-        log_ok "Credentials configured: token=${NETBOX_API_TOKEN:0:12}..."
-        save_config
-        sed -i "s|^API Token:.*|API Token: ${NETBOX_API_TOKEN}|" \
-            "$creds_out" 2>/dev/null || true
-        sed -i "s|^Password:.*|Password:  ${admin_pass}|" \
-            "$creds_out" 2>/dev/null || true
+        log_ok "Admin account ready."
+        local _tok
+        if _tok=$(provision_api_token admin "$admin_pass"); then
+            NETBOX_API_TOKEN="$_tok"
+            log_ok "API token provisioned: ${NETBOX_API_TOKEN:0:16}..."
+            save_config
+            sed -i "s|^API Token:.*|API Token: ${NETBOX_API_TOKEN}|" \
+                "$creds_out" 2>/dev/null || true
+            sed -i "s|^Password:.*|Password:  ${admin_pass}|" \
+                "$creds_out" 2>/dev/null || true
+        else
+            log_warn "Token provisioning failed -- create one in the NetBox UI (Profile -> API Tokens) or via Management -> 6."
+        fi
     else
-        log_warn "Django shell incomplete -- create token manually in NetBox UI"
+        log_warn "Admin setup via Django shell incomplete -- check the container is up."
     fi
 
     printf "\n${G}+----------------------------------------------+${NC}\n"
@@ -659,8 +642,12 @@ PYEOF
 nb_api() {
     local method="$1" endpoint="$2" data="${3:-}"
     [[ -z "$NETBOX_API_TOKEN" ]] && { log_error "API token not set"; return 1; }
+    # NetBox v2 tokens (nbt_<key>.<secret>) authenticate with the Bearer scheme;
+    # legacy v1 tokens (plain plaintext) use Token.
+    local _scheme="Token"
+    [[ "$NETBOX_API_TOKEN" == nbt_* ]] && _scheme="Bearer"
     local args=(-s -X "$method"
-        -H "Authorization: Token $NETBOX_API_TOKEN"
+        -H "Authorization: $_scheme $NETBOX_API_TOKEN"
         -H "Content-Type: application/json")
     [[ -n "$data" ]] && args+=(-d "$data")
     local url="${NETBOX_API_URL}/api/${endpoint}"
@@ -681,6 +668,34 @@ nb_api() {
     else
         curl "${args[@]}" "$url" 2>>"$LOG_FILE"
     fi
+}
+
+# Provision a usable API token via NetBox's supported REST endpoint
+# (POST /api/users/tokens/provision/) using the admin username + password.
+# No Django shell and no pepper configuration required.
+#   - NetBox 4.5+ returns {key, token, version:2}: the usable credential is
+#     nbt_<key>.<token>, sent as  Authorization: Bearer nbt_<key>.<token>.
+#   - Older NetBox returns {key} only (the 40-hex plaintext), sent as Token.
+# Echoes the full credential on stdout; non-zero on failure.
+provision_api_token() {
+    local user="${1:-admin}" pass="${2:-}" base resp key tok
+    [[ -z "$pass" ]] && { log_error "No admin password available for token provisioning"; return 2; }
+    base="${NETBOX_API_URL:-http://$(get_host_ip):${NETBOX_PORT}}"
+    resp=$(curl -s -m 20 -X POST \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        "${base}/api/users/tokens/provision/" \
+        --data "$(jq -n --arg u "$user" --arg p "$pass" '{username:$u,password:$p}')" \
+        2>>"$LOG_FILE")
+    key=$(echo "$resp" | jq -r '.key // empty' 2>/dev/null)
+    tok=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null)
+    if [[ -n "$key" && -n "$tok" ]]; then
+        printf 'nbt_%s.%s' "$key" "$tok"; return 0     # v2 (NetBox 4.5+)
+    elif [[ -n "$key" ]]; then
+        printf '%s' "$key"; return 0                    # legacy v1: key is the token
+    fi
+    printf 'token provision response: %s\n' "$resp" >> "$LOG_FILE" 2>/dev/null
+    return 1
 }
 nb_get()   { nb_api GET   "$1"; }
 nb_post()  { nb_api POST  "$1" "${2:-}"; }
@@ -4177,7 +4192,8 @@ $clusterName = "$env:COMPUTERNAME"
 $headers = $null
 function New-AuthHeaders {{
     $h = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
-    $h.Add("Authorization", "Token $token")
+    $scheme = if ($token -like 'nbt_*') {{ 'Bearer' }} else {{ 'Token' }}
+    $h.Add("Authorization", "$scheme $token")
     $h.Add("Content-Type",  "application/json")
     $h.Add("Accept",        "application/json")
     return $h
@@ -6987,7 +7003,7 @@ menu_netbox_mgmt() {
         echo "   3) Restart NetBox"
         echo "   4) View NetBox Logs (live)"
         echo "   5) Set API Token manually"
-        echo "   6) Regenerate API Token (Django shell)"
+        echo "   6) Regenerate API Token (provision via REST)"
         echo "   7) Backup Database"
         echo "   8) Restore Database"
         echo "   9) Update NetBox"
@@ -7007,39 +7023,19 @@ menu_netbox_mgmt() {
         4)  printf "${D}(Ctrl+C to exit)${NC}\n"
             cd "$NETBOX_DIR" && $DOCKER_COMPOSE logs -f --tail=50 netbox ;;
         5)  read -rp "  Token: " NETBOX_API_TOKEN; save_config ;;
-        6)  cd "$NETBOX_DIR"
-            local regen_py regen_result
-            regen_py="
-from django.contrib.auth import get_user_model
-from users.models import Token
-import secrets
-User=get_user_model()
-u=User.objects.filter(username='admin').first()
-if u is None:
-    print('NOADMIN')
-else:
-    key = secrets.token_hex(20)
-    field_names = {f.name for f in Token._meta.get_fields()}
-    if 'version' in field_names:
-        t = Token(user=u, version=1)
-        t.token = key
-    else:
-        t = Token(user=u, key=key)
-    t.save()
-    print('TOKEN:'+key)"
-            regen_result=$(cd "$NETBOX_DIR" && $DOCKER_COMPOSE exec -T netbox \
-                python manage.py shell << PYEOF 2>/dev/null | grep -E '^(TOKEN:|NOADMIN)'
-${regen_py}
-PYEOF
-            )
-            if [[ "$regen_result" == TOKEN:* ]]; then
-                NETBOX_API_TOKEN="${regen_result#TOKEN:}"; save_config
-                log_ok "New token: ${NETBOX_API_TOKEN:0:12}..."
+        6)  local _pass _tok
+            _pass="${NETBOX_ADMIN_PASS}"
+            if [[ -z "$_pass" ]]; then
+                read -rsp "  Admin password: " _pass; echo
+            fi
+            if _tok=$(provision_api_token admin "$_pass"); then
+                NETBOX_API_TOKEN="$_tok"; save_config
+                log_ok "New token provisioned: ${NETBOX_API_TOKEN:0:16}..."
                 sed -i "s|^API Token:.*|API Token: ${NETBOX_API_TOKEN}|" \
                     "$BASE_DIR/netbox-credentials.txt" 2>/dev/null || true
-            elif [[ "$regen_result" == NOADMIN ]]; then
-                log_error "No 'admin' user found in NetBox -- create it first (deploy step or NetBox UI)."
-            else log_error "Token generation failed (NetBox shell returned nothing -- is the container up?)"; fi ;;
+            else
+                log_error "Token provisioning failed -- check the admin password is correct and NetBox is up (see $LOG_FILE)."
+            fi ;;
         7)  local bk="$BASE_DIR/backup_$(date +%Y%m%d_%H%M%S).sql.gz"
             cd "$NETBOX_DIR" && $DOCKER_COMPOSE exec -T postgres \
                 pg_dump -U netbox netbox | gzip > "$bk"
