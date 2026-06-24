@@ -1,3 +1,23 @@
+#  Changelog v2.5.54 (results-file picker + dead legacy code removal):
+#   - Results-file picker: new pick_results_file() lists recent raw
+#     results_*.json (newest first, with host count) and lets you choose which
+#     to act on; Enter takes the newest, so behavior is unchanged unless you
+#     pick an older file. Wired into Network Discovery menu options 5 (view),
+#     6 (sync), 8 (preview), and 9 (sync reconciled). Fixes the case where a
+#     single-host rescan became "latest" and shadowed the full scan -- no more
+#     touch/mv dance to re-sync the full set. The post-scan auto-sync still uses
+#     the scan just produced.
+#   - Removed dead legacy code (no behavior change; all confirmed zero-caller):
+#       * sync_to_netbox() -- the 302-line legacy RAW sync, superseded by the
+#         reconciled single writer (menu 6 has called run_reconciled_sync since
+#         2.5.x); its stale "SYNC TO NETBOX" section header removed too.
+#       * nb_get_or_create_vlan() -- only the legacy raw sync used it.
+#       * discover_live_hosts() -- a thin wrapper nothing called (callers use
+#         discover_targets/_do_host_discovery).
+#       * _snmp_get() -- unused SNMP helper.
+#     import_hyperv_powershell() is retained (still used by the import menu).
+#     Net: ~330 lines lighter, 100 functions, zero orphans.
+#
 #  Changelog v2.5.53 (vendor name canonicalization + orphan cleanup):
 #   - Vendor canonicalization: new canon_vendor() maps common alias spellings to
 #     one canonical name BEFORE a manufacturer is created, so the same maker no
