@@ -1,3 +1,26 @@
+#  Changelog v2.5.58 (cred removal by index + cables fixable from a partial rescan):
+#   - Credential removal deleted by username only, so removing a Windows account
+#     wiped EVERY entry with that username across different domains/workgroups.
+#     Removals (SNMP v2c, SNMP v3, SSH, Windows) now show a numbered list -- the
+#     Windows list includes [domain]/[workgroup] -- and delete the ONE chosen
+#     entry by index. Same username in two domains is now safe.
+#   - Cables from a partial rescan: the plan only emitted a cable when the LLDP
+#     neighbor was ALSO scanned this run, so rescanning a single switch produced
+#     0 cables (its neighbor, e.g. a FortiSwitch, was not in the scan). The plan
+#     now also emits ONE-SIDED links (keyed by the neighbor name/serial, using
+#     the switch own local port like "Port  1"); the writer already resolves
+#     both ends against NetBox (nb_dev_id_by_name/serial), so the cable is built
+#     against the neighbor already in NetBox -- and on the correct port, fixing
+#     the "1" vs "Port  1" termination. If the neighbor is not in NetBox it is
+#     logged and skipped (unchanged).
+#   - Prune safety (critical with the above): stale lldp-auto cables are now
+#     pruned ONLY on devices actually discovered this run (full neighbor set
+#     known). Neighbors merely resolved in NetBox for a one-sided link are never
+#     pruned, so a single-switch rescan can no longer delete that neighbor's
+#     other cables from earlier full scans.
+#   - Note: Map Switchports (SNMP) is a read-only diagnostic report and does not
+#     write to NetBox; cabling is done by the sync (options 7/9) LLDP pass.
+#
 #  Changelog v2.5.57 (token generation done correctly: provision endpoint + v2 Bearer):
 #   - Definitive fix, confirmed against NetBox 4.6 behavior and the docs. NetBox
 #     4.5+ v2 tokens: the usable credential is  nbt_<key>.<token>  and the plain
