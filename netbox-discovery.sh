@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.52
+#  Version: 2.5.53
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.52"
+SCRIPT_VERSION="2.5.53"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -656,8 +656,56 @@ nb_get_or_create_site() {
     echo "$id"
 }
 
+# Map common vendor-name aliases to one canonical name so the same maker doesn't
+# land as several manufacturers (e.g. WinRM 'Hewlett-Packard', the OUI table's
+# 'Hewlett Packard', and 'HP' all -> 'HP'). Unknown names pass through unchanged.
+canon_vendor() {
+    local n="$1" key
+    key=$(echo "$n" | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[.,]//g; s/[[:space:]]+/ /g; s/^ +//; s/ +$//')
+    case "$key" in
+        "hewlett-packard"|"hewlett packard"|"hewlett packard company"|"hewlett packard co"|"hp inc"|"hp company"|"hp")
+            echo "HP" ;;
+        "hewlett packard enterprise"|"hpe"|"hpe networking")
+            echo "Hewlett Packard Enterprise" ;;
+        "cisco"|"cisco systems"|"cisco systems inc")
+            echo "Cisco" ;;
+        "ubiquiti"|"ubiquiti inc"|"ubiquiti networks"|"ubiquiti networks inc")
+            echo "Ubiquiti" ;;
+        "dell"|"dell inc"|"dell computer"|"dell computer corp"|"dell technologies")
+            echo "Dell" ;;
+        "intel"|"intel corp"|"intel corporate"|"intel corporation")
+            echo "Intel" ;;
+        "microsoft"|"microsoft corporation"|"microsoft corp")
+            echo "Microsoft" ;;
+        "vmware"|"vmware inc")
+            echo "VMware" ;;
+        "raspberry pi"|"raspberry pi foundation"|"raspberry pi trading"|"raspberry pi trading ltd"|"raspberry pi (trading) ltd")
+            echo "Raspberry Pi" ;;
+        "espressif"|"espressif inc"|"espressif systems"|"espressif systems (shanghai) co ltd")
+            echo "Espressif" ;;
+        "netgear"|"netgear inc")
+            echo "Netgear" ;;
+        "tp-link"|"tplink"|"tp-link technologies"|"tp-link technologies co"|"tp-link corporation limited")
+            echo "TP-Link" ;;
+        "fortinet"|"fortinet inc")
+            echo "Fortinet" ;;
+        "synology"|"synology inc"|"synology incorporated")
+            echo "Synology" ;;
+        "apple"|"apple inc")
+            echo "Apple" ;;
+        "samsung"|"samsung electronics"|"samsung electronics co"|"samsung electronics co ltd")
+            echo "Samsung" ;;
+        "")
+            echo "Unknown" ;;
+        *)
+            echo "$n" ;;
+    esac
+}
+
 nb_get_or_create_manufacturer() {
-    local name="$1" slug enc res id slug_enc
+    local name slug enc res id slug_enc
+    name=$(canon_vendor "$1")
     slug=$(slugify "$name"); enc=$(nb_urlencode "$name")
     res=$(nb_get "dcim/manufacturers/?name=${enc}")
     id=$(echo "$res" | jq -r '.results[0].id // empty' 2>/dev/null)
@@ -7161,6 +7209,57 @@ menu_disc_settings() {
 # -----------------------------------------------------------------------------
 # NETBOX MANAGEMENT MENU
 # -----------------------------------------------------------------------------
+# Remove NetBox cruft left after re-syncs: device types with no devices,
+# manufacturers with no device types, and legacy 'uplink-*' interfaces with no
+# cable and no IPs. Safe by construction -- only zero-reference objects are
+# touched, and NetBox PROTECTs anything still referenced (a 204 delete returns an
+# empty body; a protected object returns an error body, which we treat as "kept").
+cleanup_orphans() {
+    [[ -z "$NETBOX_API_TOKEN" ]] && { log_error "API token not set"; return 1; }
+    log_step "Cleaning up orphaned NetBox objects"
+    local res id name del dt_del=0 mf_del=0 if_del=0 dc dtc ipc
+
+    # 1) Device types with zero devices (delete first so their manufacturers
+    #    can then become empty).
+    res=$(nb_get "dcim/device-types/?limit=1000")
+    while IFS=$'\t' read -r id name dc; do
+        [[ -z "$id" || "$dc" != "0" ]] && continue
+        del=$(nb_delete "dcim/device-types/$id/" 2>/dev/null)
+        if [[ -z "$del" ]]; then
+            log_info "  removed empty device type: $name"; dt_del=$((dt_del+1))
+        fi
+    done < <(echo "$res" | jq -r '.results[]? | [(.id|tostring), .model, ((.device_count//0)|tostring)] | @tsv')
+
+    # 2) Manufacturers with zero device types (count queried directly, not from a
+    #    possibly-absent serializer field). NetBox protects any still referenced
+    #    by platforms / inventory items, so those simply stay.
+    res=$(nb_get "dcim/manufacturers/?limit=1000")
+    while IFS=$'\t' read -r id name; do
+        [[ -z "$id" ]] && continue
+        dtc=$(nb_get "dcim/device-types/?manufacturer_id=$id&limit=1" | jq -r '.count // 0')
+        [[ "$dtc" != "0" ]] && continue
+        del=$(nb_delete "dcim/manufacturers/$id/" 2>/dev/null)
+        if [[ -z "$del" ]]; then
+            log_info "  removed empty manufacturer: $name"; mf_del=$((mf_del+1))
+        fi
+    done < <(echo "$res" | jq -r '.results[]? | [(.id|tostring), .name] | @tsv')
+
+    # 3) Legacy 'uplink-*' interfaces (from the retired sync_to_netbox path) with
+    #    no cable and no IPs. Deliberately narrow to avoid touching real interfaces.
+    res=$(nb_get "dcim/interfaces/?name__isw=uplink-&limit=1000")
+    while IFS=$'\t' read -r id name; do
+        [[ -z "$id" ]] && continue
+        ipc=$(nb_get "ipam/ip-addresses/?interface_id=$id&limit=1" | jq -r '.count // 0')
+        [[ "$ipc" != "0" ]] && continue
+        del=$(nb_delete "dcim/interfaces/$id/" 2>/dev/null)
+        if [[ -z "$del" ]]; then
+            log_info "  removed orphan interface: $name"; if_del=$((if_del+1))
+        fi
+    done < <(echo "$res" | jq -r '.results[]? | select(.cable==null) | [(.id|tostring), .name] | @tsv')
+
+    log_ok "Cleanup: removed $dt_del device type(s), $mf_del manufacturer(s), $if_del interface(s)."
+}
+
 menu_netbox_mgmt() {
     while true; do
         banner
@@ -7185,6 +7284,7 @@ menu_netbox_mgmt() {
         echo "   9) Update NetBox"
         echo "  10) Show Container Status"
         echo "  11) Enable Auto-Start on Boot (systemd)"
+        echo "  12) Clean Up Orphaned Objects (empty mfrs/types, uplink-* ifaces)"
         echo "   0) Back"
         read -rp $'\nChoice: ' c
         case "$c" in
@@ -7237,6 +7337,8 @@ PYEOF
             log_ok "Update complete" ;;
         10) cd "$NETBOX_DIR" && $DOCKER_COMPOSE ps ;;
         11) detect_docker_compose; setup_netbox_autostart ;;
+        12) printf "  ${D}Removes only zero-reference objects; protected ones are kept.${NC}\n"
+            confirm "  Run orphan cleanup now?" && cleanup_orphans ;;
         0)  return ;;
         esac
         pause
