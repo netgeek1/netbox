@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.57
+#  Version: 2.5.58
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.57"
+SCRIPT_VERSION="2.5.58"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -5940,14 +5940,23 @@ def build(reconciled):
         return bool(p) and re.search(r'\d{5,}', p) is None
 
     pair = {}
+    unpaired = []  # neighbor not scanned this run -> writer resolves it vs NetBox
     for d in devices:
         a = d['name']
         for l in d.get('lldp_links', []):
-            b = _resolve(l['neighbor'])
-            if not b or b == a:
-                continue
-            pair.setdefault(frozenset((a, b)), {}).setdefault(a, []).append(
-                (l['local_port'], l.get('remote_port') or ''))
+            nb = (l.get('neighbor') or '').strip()
+            b = _resolve(nb)
+            if b and b != a:
+                pair.setdefault(frozenset((a, b)), {}).setdefault(a, []).append(
+                    (l['local_port'], l.get('remote_port') or ''))
+            elif not b and len(nb) >= 3 and _n(nb) != _n(a):
+                # Neighbor wasn't in THIS scan. Emit a one-sided cable keyed by the
+                # neighbor's advertised name/serial, using this device's OWN local
+                # port. The writer resolves the neighbor against devices already in
+                # NetBox (nb_dev_id_by_name/serial), so a partial rescan of just one
+                # switch still creates/corrects its cables -- and on its real port
+                # name (e.g. 'Port  1', not the peer's abbreviated '1').
+                unpaired.append((a, l['local_port'], nb, l.get('remote_port') or ''))
 
     cables = []
     seen = set()
@@ -5982,6 +5991,15 @@ def build(reconciled):
                     if ck not in seen:
                         seen.add(ck)
                         cables.append({'a_dev': sd, 'a_port': lp, 'b_dev': od, 'b_port': bp})
+
+    # One-sided links to neighbors not scanned this run (resolved vs NetBox by
+    # the writer). Deduped against the paired cables above.
+    for a, lp, nb, rp in unpaired:
+        bp = rp or 'lldp'
+        ck = frozenset(((a, lp), (nb, bp)))
+        if ck not in seen:
+            seen.add(ck)
+            cables.append({'a_dev': a, 'a_port': lp, 'b_dev': nb, 'b_port': bp})
 
     return {'site': site, 'clusters': sorted(c for c in clusters if c), 'devices': devices,
             'vms': vms, 'max_disks': max_disks, 'cables': cables}
@@ -6088,6 +6106,10 @@ PLANEOF
     done
 
     local dcount=0 vcount=0 d v
+    # Devices actually discovered THIS run -- only these may have their lldp-auto
+    # cables pruned (we know their full neighbor set). Neighbors resolved against
+    # NetBox for one-sided links are NOT in here, so their other cables are safe.
+    declare -A SCANNED_DEV_IDS=()
     while IFS= read -r d; do
         local name role mfr model serial pip pip_bare dev_id mgmt
         name=$(jq -r '.name' <<<"$d");      role=$(jq -r '.role' <<<"$d")
@@ -6101,6 +6123,7 @@ PLANEOF
         if [[ -z "$dev_id" || ! "$dev_id" =~ ^[0-9]+$ ]]; then
             log_warn "device upsert failed: $name"; continue
         fi
+        SCANNED_DEV_IDS[$dev_id]=1
         # Link the host Device to its Cluster -- nb_upsert_device doesn't set the
         # device.cluster FK, so a Hyper-V host otherwise shows no cluster. The
         # cluster name (== the host's own hostname) was created in CLU above.
@@ -6207,11 +6230,14 @@ PLANEOF
         nb_reconcile_cable "$aif" "$bif" "lldp-auto: $a_dev:$a_port <-> $b_dev:$b_port" \
             && { ccreated=$((ccreated+1)); log_info "  cable: $a_dev:$a_port <-> $b_dev:$b_port"; }
     done < <(jq -c '.cables[]?' "$plan")
-    # prune stale lldp-auto cables on every device we touched
+    # prune stale lldp-auto cables ONLY on devices we discovered this run -- never
+    # on neighbors we merely resolved in NetBox (we don't know their full neighbor
+    # set, so pruning them could delete unrelated cables from other scans).
     local kdev
     if [[ ${#CABLE_KEEP[@]} -gt 0 ]]; then
         for kdev in "${!CABLE_KEEP[@]}"; do
-            nb_prune_lldp_cables "$kdev" "${CABLE_KEEP[$kdev]}"
+            [[ -n "${SCANNED_DEV_IDS[$kdev]:-}" ]] \
+                && nb_prune_lldp_cables "$kdev" "${CABLE_KEEP[$kdev]}"
         done
     fi
     [[ "$ccreated" -gt 0 ]] && log_ok "LLDP cables created/replaced: $ccreated"
@@ -6740,6 +6766,18 @@ test_credentials_against_ip() {
 }
 
 menu_credentials() {
+    # Show a numbered credential list (on stderr) and read a 1-based choice.
+    # Echoes the chosen 0-based index on stdout; rc=1 on cancel/none/invalid.
+    # Lets removals target ONE specific entry (e.g. same username in different
+    # domains) instead of deleting every match by username.
+    cred_pick() {
+        local prompt="$1" lines="$2" n
+        if [[ -z "$lines" ]]; then printf "${Y}  (none stored)${NC}\n" >&2; return 1; fi
+        { printf "\n  %s\n%s\n" "$prompt" "$lines"; } >&2
+        read -rp "  Remove # (0=cancel): " n
+        [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 )) || return 1
+        printf '%s' "$((n-1))"
+    }
     while true; do
         banner
         printf "${C}======= Credential Management =======${NC}\n\n"
@@ -6787,9 +6825,12 @@ menu_credentials() {
             local s1ip
             read -rp "  Test against IP (blank to skip): " s1ip
             [[ -n "$s1ip" ]] && cred_test_report "$x" snmp "$s1ip" "$x" ;;
-        2)  read -rp "  Remove: " x
-            write_creds "$(echo "$creds" \
-                | jq "del(.snmp_communities[] | select(.==\"$x\"))")" ;;
+        2)  local _l _i
+            _l=$(echo "$creds" | jq -r '.snmp_communities // [] | to_entries[] | "   \(.key+1)) \(.value)"')
+            if _i=$(cred_pick "SNMP v2c communities:" "$_l"); then
+                write_creds "$(echo "$creds" | jq "del(.snmp_communities[$_i])")"
+                log_info "Removed SNMP v2c community #$((_i+1))"
+            fi ;;
         3)  read -rp "  Username: " u
             read -rp "  Auth proto [SHA]: " ap; ap=${ap:-SHA}
             read -rsp "  Auth pass: " ap2; echo
@@ -6802,12 +6843,12 @@ menu_credentials() {
             local s3ip
             read -rp "  Test against IP (blank to skip): " s3ip
             [[ -n "$s3ip" ]] && cred_test_report "$u" snmpv3 "$s3ip" "$u" "$ap" "$ap2" "$pp" "$pp2" ;;
-        4)  read -rp "  Remove SNMP v3 username (exact): " v3u
-            if [[ -n "$v3u" ]]; then
-                write_creds "$(echo "$creds" \
-                    | jq "del(.snmp_v3[] | select(.username==\"$v3u\"))")"
-                log_info "Removed SNMP v3 account: $v3u"
-            else printf "${R}  No username entered${NC}\n"; fi ;;
+        4)  local _l _i
+            _l=$(echo "$creds" | jq -r '.snmp_v3 // [] | to_entries[] | "   \(.key+1)) \(.value.username) [\(.value.auth_proto // "?")/\(.value.priv_proto // "?")]"')
+            if _i=$(cred_pick "SNMP v3 accounts:" "$_l"); then
+                write_creds "$(echo "$creds" | jq "del(.snmp_v3[$_i])")"
+                log_info "Removed SNMP v3 account #$((_i+1))"
+            fi ;;
         5)  read -rp "  Username: " u
             read -rsp "  Password (blank=key): " p; echo
             read -rp "  Key file (blank=password): " k
@@ -6822,9 +6863,12 @@ menu_credentials() {
             if [[ -n "$stip" ]]; then
                 cred_test_report "$u" ssh "$stip" "$u" "$p" "$k"
             fi ;;
-        6)  read -rp "  Remove username: " u
-            write_creds "$(echo "$creds" \
-                | jq "del(.ssh_credentials[] | select(.username==\"$u\"))")" ;;
+        6)  local _l _i
+            _l=$(echo "$creds" | jq -r '.ssh_credentials // [] | to_entries[] | "   \(.key+1)) \(.value.username)\(if .value.key_file then " (key: "+.value.key_file+")" elif .value.password then " (password)" else "" end)"')
+            if _i=$(cred_pick "SSH credentials:" "$_l"); then
+                write_creds "$(echo "$creds" | jq "del(.ssh_credentials[$_i])")"
+                log_info "Removed SSH credential #$((_i+1))"
+            fi ;;
         7)  local wtype wdomain wuser wpass wine
             printf "  1) Workgroup / local  2) Domain\n"
             read -rp "  Type [1]: " wtype; wtype="${wtype:-1}"
@@ -6841,10 +6885,12 @@ menu_credentials() {
             if [[ -n "$wtip" ]]; then
                 cred_test_report "${wdomain:+$wdomain\\}$wuser" winrm "$wtip" "$wuser" "$wpass" "$wdomain"
             fi ;;
-        8)  read -rp "  Remove username (exact): " wuser
-            write_creds "$(echo "$creds" \
-                | jq "del(.windows_credentials[] | select(.username==\"$wuser\"))")"
-            log_info "Removed Windows credential: $wuser" ;;
+        8)  local _l _i
+            _l=$(echo "$creds" | jq -r '.windows_credentials // [] | to_entries[] | "   \(.key+1)) [\(.value.domain // "" | if .=="" then "workgroup" else . end)] \(.value.username)"')
+            if _i=$(cred_pick "Windows credentials:" "$_l"); then
+                write_creds "$(echo "$creds" | jq "del(.windows_credentials[$_i])")"
+                log_info "Removed Windows credential #$((_i+1))"
+            fi ;;
         9)  read -rp "  Device IP: " dip
             read -rp "  SNMP community: " dc
             read -rp "  SSH username: " du
