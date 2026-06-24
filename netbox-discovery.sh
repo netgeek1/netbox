@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.58
+#  Version: 2.5.59
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.58"
+SCRIPT_VERSION="2.5.59"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -5384,7 +5384,8 @@ def collector_to_host(c):
         nics.append({'name': n.get('Name', 'eth'),
                      'description': n.get('Description', ''),
                      'mac': mac,
-                     'ips': [i for i in (n.get('IPAddresses') or []) if i]})
+                     'ips': [i for i in (n.get('IPAddresses') or []) if i],
+                     'prefix_lens': [p for p in (n.get('PrefixLens') or []) if p is not None]})
     disks = [{'size_gb': d.get('SizeGB'), 'media': d.get('Media'),
               'interface': d.get('Interface')}
              for d in (H.get('PhysicalDisks') or [])]
@@ -6365,15 +6366,21 @@ $os   = Get-CimInstance Win32_OperatingSystem 2>$null
 $bios = Get-CimInstance Win32_BIOS            2>$null
 $bb   = Get-CimInstance Win32_BaseBoard       2>$null
 $cpu  = Get-CimInstance Win32_Processor 2>$null | Select-Object -First 1
-$nics = Get-NetAdapter -Physical 2>$null | Where-Object { $_.Status -eq "Up" } |
+$nics = Get-NetAdapter 2>$null | Where-Object { $_.Status -eq "Up" } |
         ForEach-Object {
             $if = $_
             $v4 = Get-NetIPAddress -InterfaceIndex $if.ifIndex 2>$null |
-                  Where-Object { $_.AddressFamily -eq "IPv4" -and $_.IPAddress -ne "127.0.0.1" }
-            [ordered]@{ Name=$if.Name; Description=$if.InterfaceDescription;
-                        MacAddress=($if.MacAddress -replace "-",":").ToUpper();
-                        IPAddresses=@(@($v4.IPAddress) | Where-Object { $_ });
-                        PrefixLens=@(@($v4.PrefixLength) | Where-Object { $null -ne $_ }) }
+                  Where-Object { $_.AddressFamily -eq "IPv4" -and $_.IPAddress -ne "127.0.0.1" -and $_.IPAddress -notlike "169.254.*" }
+            # Keep physical NICs (inventory) AND any adapter that holds an IPv4.
+            # On a Hyper-V host the management IP lives on a vEthernet (vSwitch)
+            # virtual adapter while the physical NIC bound to the switch has none,
+            # so -Physical alone dropped every vEthernet (and its IP).
+            if ($if.HardwareInterface -or @($v4).Count -gt 0) {
+                [ordered]@{ Name=$if.Name; Description=$if.InterfaceDescription;
+                            MacAddress=($if.MacAddress -replace "-",":").ToUpper();
+                            IPAddresses=@(@($v4.IPAddress) | Where-Object { $_ });
+                            PrefixLens=@(@($v4.PrefixLength) | Where-Object { $null -ne $_ }) }
+            }
         }
 # Host-level IPv4s across ALL adapters (incl. Hyper-V vEthernet, where the
 # management IP usually lives) -- the physical NIC alone often has none.
@@ -6470,7 +6477,7 @@ if ($isHyperV) {
 
 # ---- Merge + emit (single JSON; no NetBox, no WinRM) ----
 $payload = [ordered]@{
-    CollectorVersion = "1.2"
+    CollectorVersion = "1.3"
     CollectedAt      = (Get-Date).ToString("o")
     Host             = $hostObj
     HyperVVMs        = @($hvVMs)
