@@ -1,3 +1,17 @@
+#  Changelog v2.5.55 (FIX: API token generator -- wrong user model on NetBox 4.x):
+#   - Root cause the token generator never worked: both the deploy-time setup
+#     and Management option 6 imported "from django.contrib.auth.models import
+#     User". NetBox 4.0+ uses a CUSTOM user model (users.User) as
+#     AUTH_USER_MODEL, so the admin account lives in that table -- the legacy
+#     auth_user model is empty. User.objects.get("admin") therefore found
+#     nothing and Token.objects.create(user=u) could not attach, so the deploy
+#     loop timed out and the menu reported "Token generation failed".
+#   - Fix: both shells now use django.contrib.auth.get_user_model(), which
+#     returns the model NetBox actually uses (correct on 3.x and 4.x).
+#   - Management option 6 also now distinguishes "no admin user" (NOADMIN) from
+#     "container/shell returned nothing" so the failure message is actionable
+#     instead of a generic "failed".
+#
 #  Changelog v2.5.54 (results-file picker + dead legacy code removal):
 #   - Results-file picker: new pick_results_file() lists recent raw
 #     results_*.json (newest first, with host count) and lets you choose which
