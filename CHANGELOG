@@ -1,3 +1,23 @@
+#  Changelog v2.5.59 (FIX: standalone collector dropped all Hyper-V vEthernet NICs):
+#   - netbox-collector.ps1 enumerated NICs with Get-NetAdapter -PHYSICAL, so on a
+#     Hyper-V host it returned ONLY the physical NIC (which is bound to a vSwitch
+#     and has no IP) and dropped every vEthernet (vSwitch) adapter -- where the
+#     real IPs live. Net result on import: ~1 interface, the host primary IP
+#     stranded onto a fallback/mgmt interface. (Ground truth: OFFICE-HP has 1
+#     physical + 6 vEthernet adapters; the collector reported just "Ethernet"
+#     with no IPs.) This is the same -Physical bug fixed in the inline WinRM
+#     collector back in 2.5.42, never mirrored into the standalone collector.
+#   - Fix: collector now enumerates ALL Up adapters and keeps physical NICs OR
+#     any adapter carrying an IPv4 (169.254 excluded), matching the inline path.
+#     All vEthernet adapters and their IPs are now reported.
+#   - Also: the collector-JSON ingest dropped PrefixLens, so vSwitch subnet masks
+#     were guessed; it now carries prefix_lens through to the plan, so each IP
+#     gets its real prefix (e.g. /24 on vEthernet (External), /20, /16 on the
+#     NAT switches). CollectorVersion -> 1.3.
+#   - Effect for OFFICE-HP: import now creates 7 interfaces with 6 IPs on their
+#     real adapters, 192.168.0.162/24 on vEthernet (External) as primary, instead
+#     of 1-2 with the IP parked on mgmt.
+#
 #  Changelog v2.5.58 (cred removal by index + cables fixable from a partial rescan):
 #   - Credential removal deleted by username only, so removing a Windows account
 #     wiped EVERY entry with that username across different domains/workgroups.
