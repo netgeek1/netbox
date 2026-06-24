@@ -1,3 +1,22 @@
+#  Changelog v2.5.53 (vendor name canonicalization + orphan cleanup):
+#   - Vendor canonicalization: new canon_vendor() maps common alias spellings to
+#     one canonical name BEFORE a manufacturer is created, so the same maker no
+#     longer lands as several manufacturers. e.g. WinRM "Hewlett-Packard", the
+#     OUI table's "Hewlett Packard", and "HP" all -> "HP" (HPE kept distinct).
+#     Covers HP, Cisco, Ubiquiti, Dell, Intel, Microsoft, VMware, Raspberry Pi,
+#     Espressif, Netgear, TP-Link, Fortinet, Synology, Apple, Samsung; unknown
+#     names pass through unchanged. Applied at the single choke point
+#     (nb_get_or_create_manufacturer), so it covers WinRM/OID/OUI/keyword.
+#   - Orphan cleanup: new cleanup_orphans() + NetBox Management option 12 removes
+#     device types with 0 devices, manufacturers with 0 device types, and legacy
+#     uplink-* interfaces with no cable and no IPs. Safe by construction: only
+#     zero-reference objects are deleted, NetBox PROTECT keeps anything still
+#     referenced (an empty 204 body = removed; an error body = kept), and the
+#     interface sweep is deliberately narrowed to the uplink-* legacy pattern.
+#   - Together: canonicalization stops new duplicate manufacturers forming;
+#     cleanup clears the existing HP/Hewlett-Packard/HP-Unknown cruft (run it
+#     once after re-syncing on this version).
+#
 #  Changelog v2.5.52 (fix arithmetic crash in HTTP-trace summary on clean sync):
 #   - "syntax error in expression (error token is 0)" at the END of a sync: the
 #     trace summary used `grep -c ... || echo 0`, but grep -c already prints 0 on
