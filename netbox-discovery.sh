@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.54
+#  Version: 2.5.55
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.54"
+SCRIPT_VERSION="2.5.55"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -582,10 +582,11 @@ DCEOF
     log_info "Configuring admin credentials via Django shell..."
     local setup_py setup_result setup_tries=0
     setup_py="
-from django.contrib.auth.models import User
+from django.contrib.auth import get_user_model
 from users.models import Token
 import sys
 
+User = get_user_model()
 u, created = User.objects.get_or_create(username='admin')
 if created:
     u.set_password('${admin_pass}')
@@ -7001,13 +7002,17 @@ menu_netbox_mgmt() {
         6)  cd "$NETBOX_DIR"
             local regen_py regen_result
             regen_py="
+from django.contrib.auth import get_user_model
 from users.models import Token
-from django.contrib.auth.models import User
-u=User.objects.get(username='admin')
-t=Token.objects.create(user=u)
-print('TOKEN:'+str(t.key))"
+User=get_user_model()
+u=User.objects.filter(username='admin').first()
+if u is None:
+    print('NOADMIN')
+else:
+    t=Token.objects.create(user=u)
+    print('TOKEN:'+str(t.key))"
             regen_result=$(cd "$NETBOX_DIR" && $DOCKER_COMPOSE exec -T netbox \
-                python manage.py shell << PYEOF 2>/dev/null | grep '^TOKEN:'
+                python manage.py shell << PYEOF 2>/dev/null | grep -E '^(TOKEN:|NOADMIN)'
 ${regen_py}
 PYEOF
             )
@@ -7016,7 +7021,9 @@ PYEOF
                 log_ok "New token: ${NETBOX_API_TOKEN:0:12}..."
                 sed -i "s|^API Token:.*|API Token: ${NETBOX_API_TOKEN}|" \
                     "$BASE_DIR/netbox-credentials.txt" 2>/dev/null || true
-            else log_error "Token generation failed"; fi ;;
+            elif [[ "$regen_result" == NOADMIN ]]; then
+                log_error "No 'admin' user found in NetBox -- create it first (deploy step or NetBox UI)."
+            else log_error "Token generation failed (NetBox shell returned nothing -- is the container up?)"; fi ;;
         7)  local bk="$BASE_DIR/backup_$(date +%Y%m%d_%H%M%S).sql.gz"
             cd "$NETBOX_DIR" && $DOCKER_COMPOSE exec -T postgres \
                 pg_dump -U netbox netbox | gzip > "$bk"
