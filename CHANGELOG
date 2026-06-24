@@ -1,3 +1,21 @@
+#
+#  Changelog v2.5.56 (FIX: token generator returned the key, not a usable token):
+#   - NetBox 4.5+ introduced v2 API tokens: the plaintext is hashed with a
+#     server-side pepper and is NEVER stored/retrievable, and creating one
+#     requires a pepper to be configured. So Token.objects.create()+t.key gave
+#     back the stored checksum (the "key"), not a usable bearer token -- and on
+#     a default deploy (no pepper) a v2 token would not create cleanly at all.
+#   - Fix: both the deploy-time setup and Management option 6 now mint an
+#     explicit v1 token with a 40-hex key we generate (secrets.token_hex(20)),
+#     setting it via the v1 token attribute when the model is versioned
+#     (NetBox 4.5+) and via key= on older NetBox. The value stored in config IS
+#     the actual usable token. Detection is by Token model fields, so it works
+#     across NetBox 3.x/4.x without assuming a version.
+#   - Note: v1 tokens are deprecated upstream (v2 plaintext cannot be captured
+#     non-interactively without a pepper); v1 remains the reliable choice for
+#     unattended automation. Replace any previously-stored bad token via
+#     Management option 6, and prune stale tokens in the NetBox UI.
+#
 #  Changelog v2.5.55 (FIX: API token generator -- wrong user model on NetBox 4.x):
 #   - Root cause the token generator never worked: both the deploy-time setup
 #     and Management option 6 imported "from django.contrib.auth.models import
