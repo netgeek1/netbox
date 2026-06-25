@@ -1,3 +1,19 @@
+#  Changelog v2.5.60 (collector picks primary IP from the default gateway):
+#   - Standalone collector primary-IP selection was positional: the importer
+#     used the first address in IPv4Addresses, which on a Hyper-V host is often a
+#     vSwitch NAT gateway (e.g. 172.26.x) rather than the LAN management IP.
+#   - netbox-collector.ps1 now resolves the default route (0.0.0.0/0, lowest
+#     RouteMetric) and reports the IPv4 on that gateway-bearing adapter as
+#     PrimaryIP -- that adapter is the management interface by definition.
+#     CollectorVersion stays 1.3 (additive field).
+#   - Ingest: new_host() prefers PrimaryIP over IPv4Addresses[0]; apply_identity()
+#     also adopts it for a matched host, so even when the scan reached the host on
+#     an internal/NAT address the NetBox primary becomes the real management IP.
+#     Only affects standalone-collector imports (the WinRM path keeps the scan
+#     IP); falls back to prior behavior when no default route is found.
+#   - For OFFICE-HP this selects 192.168.0.162 (default GW 192.168.0.253 on
+#     vEthernet (External)) instead of 172.26.128.1.
+#
 #  Changelog v2.5.59 (FIX: standalone collector dropped all Hyper-V vEthernet NICs):
 #   - netbox-collector.ps1 enumerated NICs with Get-NetAdapter -PHYSICAL, so on a
 #     Hyper-V host it returned ONLY the physical NIC (which is bound to a vSwitch
