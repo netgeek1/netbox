@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.60
+#  Version: 2.5.61
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.60"
+SCRIPT_VERSION="2.5.61"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -6350,6 +6350,11 @@ generate_collector_script() {
     # collection logic as the WinRM PS_BASE/PS_HYPERV probes, so output is
     # identical whether gathered over WinRM or run by hand on a closed host.
     local dest="${1:-$DISCOVERY_DIR/netbox-collector.ps1}"
+    # If the caller passed a directory (existing, or a trailing-slash path), write
+    # the default filename inside it rather than trying to overwrite the directory.
+    if [[ -d "$dest" || "$dest" == */ ]]; then
+        dest="${dest%/}/netbox-collector.ps1"
+    fi
     mkdir -p "$(dirname "$dest")" 2>/dev/null
     cat > "$dest" <<'COLLECTEOF'
 <#
@@ -6510,9 +6515,10 @@ $payload = [ordered]@{
 $json = $payload | ConvertTo-Json -Depth 8
 if (-not $OutFile) {
     $base = "netbox-collect-$($cs.Name).json"
-    $desk = [Environment]::GetFolderPath("Desktop")
-    if ($desk -and (Test-Path $desk)) { $OutFile = Join-Path $desk $base }
-    else { $OutFile = Join-Path $env:TEMP $base }
+    # Default to the current working directory (where the script was invoked),
+    # not the user's Desktop.
+    $cwd = (Get-Location).Path
+    if ($cwd) { $OutFile = Join-Path $cwd $base } else { $OutFile = $base }
 }
 # Write UTF-8 WITHOUT BOM (Out-File -Encoding UTF8 emits a BOM that breaks
 # strict JSON parsers).
