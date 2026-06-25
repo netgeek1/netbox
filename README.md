@@ -4,9 +4,10 @@ A single Bash script that deploys NetBox, discovers a network using many
 protocols, and keeps NetBox populated with devices, VMs, IPs, MACs, interfaces,
 clusters, and cabling — automatically and idempotently.
 
-> **Version:** 2.5.51 · **Platform:** Ubuntu 24.04 · **License:** see [License](#license)
+> **Version:** 2.5.61 · **Platform:** Ubuntu 24.04 · **License:** see [License](#license)
 >
-> The authoritative, per-version history lives in CHANGELOG.
+> The authoritative, per-version history lives in the changelog block at the top
+> of `netbox-discovery.sh`; a generated copy is in [`CHANGELOG.md`](CHANGELOG.md).
 > This README describes current behavior.
 
 ---
@@ -22,12 +23,14 @@ clusters, and cabling — automatically and idempotently.
 - [Configuration](#configuration)
 - [How it works (architecture)](#how-it-works-architecture)
 - [What gets created in NetBox](#what-gets-created-in-netbox)
+- [Standalone collector (agent mode)](#standalone-collector-agent-mode)
 - [Non-interactive / scheduled scans](#non-interactive--scheduled-scans)
 - [Auto-start on boot](#auto-start-on-boot)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
 - [File & directory layout](#file--directory-layout)
 - [Security notes](#security-notes)
+- [Changelog](#changelog)
 - [License](#license)
 
 ---
@@ -82,8 +85,9 @@ First-run flow from the menu:
 
 1. **8) Quick Setup** — installs dependencies and deploys NetBox in one step
    (or run **1** then **2** separately).
-2. Open NetBox at `http://<host-ip>:8000`, confirm it's up. The script captures
-   an API token automatically; you can re-set it under **6) NetBox Management**.
+2. Open NetBox at `http://<host-ip>:8000`, confirm it's up. The script
+   provisions an API token automatically (via NetBox's `tokens/provision`
+   endpoint); you can re-provision it under **6) NetBox Management**.
 3. **4) Manage Credentials** — add SNMP / SSH / WinRM credentials and test them.
 4. **5) Run Network Discovery** — scan one or more subnets.
 5. Review the dry-run, then confirm the sync to NetBox.
@@ -105,12 +109,19 @@ First-run flow from the menu:
 0  Exit
 ```
 
+- **Run Network Discovery** — scan, view, preview, and sync. The view/sync
+  actions (View Results, Sync, Preview Reconciliation, Sync RECONCILED model)
+  let you **pick which `results_*.json` to act on** when more than one exists;
+  pressing Enter takes the newest, so a one-off rescan of a single host doesn't
+  silently shadow your full scan.
 - **Discovery Settings** — scan/SNMP/SSH timeouts, parallel threads, default
   site, NetBox port, Debug Mode, **Cred Test Stop-on-Pass**, and cron scheduling.
-- **NetBox Management** — container status/lifecycle, API token, and
-  **Enable Auto-Start on Boot**.
-- **Import / Agent Deployment** — Hyper-V import and NetBox Agent push to Linux
-  hosts.
+- **NetBox Management** — container status/lifecycle, **Regenerate API Token**
+  (provisions a fresh token over REST), **Enable Auto-Start on Boot**, and
+  **Clean Up Orphaned Objects** (removes empty device types/manufacturers and
+  legacy `uplink-*` interfaces).
+- **Import / Agent Deployment** — Hyper-V import, ingest of a `netbox-collector`
+  JSON, and NetBox Agent push to Linux hosts.
 
 ---
 
@@ -138,6 +149,10 @@ separate from the main config. Manage them under **4) Manage Credentials**:
 
 When you add an SNMP community, SNMP v3 account, SSH, or Windows credential, you
 are offered an **inline test** against an IP (leave blank to skip).
+
+Removals show a **numbered list** and delete the one entry you pick — the Windows
+list shows each account's `[domain]`/`[workgroup]`, so the same username in two
+domains is removed individually rather than all at once.
 
 ---
 
@@ -239,6 +254,41 @@ A few design points explain most of the behavior:
 
 ---
 
+## Standalone collector (agent mode)
+
+For Windows hosts the suite can collect inventory two ways, which gather the
+**same data**:
+
+- **WinRM (inline)** — during a scan, the tool connects to the host over WinRM
+  and runs the collection PowerShell remotely. Needs WinRM reachable + working
+  credentials.
+- **`netbox-collector.ps1` (standalone)** — a read-only script you run **on** the
+  host. It needs no WinRM and no NetBox connectivity; it writes one JSON file the
+  suite ingests via **Import / Agent Deployment**. Useful for hosts the scanner
+  can't reach over WinRM.
+
+Generate the script from the suite (Import / Agent menu), then run it on the
+target:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\netbox-collector.ps1
+# writes netbox-collect-<hostname>.json in the current directory
+# (override with -OutFile C:\path\out.json)
+```
+
+It collects host identity (make/model/serial/OS), CPU/memory, physical disks,
+**all Up network adapters** — including Hyper-V `vEthernet` (vSwitch) adapters and
+their IPs — Hyper-V VM inventory, and the host's neighbor (ARP) table. The
+**primary IP** is taken from the adapter that owns the default route (the
+management interface), so a Hyper-V host isn't mis-tagged with an internal vSwitch
+NAT address. Copy the resulting JSON back to the suite host and ingest it from the
+Import menu.
+
+When generating the script, you can pass a directory and it will write
+`netbox-collector.ps1` inside it (the default filename).
+
+---
+
 ## Non-interactive / scheduled scans
 
 ```bash
@@ -278,6 +328,15 @@ deployment, enable it once from **NetBox Management → Enable Auto-Start on Boo
   SNMP/SSH/HTTP/WinRM JSON, OS fingerprints) is kept for inspection.
 - **A host came in wrong (e.g. "Microsoft"/no VMs)** — almost always a failed
   WinRM/SNMP credential on that run; fix the credential, re-scan, and re-sync.
+- **API token rejected** — re-provision it via *NetBox Management → Regenerate
+  API Token*. NetBox 4.5+ issues v2 tokens (`nbt_<key>.<token>`, sent as
+  `Authorization: Bearer`); the suite selects the scheme automatically.
+- **A cable is missing or on the wrong port** — cabling is built from LLDP during
+  a sync; both ends must exist. A neighbor already in NetBox is resolved by
+  name/serial, so rescanning one switch can fix its cable, but the neighbor must
+  be present (scanned previously or now).
+- **Duplicate manufacturers / empty device types** — run *NetBox Management →
+  Clean Up Orphaned Objects* once after a re-sync.
 
 ---
 
@@ -315,6 +374,14 @@ deployment, enable it once from **NetBox Management → Enable Auto-Start on Boo
 - This tool **scans networks and stores infrastructure credentials** — run it
   only against networks you are authorized to scan, and protect the host it runs
   on accordingly.
+
+---
+
+## Changelog
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the full per-version history (generated
+from the changelog block at the top of `netbox-discovery.sh`, which is the
+authoritative source).
 
 ---
 
