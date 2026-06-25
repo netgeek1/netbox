@@ -1,3 +1,14 @@
+#  Changelog v2.5.61 (collector generation/output path fixes):
+#   - Generating netbox-collector.ps1 with a DIRECTORY as the path argument tried
+#     to write over the directory (cat > dir), failing/clobbering perms. If the
+#     argument is an existing directory or ends with "/", the generator now
+#     writes <dir>/netbox-collector.ps1 (default filename) inside it. Explicit
+#     file paths are unchanged.
+#   - When run on the target, the collector defaulted its output to the user's
+#     Desktop (then TEMP). It now defaults to the CURRENT working directory
+#     (Get-Location), i.e. netbox-collect-<host>.json in the folder it was run
+#     from. An explicit -OutFile still overrides.
+#
 #  Changelog v2.5.60 (collector picks primary IP from the default gateway):
 #   - Standalone collector primary-IP selection was positional: the importer
 #     used the first address in IPv4Addresses, which on a Hyper-V host is often a
