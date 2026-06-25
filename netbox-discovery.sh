@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.59
+#  Version: 2.5.60
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +9,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.59"
+SCRIPT_VERSION="2.5.60"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -5410,6 +5410,7 @@ def collector_to_host(c):
         'neighbor_table': neigh,
         'arp_table': arp,
         'ipv4_addresses': ipv4,
+        'primary_ip': (H.get('PrimaryIP') or '').strip(),
         'nic_macs': nic_macs,
     }
 
@@ -5454,6 +5455,12 @@ def apply_identity(h, rec):
         if rec.get(k) and str(rec[k]).strip():
             h[k] = rec[k]
     h['is_hyperv'] = rec['is_hyperv']
+    # The gateway-bearing adapter is the management interface, so prefer its IP as
+    # the primary -- even if the scan reached this host on an internal/NAT address
+    # (common on Hyper-V hosts reached over a vSwitch). Only set when the collector
+    # actually found a default-route IP.
+    if rec.get('primary_ip'):
+        h['ip'] = rec['primary_ip']
     h['winrm_nics'] = rec['winrm_nics']
     h['hardware'] = rec['hardware']
     h['hyperv_vms'] = rec['hyperv_vms']
@@ -5481,7 +5488,9 @@ def apply_identity(h, rec):
 
 
 def new_host(rec):
-    ip = rec['ipv4_addresses'][0] if rec['ipv4_addresses'] else None
+    # Prefer the gateway-bearing adapter's IP (the management interface) over a
+    # bare first-in-list pick, which on a Hyper-V host is often a NAT gateway.
+    ip = rec.get('primary_ip') or (rec['ipv4_addresses'][0] if rec['ipv4_addresses'] else None)
     h = {'ip': ip, 'hostname': rec['hostname'] or None,
          'mac': rec['nic_macs'][0] if rec['nic_macs'] else None,
          'vendor': '', 'os': rec['os'], 'os_accuracy': 'import',
@@ -6387,6 +6396,20 @@ $nics = Get-NetAdapter 2>$null | Where-Object { $_.Status -eq "Up" } |
 $hostIPs = @(Get-NetIPAddress -AddressFamily IPv4 2>$null |
     Where-Object { $_.IPAddress -ne "127.0.0.1" -and $_.IPAddress -notlike "169.254.*" } |
     Select-Object -ExpandProperty IPAddress -Unique)
+# Primary IP = the IPv4 on the adapter that owns the default route (0.0.0.0/0).
+# That gateway-bearing adapter is the real management interface; without it the
+# importer would otherwise guess (often a Hyper-V NAT gateway like 172.x).
+$primaryIP = ""
+try {
+    $defRt = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -AddressFamily IPv4 2>$null |
+             Where-Object { $_.NextHop -and $_.NextHop -ne "0.0.0.0" } |
+             Sort-Object -Property RouteMetric | Select-Object -First 1
+    if ($defRt) {
+        $primaryIP = (Get-NetIPAddress -InterfaceIndex $defRt.InterfaceIndex -AddressFamily IPv4 2>$null |
+            Where-Object { $_.IPAddress -ne "127.0.0.1" -and $_.IPAddress -notlike "169.254.*" } |
+            Select-Object -First 1 -ExpandProperty IPAddress)
+    }
+} catch {}
 $isHyperV = $false
 try { $isHyperV = ($null -ne (Get-Command Get-VM -ErrorAction SilentlyContinue)) } catch {}
 $pdisks = @()
@@ -6417,6 +6440,7 @@ $hostObj = [ordered]@{ Hostname=$cs.Name; Domain=$cs.Domain;
             LogicalProcessors=[int]$cs.NumberOfLogicalProcessors;
             MemoryGB=[math]::Round($cs.TotalPhysicalMemory/1GB,2);
             IPv4Addresses=@($hostIPs);
+            PrimaryIP=$primaryIP;
             PhysicalDisks=@($pdisks);
             NetworkAdapters=@($nics) }
 
