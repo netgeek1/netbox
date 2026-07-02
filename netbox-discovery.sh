@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  NetBox Auto-Deploy & Network Discovery Suite  --  Ubuntu 24.04
-#  Version: 2.5.61
+#  Author:  netgeek1  (https://github.com/netgeek1/netbox)
+#  License: MIT  (see LICENSE)
+#  Built with engineering assistance from Claude (Anthropic).
+#  Version: see SCRIPT_VERSION below (authoritative) and CHANGELOG.md
 # =============================================================================
 
 set -uo pipefail
@@ -9,7 +12,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.61"
+SCRIPT_VERSION="2.5.62"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
