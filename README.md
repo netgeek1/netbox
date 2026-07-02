@@ -4,10 +4,9 @@ A single Bash script that deploys NetBox, discovers a network using many
 protocols, and keeps NetBox populated with devices, VMs, IPs, MACs, interfaces,
 clusters, and cabling — automatically and idempotently.
 
-> **Version:** 2.5.62 · **Platform:** Ubuntu 24.04 · **License:** see [License](#license)
+> **Version:** 2.5.63 · **Platform:** Ubuntu 24.04 · **License:** see [License](#license)
 >
-> The authoritative, per-version history lives in the changelog block at the top
-> of `netbox-discovery.sh`; a generated copy is in [`CHANGELOG.md`](CHANGELOG.md).
+> The authoritative, per-version history lives in [`CHANGELOG.md`](CHANGELOG.md).
 > This README describes current behavior.
 
 ---
@@ -392,9 +391,9 @@ deployment, enable it once from **NetBox Management → Enable Auto-Start on Boo
 
 ## Changelog
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the full per-version history (generated
-from the changelog block at the top of `netbox-discovery.sh`, which is the
-authoritative source).
+See [`CHANGELOG.md`](CHANGELOG.md) for the full per-version history. It's the
+authoritative changelog; the per-version notes were moved out of the script
+header in v2.5.63.
 
 ---
 
