@@ -1,3 +1,11 @@
+#  Changelog v2.5.62 (licensing + attribution):
+#   - Released under the MIT License (Copyright (c) 2026 netgeek1); added LICENSE
+#     file and filled in the README License section.
+#   - Script header now carries author (netgeek1), repo URL, MIT license note,
+#     and an acknowledgment of engineering assistance from Claude (Anthropic).
+#     Replaced the stale hardcoded "Version: 2.5.9" header comment with a pointer
+#     to SCRIPT_VERSION / CHANGELOG.md so it can no longer drift.
+#
 #  Changelog v2.5.61 (collector generation/output path fixes):
 #   - Generating netbox-collector.ps1 with a DIRECTORY as the path argument tried
 #     to write over the directory (cat > dir), failing/clobbering perms. If the
