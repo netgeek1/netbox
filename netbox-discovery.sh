@@ -13,7 +13,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.64"
+SCRIPT_VERSION="2.5.65"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -1285,6 +1285,22 @@ nb_add_vm_interface() {
     [[ -n "$id" && -n "$mac" && "$mac" != "null" ]] && \
         nb_ensure_mac_address "virtualization.vminterface" "$id" "$mac"
     echo "$id"
+}
+
+# Find an existing VM (and the interface that carries the MAC) already in NetBox.
+# Lets a Hyper-V guest scanned in isolation -- whose host wasn't enumerated this
+# run, so it has no cluster to key on -- attach to its real VM record by MAC
+# instead of creating an Unclustered duplicate. Echoes "<vm_id> <vif_id>" on a
+# hit, nothing on a miss. MAC is uppercased to match NetBox's stored form.
+nb_find_vm_by_mac() {
+    local mac="$1"
+    [[ -z "$mac" || "$mac" == "null" ]] && return 0
+    mac=$(printf '%s' "$mac" | tr 'a-z' 'A-Z')
+    local enc; enc=$(nb_urlencode "$mac")
+    local resp; resp=$(nb_get "virtualization/interfaces/?mac_address=${enc}")
+    echo "$resp" | jq -r '
+        .results[]? | select(.virtual_machine.id != null)
+        | "\(.virtual_machine.id) \(.id)"' 2>/dev/null | head -1
 }
 
 # -----------------------------------------------------------------------------
@@ -3735,6 +3751,10 @@ def reconcile(data):
             vmac = next((m for m in host_macs(h) if m.startswith(HYPERV_OUI)), None)
             if vmac:
                 h["sync_as"] = "vm"
+                # Host wasn't matched to a VM enumerated THIS run (its Hyper-V host
+                # wasn't scanned). Carry the MAC so the writer can bind this to the
+                # VM already in NetBox instead of spawning an Unclustered duplicate.
+                h["vm_resolve_by_mac"] = vmac
                 h["vm_reason"] = "Hyper-V MAC %s (host not WinRM-scanned)" % vmac
 
     # Synthesize a record for every VM instance not bound to a discovered host.
@@ -5921,6 +5941,7 @@ def build(reconciled):
                 'disks_gb': disks_gb,
                 'primary_ip': ('%s/%d' % (ip, DEF_MASK)) if ip else None,
                 'mac': macs[0] if macs else None,
+                'resolve_by_mac': h.get('vm_resolve_by_mac'),
                 'no_ip_flag': bool(h.get('vm_no_ip_flag')),
                 'discovered_ports': (', '.join(
                     '%s/%s' % (p.get('port'), p.get('service') or p.get('proto') or 'tcp')
@@ -6259,20 +6280,39 @@ PLANEOF
 
     while IFS= read -r v; do
         local vname vcl vrole status vcpus vmem vdisk vip vmac cid vm_id vif role_id vports
-        local _nd _i _dsz _dname
+        local _nd _i _dsz _dname rbm existing_vif _hit
         vname=$(jq -r '.name' <<<"$v");   vcl=$(jq -r '.cluster' <<<"$v")
         vrole=$(jq -r '.role // "Server"' <<<"$v")
         status=$(jq -r '.status' <<<"$v")
         vcpus=$(jq -r '.vcpus // ""' <<<"$v");  vmem=$(jq -r '.memory_mb // ""' <<<"$v")
         vdisk=$(jq -r '.disk_gb // ""' <<<"$v"); vip=$(jq -r '.primary_ip // ""' <<<"$v")
         vmac=$(jq -r '.mac // ""' <<<"$v")
-        cid="${CLU[$vcl]:-}"
-        if [[ -z "$cid" || ! "$cid" =~ ^[0-9]+$ ]]; then
-            log_warn "no cluster for VM $vname ($vcl)"; continue
+        rbm=$(jq -r '.resolve_by_mac // ""' <<<"$v"); existing_vif=""
+        vm_id=""
+        # A guest scanned without its Hyper-V host has no cluster to key on. Bind
+        # it to the VM already in NetBox by MAC (keeping that VM's real cluster)
+        # instead of creating an Unclustered duplicate, and attach the discovered
+        # IP to the very interface that carries the MAC.
+        if [[ -n "$rbm" && "$rbm" != "null" ]]; then
+            _hit=$(nb_find_vm_by_mac "$rbm" 2>>"$LOG_FILE")
+            if [[ -n "$_hit" ]]; then
+                vm_id="${_hit%% *}"; existing_vif="${_hit##* }"
+                if [[ "$vm_id" =~ ^[0-9]+$ ]]; then
+                    log_ok "VM $vname: bound to existing NetBox VM #$vm_id by MAC $rbm (no duplicate)"
+                else
+                    vm_id=""; existing_vif=""
+                fi
+            fi
         fi
-        vm_id=$(nb_upsert_vm "$vname" "$cid" "$status" "$vcpus" "$vmem" "$site_id" 2>>"$LOG_FILE")
-        if [[ -z "$vm_id" || ! "$vm_id" =~ ^[0-9]+$ ]]; then
-            log_warn "VM upsert failed: $vname"; continue
+        if [[ -z "$vm_id" ]]; then
+            cid="${CLU[$vcl]:-}"
+            if [[ -z "$cid" || ! "$cid" =~ ^[0-9]+$ ]]; then
+                log_warn "no cluster for VM $vname ($vcl)"; continue
+            fi
+            vm_id=$(nb_upsert_vm "$vname" "$cid" "$status" "$vcpus" "$vmem" "$site_id" 2>>"$LOG_FILE")
+            if [[ -z "$vm_id" || ! "$vm_id" =~ ^[0-9]+$ ]]; then
+                log_warn "VM upsert failed: $vname"; continue
+            fi
         fi
         if [[ -n "$vrole" && "$vrole" != "null" ]]; then
             role_id=$(nb_get_or_create_role "$vrole" 2>>"$LOG_FILE")
@@ -6302,7 +6342,11 @@ PLANEOF
             nb_patch "virtualization/virtual-machines/$vm_id/" \
                 "{\"disk\":$(( vdisk * 1024 ))}" >/dev/null 2>&1 || true
         fi
-        vif=$(nb_add_vm_interface "$vm_id" "eth0" "$vmac" "" 2>>"$LOG_FILE")
+        if [[ -n "$existing_vif" && "$existing_vif" =~ ^[0-9]+$ ]]; then
+            vif="$existing_vif"   # the interface that already carries this MAC
+        else
+            vif=$(nb_add_vm_interface "$vm_id" "eth0" "$vmac" "" 2>>"$LOG_FILE")
+        fi
         if [[ -n "$vip" && "$vif" =~ ^[0-9]+$ ]]; then
             nb_add_vm_ip "$vip" "$vm_id" "$vif" >/dev/null 2>&1 || true
         fi
