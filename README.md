@@ -32,6 +32,7 @@ clusters, and cabling — automatically and idempotently.
 - [Security notes](#security-notes)
 - [Changelog](#changelog)
 - [License](#license)
+- [Acknowledgments](#acknowledgments)
 
 ---
 
@@ -58,9 +59,21 @@ clusters, and cabling — automatically and idempotently.
   and writes a systemd unit.
 - **Network:** outbound internet for Docker images and `apt`, and reachability
   to the targets you want to scan.
-- **Resources:** enough for the NetBox Docker stack (NetBox + PostgreSQL + Redis
-  + workers). Plan for a few GB of RAM and several GB of disk; more is better for
-  larger inventories.
+- **Resources:** the VM runs the full NetBox Docker stack (NetBox + PostgreSQL +
+  Redis ×2 + worker + housekeeping + nginx) plus the discovery tooling, so size
+  it off the Docker guidance, not NetBox's bare-metal minimum:
+
+  | Tier | vCPU | RAM | Disk |
+  | --- | --- | --- | --- |
+  | Minimum (works, tight) | 2 | 4 GB | 25 GB SSD |
+  | Recommended (comfortable, homelab/SOHO up to a few hundred devices) | 2–4 | 8 GB | 40–60 GB SSD |
+
+  CPU is bursty during discovery (parallel probes via `MAX_THREADS`, plus
+  nmap/masscan) rather than at idle, where NetBox sits around 1.5–2.5 GB. Watch
+  **disk** over time: NetBox images are a few GB, Postgres grows slowly with
+  inventory, and `RAW_CAPTURE=1` keeps every host's raw probe output plus a
+  per-sync HTTP trace under `discovery/` — prune those to keep it flat. Prefer
+  **SSD** (Postgres and the discovery JSON churn benefit from it) over raw size.
 - **Tooling:** the script installs everything it needs (Docker, Nmap, Masscan,
   ARP-Scan, fping, net-snmp, SSH tools, jq, plus Python libraries such as
   pynetbox, netmiko, napalm, pysnmp, paramiko, scapy, and pywinrm). **Nmap is a
@@ -387,5 +400,19 @@ authoritative source).
 
 ## License
 
-Add your chosen license here (e.g. MIT). Until then, treat as
-all-rights-reserved by the repository owner.
+Released under the **MIT License** — see [`LICENSE`](LICENSE).
+
+```
+Copyright (c) 2026 netgeek1
+```
+
+You're free to use, modify, and redistribute this, including commercially, as
+long as the copyright and license notice are preserved. Provided as-is, with no
+warranty.
+
+---
+
+## Acknowledgments
+
+Developed by **netgeek1** ([github.com/netgeek1/netbox](https://github.com/netgeek1/netbox)),
+with engineering assistance from **Claude (Anthropic)**.
