@@ -4,7 +4,7 @@ A single Bash script that deploys NetBox, discovers a network using many
 protocols, and keeps NetBox populated with devices, VMs, IPs, MACs, interfaces,
 clusters, and cabling — automatically and idempotently.
 
-> **Version:** 2.5.61 · **Platform:** Ubuntu 24.04 · **License:** see [License](#license)
+> **Version:** 2.5.62 · **Platform:** Ubuntu 24.04 · **License:** see [License](#license)
 >
 > The authoritative, per-version history lives in the changelog block at the top
 > of `netbox-discovery.sh`; a generated copy is in [`CHANGELOG.md`](CHANGELOG.md).
