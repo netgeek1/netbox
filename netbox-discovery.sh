@@ -13,7 +13,7 @@ set -uo pipefail
 # -----------------------------------------------------------------------------
 # GLOBAL CONSTANTS
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION="2.5.63"
+SCRIPT_VERSION="2.5.64"
 SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 REAL_USER="${SUDO_USER:-$(id -un)}"   # actual user even when run via sudo
 
@@ -2377,8 +2377,9 @@ $hvVMs = Get-VM 2>$null | ForEach-Object {
             }
         } catch {}
     }
-    if ($vm.DynamicMemoryEnabled) { $memB = [int64]$vm.MemoryMaximum }
-    else                          { $memB = [int64]$vm.MemoryStartup }
+    # Startup RAM -- the stable "Startup memory" Hyper-V Manager shows. Reading
+    # MemoryMaximum for dynamic-memory VMs reported Hyper-V's 1 TiB default max.
+    $memB = [int64]$vm.MemoryStartup
     [ordered]@{ Name=$vm.Name; State="$($vm.State)";
                 Generation=$vm.Generation;
                 ProcessorCount=[int]$vm.ProcessorCount;
@@ -4633,7 +4634,7 @@ function Sync-NetboxVM {{
         if ($m.cluster -and $m.cluster.id -eq $ClusterId) {{ $tid=$m.id }}
     }}
     $diskGB=[int][Math]::Ceiling((Get-VMTotalDiskBytes -VmName $nm)/1GB)
-    $memMB=if($VM.DynamicMemoryEnabled){{[int]($VM.MemoryMaximum/1MB)}}else{{[int]($VM.MemoryStartup/1MB)}}
+    $memMB=[int]($VM.MemoryStartup/1MB)
     $status=if($VM.State -eq "Running"){{"active"}}else{{"offline"}}
     $b=@{{
         name=$nm; cluster=$ClusterId; status=$status; role=$RoleId
@@ -6478,8 +6479,9 @@ if ($isHyperV) {
                 }
             } catch {}
         }
-        if ($vm.DynamicMemoryEnabled) { $memB = [int64]$vm.MemoryMaximum }
-        else                          { $memB = [int64]$vm.MemoryStartup }
+        # Startup RAM -- stable "Startup memory"; MemoryMaximum reported the
+        # 1 TiB Hyper-V default max for dynamic-memory VMs.
+        $memB = [int64]$vm.MemoryStartup
         [ordered]@{ Name=$vm.Name; State="$($vm.State)";
                     Generation=$vm.Generation;
                     ProcessorCount=[int]$vm.ProcessorCount;
@@ -6510,7 +6512,7 @@ if ($isHyperV) {
 
 # ---- Merge + emit (single JSON; no NetBox, no WinRM) ----
 $payload = [ordered]@{
-    CollectorVersion = "1.3"
+    CollectorVersion = "1.4"
     CollectedAt      = (Get-Date).ToString("o")
     Host             = $hostObj
     HyperVVMs        = @($hvVMs)
